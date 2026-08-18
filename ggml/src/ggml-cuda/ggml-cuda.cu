@@ -1078,7 +1078,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends >= 2 && n_backends <= GGML_CUDA_MAX_DEVICES);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1167,13 +1167,57 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
+    GGML_LOG_WARN("internal AllReduce init failed (no pipeline supports this "
+                  "topology); falling back to meta-backend butterfly\n");
     ggml_backend_cuda_comm_init_none(ret);
 }
 
-static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
 #ifdef GGML_USE_NCCL
+// ncclCommInitAll can succeed while the collective kernels are missing for the
+// GPU's arch (notably RDNA/RCCL): probe with a tiny allreduce up front.
+static bool ggml_backend_cuda_comm_nccl_probe(
+        const std::vector<ncclComm_t> & comms, const std::vector<int> & dev_ids) {
+    const int    n     = (int) comms.size();
+    const size_t count = 16;
+    std::vector<float *> buf(n, nullptr);
+
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) {
+        ggml_cuda_set_device(dev_ids[i]);
+        ok = cudaMalloc(&buf[i], count * sizeof(float)) == cudaSuccess
+          && cudaMemset(buf[i], 0, count * sizeof(float)) == cudaSuccess;
+    }
+
+    if (ok) {
+        bool grp = ncclGroupStart() == ncclSuccess;
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(dev_ids[i]);
+            if (ncclAllReduce(buf[i], buf[i], count, ncclFloat, ncclSum,
+                              comms[i], (cudaStream_t) 0) != ncclSuccess) {
+                grp = false;
+            }
+        }
+        if (ncclGroupEnd() != ncclSuccess) {
+            grp = false;
+        }
+        ok = grp;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if (buf[i] == nullptr) {
+            continue;
+        }
+        ggml_cuda_set_device(dev_ids[i]);
+        ok = (cudaStreamSynchronize((cudaStream_t) 0) == cudaSuccess) && ok;
+        (void) cudaFree(buf[i]);
+    }
+    (void) cudaGetLastError();  // clear any sticky error from a failed probe
+    return ok;
+}
+
+static bool g_nccl_unusable = false;
+
+static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count > info.physical_device_count) {
@@ -1183,26 +1227,53 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
         return;
     }
 
-    const size_t n = ret->dev_ids.size();
-    ret->comms.resize(n);
-    ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
-    if (rc == ncclSuccess) {
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+    static const bool retry_nccl = getenv("GGML_CUDA_NCCL_RETRY") == nullptr;
+    if (g_nccl_unusable && retry_nccl) {
+        ggml_backend_cuda_comm_init_internal(ret);
         return;
     }
 
+    const size_t n = ret->dev_ids.size();
+    ret->comms.resize(n);
+
+    ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
+    if (rc == ncclSuccess) {
+        if (ggml_backend_cuda_comm_nccl_probe(ret->comms, ret->dev_ids)) {
+            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+            return;
+        }
+
+        // abort comms instead of destroy on failure
+        for (ncclComm_t comm : ret->comms) {
+            (void) ncclCommAbort(comm);
+        }
+
+        (void) cudaGetLastError(); // clear any sticky errors
+        GGML_LOG_WARN("NCCL unusable (collective kernels missing for this arch?); "
+                      "falling back to internal AllReduce\n");
+    } else {
+        // ncclCommInitAll failed: the comm handles are not valid, so nothing to
+        // tear down here.
+        GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
+                      ncclGetErrorString(rc));
+    }
+
+    g_nccl_unusable = true;
     ret->comms.clear();
-    GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
-                  ncclGetErrorString(rc));
+
+    ggml_backend_cuda_comm_init_internal(ret);
+}
 #else // GGML_USE_NCCL
+
+static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
 #ifndef GGML_USE_HIP
     GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
                   "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
 #endif // !GGML_USE_HIP
-#endif // GGML_USE_NCCL
 
     ggml_backend_cuda_comm_init_internal(ret);
 }
+#endif // GGML_USE_NCCL
 
 // Top-level init.  Picks one of the three init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
