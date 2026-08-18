@@ -5,11 +5,26 @@
 
 #include <cstddef>
 
-// Opaque pipeline context -- owns all pinned buffers, streams, and events.
-struct ggml_cuda_ar_pipeline;
+// Opaque; each is defined in its own TU (allreduce-host.cu / allreduce-p2p.cu)
+// and never included here, so this header stays a forward-declaration-only
+// dependency for both.
+struct ggml_cuda_ar_pipeline_host_staged;
+struct ggml_cuda_ar_pipeline_direct;
+
+// Thin dispatcher struct: n_devices/devices are duplicated from the backend-
+// specific impl for cheap access without a downcast. Exactly one of
+// host_staged/direct is non-null -- that pointer *is* the tag, so init/free/
+// allreduce in allreduce.cu dispatch on which one is set rather than keeping
+// a separate enum that could drift out of sync with it.
+struct ggml_cuda_ar_pipeline {
+    int                             n_devices;
+    int                             devices[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_ar_pipeline_host_staged * host_staged = nullptr;
+    ggml_cuda_ar_pipeline_direct      * direct      = nullptr;
+};
 
 // Allocate a pipeline for n_devices GPUs.
-// devices[] holds the GPU device IDs in rank order.
+// devices[] holds the CUDA device IDs in rank order.
 // Returns nullptr on allocation failure.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
     const int * devices, size_t n_devices);
@@ -26,4 +41,3 @@ bool ggml_cuda_ar_allreduce(
     ggml_cuda_ar_pipeline * pipeline,
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
-
