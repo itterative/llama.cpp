@@ -2827,6 +2827,17 @@ class TensorNameMap:
             MODEL_TENSOR.PLE_CONV1D: (
                 "model.layers.{bid}.ple.conv1d",
             ),
+            # the MTP block carries its own head mixer, renamed from the mtp root by the
+            # converter so it does not collide with the trunk's output_hc_*
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
+                "model.layers.{bid}.hc_head_norm",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
+                "model.layers.{bid}.hc_head_down",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
+                "model.layers.{bid}.hc_head_up",
+            ),
         },
     }
 

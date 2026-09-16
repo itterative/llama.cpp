@@ -91,6 +91,8 @@ llama_memory_recurrent::llama_memory_recurrent(
             dev_name = ggml_backend_dev_name(dev);
         }
 
+        ++n_layer_state;
+
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
 
         ggml_context * ctx = ctx_for_buft(buft);
@@ -190,8 +192,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a filter may select no state layers at all (the MTP draft of a hybrid model), in
+                // which case there is no state to stay consistent with and only the position moves
+                if (n_layer_state == 0) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+
+                // partial rollback via per-token snapshot index (bounded by n_rs_seq)
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
@@ -1289,6 +1298,10 @@ int32_t llama_memory_recurrent_context::get_rs_z() const {
 
 uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
+}
+
+bool llama_memory_recurrent_context::has_state() const {
+    return mem->n_layer_state > 0;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {

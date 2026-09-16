@@ -2618,19 +2618,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
+                    } else if (arch == LLM_ARCH_QWEN4EXP) {
+                        // the draft runs the MTP block alone, which is full attention with its own
+                        // indexer and has no linear attention layer, so its recurrent half is empty
+                        const bool draft = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0;
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
-                            };
+                        filter_attn = [&, draft](uint32_t il) {
+                            return draft ? il >= hparams.n_layer() : (il < hparams.n_layer() && !hparams.is_recr(il));
+                        };
+                        filter_recr = [&, draft](uint32_t il) {
+                            return !draft && il < hparams.n_layer() && hparams.is_recr(il);
+                        };
+
+                        // QSA runs on the dense-attention layers only, which are the ones the
+                        // attention filter already picks
+                        if (hparams.indexer_head_size > 0) {
+                            filter_idx = filter_attn;
                         }
                     }
 
