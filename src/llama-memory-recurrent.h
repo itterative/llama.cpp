@@ -70,6 +70,9 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // a layer filter can select none, e.g. the MTP draft of a hybrid model
+    uint32_t n_layer_state = 0;
+
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
@@ -167,6 +170,7 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    bool has_state() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;

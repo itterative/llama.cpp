@@ -20,20 +20,40 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     Shares the Qwen3.5 gated delta net and interleaved mrope, and adds three things:
     hyper-connections in place of every layer norm, QSA sparse attention on the full
-    attention layers, and PLE n-gram hash embeddings on a single layer.
+    attention layers, and PLE n-gram hash embeddings on a single layer. The single MTP
+    block exports as a nextn draft block.
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # the two projections the HF checkpoint carries in place of a fused eh_proj
+    _MTP_FC = {
+        "mtp.fc_embedding.weight": "embedding",
+        "mtp.fc_hidden.weight":    "hidden",
+    }
+
+    # the MTP block mixes its own hidden state, so it cannot share the trunk head mixer
+    _MTP_HEAD_MIXER = {
+        "mtp.hyper_connection_mixer.hc_norm.weight":               "hc_head_norm",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": "hc_head_down",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight":   "hc_head_up",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        # the fc pair arrives as two shards, in either order
+        self._mtp_fc: dict[str, Tensor] = {}
+
+    def _mtp_bid(self) -> int:
+        assert self._original_block_count is not None
+        return self._original_block_count
+
+    def _mtp_has_indexer(self) -> bool:
+        key = f"model.layers.{self._mtp_bid()}.self_attn.indexer.index_qk_proj.weight"
+        return key in self.model_tensors
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -63,14 +83,16 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        # the MTP block is a full attention block; it is sparse only if it carries an indexer
+        mtp_ratio = ratio if self._mtp_has_indexer() else 0
+        self.gguf_writer.add_attention_compress_ratios(ratios + [mtp_ratio] * (self.block_count - n_layer))
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        # a draft has no PLE layer, and --mtp prunes the n-gram table from the index
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -105,7 +127,33 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        # the mixin remaps on the un-prefixed names, so compare against those
+        key = name.removeprefix("model.")
+
+        # keep the HF names: modify_tensors needs both halves to fuse them
+        if key in cls._MTP_FC:
+            return None if cls.no_mtp else (key, gen)
+
+        if suffix := cls._MTP_HEAD_MIXER.get(key):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            return f"model.layers.{cls._original_block_count}.{suffix}.weight", gen
+
+        return super().filter_tensors(item)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in self._MTP_FC:
+            # the concat order must match the runtime: [norm(embedding) | norm(hidden)]
+            self._mtp_fc[self._MTP_FC[name]] = data_torch
+            if len(self._mtp_fc) < 2:
+                return []
+            eh_proj = torch.cat((self._mtp_fc["embedding"], self._mtp_fc["hidden"]), dim=1).contiguous()
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, self._mtp_bid(), ".weight"), eh_proj)]
+
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
             self._ple_multipliers = [int(x) for x in data_torch.tolist()]
