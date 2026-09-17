@@ -37,9 +37,12 @@ reference configs (`:47`). Note the converter folds each gamma to `(1 + w)` (`:2
 `2*sigmoid` centres the scatter weights on 1 so a zero injection is a plain residual add
 (`:331`) - both are load-time facts that a kernel reimplementation must reproduce.
 
-Fused ops: `GGML_OP_DSV4_HC_{COMB,PRE,POST}` with builders
-`ggml_dsv4_hc_comb/_pre/_pre_gated/_post` (`ggml/include/ggml.h:2690-2722`). Shared with
-DeepSeek-V4; the `_pre_gated` variant is the qwen4exp one. These landed in `37b53fd45`.
+Fused ops: qwen4exp emits only **`DSV4_HC_PRE` with `gated=1`** (`:293`) and **`DSV4_HC_POST`
+with `src[3] == nullptr`** (`:338`) `[v]`. `_COMB` and the non-gated `_pre` belong to
+DeepSeek-V4 / Kimi-K3, not this arch. Builders `ggml_dsv4_hc_comb/_pre/_pre_gated/_post` at
+`ggml/include/ggml.h:2690-2722`; kernels landed in `37b53fd45`. On HIP the support gate is
+dtype-only - **all inputs F32**, and no shape restriction (`ggml/src/ggml-cuda/ggml-cuda.cu:5492-5501`
+`[v]`), unlike Metal/Vulkan which demand `hc == 4`. See `rdna4-rocm-build`.
 
 **Cost profile: HC is per-layer and per-token, in every mode.** Nothing about it is
 batch-size dependent, so it is a first-order target for both pp and tg.
