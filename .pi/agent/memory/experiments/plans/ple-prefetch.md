@@ -21,6 +21,22 @@ it, but that is a suspicion, not a diagnosis, and nothing below should be read a
 An **LRU in RAM** would also work, and is strictly less invasive than the VRAM variant - see
 "where a cache should live" at the end. Measure first (next section), then pick.
 
+## An arithmetic ceiling that argues against this being the tg cost
+
+Before building anything, note how little the PLE fetch path can explain. Per decoded token:
+16 rows x 2560 elements at Q5-ish packing is ~1760 B per row, so ~28 KB total, spanning
+roughly 16-23 page touches.
+
+- all minor faults, page already in cache: single-digit us each -> **~0.1 ms/token**
+- all cold major faults from NVMe with readahead off (~100-200 us each): **~2-4 ms/token**
+
+Measured tg is 35.5 ms/token. So even the pessimistic end is ~10% of the cost, **unless the box
+is swapping** - which is exactly what method 1 below distinguishes in five seconds. Conclusion:
+the PLE fetch path is unlikely to dominate decode, and this line of work should be justified by
+measurement rather than by the plausibility of the story. It may still matter for pp (where the
+whole prompt's rows are touched in one pass) and for VRAM/RAM sizing, which are different
+questions from tg.
+
 ## How to measure page faults here, cheapest first
 
 | # | method | code needed | what it answers |
@@ -32,7 +48,9 @@ An **LRU in RAM** would also work, and is strictly less invasive than the VRAM v
 | 5 | `clear_refs` on the mapping then re-measure faults per token | small patch | turns "I think we fault 16 times per token" into a number, with the residency reset deliberately |
 
 Start with 1: it is free, it takes one decode run, and it can close the question in either
-direction before any code is written.
+direction before any code is written. Add `vmstat 1` for swap in/out while there - the ceiling
+arithmetic above only holds if the box is not swapping, and if it *is*, every estimate here has
+to be redone.
 
 ## Where a cache should live
 
