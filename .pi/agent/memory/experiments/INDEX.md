@@ -21,6 +21,7 @@ try that?".
 | E015 | 2026-09-17 | T2 | bench-4x-r9700-32g | scheduler op-offload may be the fixed per-step cost | **no** - tg 28.14 vs 28.20, pp 547.5 vs 546.8, CSV confirms `no_op_offload=1` applied | dead-end | [runs/E015-no-op-offload.md](runs/E015-no-op-offload.md) |
 | E017 | 2026-09-17 | T1 | dev-rx9070-16g | a shape-faithful dummy can be generated and run locally | **yes**: 4 real layers + real types, 5.47 ms/step of which ~4.5 ms is per-step host work; decode is flat across a 10x table volume range (182.1/182.7/182.4) while pp4096 gains 6.5% from a small table; shipped as models/q4exp-4l.gguf with a 5.5 GB table | done | [runs/E017-dummy-harness.md](runs/E017-dummy-harness.md) |
 | E018 | 2026-09-17 | T1 | dev-rx9070-16g | a zero-filled dummy cannot detect a model-level bug | **yes**: seeded pattern fill + `llama-perplexity` fingerprint, `PPL = 262938.7619 +/- 3039.07`, bit-stable across runs, and perf-neutral vs zeros (181.89 vs 182.40, -0.28%); local noise floor measured at ~1% so only >2% deltas count | done | [runs/E018-correctness-gate.md](runs/E018-correctness-gate.md) |
+| E019 | 2026-09-17 | T1 | dev-rx9070-16g | the op-level gate needs a baseline on the current stack | **yes**: 5641 cases, 5633 OK / 7 FAIL, all FAILs pre-existing `FLASH_ATTN_EXT hsk=192,hsv=128`; our 256/256 shape is 142/142. Capture works locally now (9430 warmups); `-j 8` aborts, use `-j 1` | done | [runs/E019-ops-baseline.md](runs/E019-ops-baseline.md) |
 
 ## Comparability breaks
 
@@ -148,6 +149,10 @@ measuring at all. Detail in the topic memories.
 - **Local deltas below ~2% on the dummy harness are noise** (E018: same file measured
   180.3/181.8/181.9 t/s across invocations). Iterate on 1.3 GB smoke builds; the 12.76 GB
   build takes ~40 s of I/O and should be written once.
+
+- **The op-level baseline on ROCm 7.1.1 is 5633 OK / 7 FAIL** (E019), the FAILs all being the
+  known `FLASH_ATTN_EXT hsk=192,hsv=128` family. New failures are judged against 7, not the
+  6 in the older note. `test-backend-ops -j >1` aborts on HIP capture errors - run `-j 1`.
 
 ## Status legend
 
