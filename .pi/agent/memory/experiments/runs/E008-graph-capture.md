@@ -36,9 +36,11 @@ bottleneck even in the worst case, and with graphs on it is nearly free.
 
 ## what this leaves
 
-Tg is ~35.5 ms/token against a weight-streaming floor of roughly 1.4 ms (active weights ~2.7
-GB/token across four cards at a conservative 500 GB/s each). Excluded so far, each by a
-measurement rather than by argument:
+Tg is ~35.5 ms/token. Corrected floor (and note E005's depth section: `-d 40960` really does
+fill the KV, so these measurements are at ~40 k depth, not shallow): ~3.3 GB active weights
+(6 B params) + ~1.0 GB KV + ~0.2 GB fp32 GDN state = **~3.9 GB/token**, ~0.98 GB per card,
+**~2 ms floor** at a conservative 500 GB/s/card. So the gap is **~18x**. Excluded so far, each
+by a measurement rather than by argument:
 
 | mechanism | excluded by |
 |---|---|
@@ -46,6 +48,12 @@ measurement rather than by argument:
 | cross-GPU collectives | E006: layer split does ~none and is slower |
 | launch submission / graph capture | E008: worth 2.7 ms/token in total |
 | PLE fetch path (page faults) | arithmetic ceiling: ~28 KB and 16-23 page touches per token is 0.1-4 ms, not 33 (see `plans/ple-prefetch.md`) - unless the box is swapping |
+| dense attention over 40 k | partially: it is ~6 GFLOP/token across the 12 full-attention layers, i.e. **~0.9 ms** at the observed effective throughput - real, but ~2.5% of the token, so it cannot be the missing 33 ms on decode |
+
+That last row is worth keeping in view for the QSA thread: at 40 k depth attention is roughly
+half the *FLOPs* of a prefill token, but since pp runs at <=3.5% of WMMA peak, removing half
+the arithmetic need not remove half the time. Whether it does is not answerable from these
+numbers - it is a depth-curve question, which is E013.
 
 What remains has to be work that is **per decode step, serial, host-side, and not removable by
 graph replay**. The obvious class is *per-step graph construction and allocation on the host*:
