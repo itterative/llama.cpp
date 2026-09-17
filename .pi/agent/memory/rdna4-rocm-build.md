@@ -183,6 +183,26 @@ shorter:
 - `LIGHTNING_INDEXER` is **not in this graph** `[x]` - `build_qsa_top_k` hand-rolls the
   indexer from `MUL_MAT`/`ROPE`/`RELU`/`ADD`/`GET_ROWS`/`TOP_K` (`:542-691`).
 
+## Split mode on 4x consumer RDNA4 (operating experience, not code)
+
+User-reported from their own tuning, and the project's prior until measured otherwise. Treat
+as experienced expectation, not verified behaviour.
+
+- **decode: tensor split always wins.** Compute per layer runs in parallel across the cards,
+  so the per-token serial path is short, at the cost of more inter-card traffic per step.
+- **pp: layer split usually wins.** Layers pipeline across cards, so the transfers hide behind
+  inter-layer compute overlap; the user also believes layer's comms volume is lower, but has
+  not tested that. Tensor's per-layer reduce is harder to hide when each ubatch is big.
+- **Measured at E006 (qwen4exp, this fork, 4x R9700): tensor won both**, including pp at
+  12-32%. That contradicts the pp expectation, so either this arch breaks the pipeline-overlap
+  assumption or something is stalling the graph - currently attributed to the CPU-placed
+  n-gram table splitting the graph at layer 1 (`-ot per_layer_token_embd=CPU`). E007b re-tests
+  pp after removing it.
+- Physical reason traffic is expensive here: **Navi 48 has no Infinity Fabric**, and `lspci`
+  puts all four cards under a single Zen3 root complex through two levels of PCIe switches
+  (BDF 0b/10/13/19). Every inter-card byte traverses the host bridge, and there is no peer
+  link to make it cheap.
+
 ## Traps
 
 - **`docs/ops.md` and `docs/ops/*.csv` are stale and wrong for these ops** `[s]`: they mark
