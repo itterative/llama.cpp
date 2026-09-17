@@ -13,6 +13,44 @@ step** (`-ot per_layer_token_embd=CPU` forces the CPU buft; `weight_buft_support
 hypothetical `get_rows` on that buft, `src/llama-model-loader.cpp:946-950`, so the op and its
 H2D result land off the GPU path).
 
+## Status: a thing to look at, not a plan
+
+The user's position, which is the honest one: it is **hard to say what the PLE-side issue
+actually is**. The working assumption is that not mmapping the table properly may be causing
+it, but that is a suspicion, not a diagnosis, and nothing below should be read as agreed.
+An **LRU in RAM** would also work, and is strictly less invasive than the VRAM variant - see
+"where a cache should live" at the end. Measure first (next section), then pick.
+
+## How to measure page faults here, cheapest first
+
+| # | method | code needed | what it answers |
+|---|---|---|---|
+| 1 | **`iostat -x 1` / `/proc/diskstats` sampled during a steady tg run** | none | decisive and immediate: if the NVMe is serving reads while decoding, the table is being re-faulted from disk. If disk reads are ~0, the pages are resident and the whole fault-latency theory is wrong and the suspect is the sync, not the bytes |
+| 2 | `perf stat -e minor-faults,major-faults -p <pid>` across a fixed token count, then faults/token | none | per-process fault counts. Major faults are the expensive ones; if major ~ 0, cost per token is bounded by minor-fault handling (~sub-us) and cannot be 35 ms |
+| 3 | `bpftrace` on `tracepoint:exceptions:page_fault_user`, or on `mm_filemap_add_to_page_cache` (fires only when a file page is brought in from disk), with a stack probe | one-liner, no rebuild | attributes faults to the gather path instead of guessing |
+| 4 | **`mincore()` over the table's byte range**, or `/proc/<pid>/pagemap` for the same range | small patch, or an external reader of the mapping's address | the only method that answers residency *of that specific range*: how many of the ~30 GB are present after N tokens, and whether it decays over time. llama.cpp already knows the exact ranges (`lazy_ranges`, `llama-model-loader.cpp:1096-1098`), so a debug print is a few lines |
+| 5 | `clear_refs` on the mapping then re-measure faults per token | small patch | turns "I think we fault 16 times per token" into a number, with the residency reset deliberately |
+
+Start with 1: it is free, it takes one decode run, and it can close the question in either
+direction before any code is written.
+
+## Where a cache should live
+
+Given the gather is **already host-side** (`ggml_get_rows` on a CPU-placed weight, hash
+computed on the host because ggml has no int64/xor):
+
+- **A RAM-side cache is the smaller change.** It needs no new ggml op, no index remapping, no
+  interaction with graph capture - it is a host data structure in front of the file-backed
+  range, i.e. effectively "pin the hot rows". If the problem is fault latency and RAM is
+  available for the hot set, this is the fix, and it is compatible with keeping `-lm none`.
+- **A VRAM cache is the bigger change**: a new on-device tensor, remapped row indices, miss
+  paths back to the host, and it is exactly the kind of dynamic-shape thing that may itself
+  defeat graph capture - which is one of the things we suspect is already wrong.
+- Caveat on the RAM idea: if the binding constraint is *system RAM pressure* (which is why
+  `-lm mmap` thrashes at all), a RAM cache competes for the same scarce resource and wins only
+  by being smaller and smarter about eviction. So steps 1 and 4 above are what determine
+  whether a RAM cache is a fix or just a re-labelled version of the same problem.
+
 ## The shape of the problem, which the user's two ideas split cleanly
 
 Facts that matter, all from `plans/model-shape.md`: PLE serves **exactly one** layer
