@@ -11,7 +11,7 @@ try that?".
 | E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - (instrument now blocked on E004; `n_kv_max` flip is inert, see E001) | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
 | E004 | - | T1 | dev-rx9070-16g | a config-shaped synthetic model (real head_dim 256 / 24-2 heads / hc_lowrank 320 / budget 2048, fewer experts) is a usable pp instrument | - | planned | (record not yet written) |
 | E005 | 2026-09-17 | **T2** | bench-4x-r9700-32g | real qwen4exp Q4_K_M on 4x R9700 gives us a baseline | pp512/4k/8k = 397/512/547 t/s, tg128 = 28.2 t/s; **~9% GPU util**; **not a baseline** - user's fork, different ROCm | done | [runs/E005-real-baseline.md](runs/E005-real-baseline.md) |
-| E006 | - | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg ~20-40x via per-layer cross-GPU collectives over PCIe (no Infinity Fabric on Navi 48) | - | planned | (record not yet written) |
+| E006 | 2026-09-17 | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg via per-layer cross-GPU collectives (no Infinity Fabric on Navi 48) | **refuted by sign**: layer split does ~zero collectives and is *slower* (tg 24.7 vs 28.2). Also refutes bandwidth-bound (predicted 0.25 ratio, measured 0.88). tg cost is serial and mode-independent | done | [runs/E006-split-mode.md](runs/E006-split-mode.md) |
 
 ## Comparability breaks
 
