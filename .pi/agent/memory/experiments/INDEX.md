@@ -14,9 +14,11 @@ try that?".
 | E006 | 2026-09-17 | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg via per-layer cross-GPU collectives (no Infinity Fabric on Navi 48) | **refuted by sign**: layer split does ~zero collectives and is *slower* (tg 24.7 vs 28.2); also refutes bandwidth-bound (predicted 0.25 ratio, measured 0.88). tg is serial and mode-independent | done | [runs/E006-split-mode.md](runs/E006-split-mode.md) |
 | E007 | - | T2 | bench-4x-r9700-32g | move the n-gram table onto VRAM to avoid the host gather | **impossible**: the PLE path is *mirrored* under `-sm tensor` (`src/llama-model.cpp:513-515`), so ~30 GB becomes ~30 GB/card on a 128 GB box | dead-end | folded into [plans/ple-prefetch.md](plans/ple-prefetch.md) |
 | E008 | 2026-09-17 | T2 | bench-4x-r9700-32g | the CPU-placed table might defeat HIP graph capture | **no** - capture is active: graphs off costs 7% of tg and ~7% of deep pp. Bounds total launch-submission cost at ~2.7 ms/token | done | [runs/E008-graph-capture.md](runs/E008-graph-capture.md) |
-| E009 | - | T2 | bench-4x-r9700-32g | decode may reallocate its graph every step, which graphs cannot remove | - | planned | (see backlog Next runs) |
+| E009 | 2026-09-17 | T2 | bench-4x-r9700-32g | the graph may be reallocated at unchanged size every step | **no** - the hook GGML_ABORTs when it fires and the run finished clean; same-size realloc ruled out | done | [runs/E009-graph-realloc.md](runs/E009-graph-realloc.md) |
+| E010 | 2026-09-17 | T2 | bench-4x-r9700-32g | graph reuse may already be broken for this model | **no, best number yet**: reuse works, worth ~22 ms/step (tg 28.20->17.36; pp512 +19.6 ms on its single build); pp insensitive, decode collapses | done | [runs/E010-graph-reuse.md](runs/E010-graph-reuse.md) |
 | E011 | 2026-09-17 | T2 | bench-4x-r9700-32g | if tg scales super-linearly with concurrency the cost is per-step host work | **yes**: ~28 ms/step is fixed regardless of tokens (B=1/2/4 -> 32.4/36.7/52.5 ms per step); ~90% of a decode token is per-step cost. Bonus: 40k depth costs only ~10% of tg, bounding H4b | done | [runs/E011-concurrency.md](runs/E011-concurrency.md) |
 | E014 | - | T2 | bench-4x-r9700-32g | `-lzm off` + `-ot ...=CPU` gives a resident table with no demand paging; if tg improves, faults are part of the fixed ~28 ms | - | planned | [runs/E011-concurrency.md](runs/E011-concurrency.md#found-in-the-header-of-this-log--ot-has-never-done-anything) |
+| E015 | 2026-09-17 | T2 | bench-4x-r9700-32g | scheduler op-offload may be the fixed per-step cost | **no** - tg 28.14 vs 28.20, pp 547.5 vs 546.8, CSV confirms `no_op_offload=1` applied | dead-end | [runs/E015-no-op-offload.md](runs/E015-no-op-offload.md) |
 
 ## Comparability breaks
 
@@ -116,6 +118,16 @@ measuring at all. Detail in the topic memories.
   overrides (`W llama_model_loader: tensor overrides do not apply to lazy-read tensors`), and
   lazy mode itself forces the CPU buffer type (`src/llama-model-loader.cpp:1080-1086`). The
   placement is real; the mechanism was not what F3 claimed. See E011.
+
+- **A host-side graph pass costs ~20-22 ms on this box** (E010): disabling graph reuse
+  dropped tg 28.20 -> 17.36 while every pp row stayed within noise, and pp512's whole test
+  gained 19.6 ms for its single build. Two independent measurements bounding the same number
+  is why it is trusted. Per-step cost is invisible in prefill (amortised over ~512 tokens) and
+  dominant in decode - so **pp numbers must never be used to reason about decode**.
+- **Six mechanisms for the ~28 ms/step are now excluded**: weight bandwidth, cross-GPU
+  collectives, split mode, graph capture, scheduler op-offload (E015), same-size graph realloc
+  (E009). Reuse works. What remains is per-step host work that flags cannot reach -> E016 is a
+  host profile, not another A/B.
 
 ## Status legend
 
