@@ -3,7 +3,7 @@
 - date: 2026-09-17
 - machine: dev-rx9070-16g
 - tier: T1
-- status: blocked
+- status: done
 - parent: -
 - commit: `ebbb185227c31f1652f1445e2623563d2f67fe5a` (tree: clean; only untracked `.pi/agent/memory/`)
 - build: pre-existing `build/`, `GGML_HIP=ON`, `BUILD_SHARED_LIBS=ON`, no `AMDGPU_TARGETS` override
@@ -86,3 +86,60 @@ the synthetic model - slower per-op but it exercises the same kernels end to end
 Structural thought this raises: `BUILD_SHARED_LIBS=ON` plus a shadowing `~/.local` is a
 permanently unsafe default for a perf branch. A static build, or an rpath, removes the
 whole class of error rather than relying on remembering an export. Candidate backlog B0.
+(Note: `GGML_STATIC` is a hard `FATAL_ERROR` on the HIP path, so for B0 it is rpath or
+nothing.)
+
+---
+
+## Update, same day - harness run with the pin (user authorised GPU use)
+
+`status: blocked -> done`. The user recalled `test-backend-ops` hanging the GPU, but
+specifically **on the flash-attention tests, and on the bench box**, with the mul_mat tests
+fine. Re-tested here under the pin, in widening stages:
+
+| stage | scope | result |
+|---|---|---|
+| 1 | `support`, 13 ops incl. HC/GDN/TOP_K/SET_ROWS/ARGSORT | **rc=0**, 9906 supported / 2384 unsupported cases |
+| 2 | `test`, the qwen4exp op set *excluding* FLASH_ATTN_EXT | **1500/1500 passed** |
+| 3 | `test -o FLASH_ATTN_EXT -p n_kv_max=512` (the sparse cases) | **11/11 passed** - no abort, see below |
+| 4 | `test -o FLASH_ATTN_EXT`, whole suite | **3973/3979 passed, rc=1**, no hang, no crash |
+
+**The AMD `test-backend-ops` blocker is removed for the dev box.** Evidence:
+`results/E001-harness-summary.txt` (per-op support tallies, the six failing cases, the
+commands) plus the retained `results/E001-test-fa-sparse.log`. The three large raw logs were
+distilled away rather than committed, per `PROTOCOL.md` 8 - they regenerate from the commands
+in the summary.
+
+### The 6 failures
+
+All are `hsk=192, hsv=128`, gqa 8 or 16, with permuted K/V views; error 0.0033-0.0298
+against a 0.0005 tolerance. Numerically wrong, not a crash. **qwen4exp is 256/256, and that
+set passed 142/142**, so this is not our path - recorded in `plans/backlog.md` as an
+observed-but-out-of-scope defect rather than chased.
+
+### Why the sparse cases did not hit the GGML_ABORT
+
+The 18 nonzero-`n_kv_max` FA cases all report `SUPPORTED` on `ROCm0` (they select a kernel
+via `ggml_cuda_flash_attn_ext_supported` -> `get_best_fattn_kernel != NONE`, which never
+consults `n_kv_max`), and then **pass**, because `use_sparse` is false on HIP so
+`compact_mask` is never called and the case silently computes dense over the same mask.
+
+This corrects a claim in `rdna4-rocm-build`: the `GGML_ABORT` is unreachable, not a
+landmine, and the implication for the model is sharper than I put it -
+
+> **flipping `n_kv_max` at `src/models/qwen4exp.cpp:767` is inert on ROCm.** It changes
+> neither results nor speed, because the sparse branch is compiled out (`#if
+> !defined(GGML_USE_HIP)` at `fattn.cu:133-140`) rather than merely gated off. H4b is
+> therefore real kernel work in `mma_f16`, not a flag flip, and H4a cannot be approximated
+> by toggling `n_kv_max` either.
+
+### Still open
+
+- **The dummy-model leg of the original hypothesis was never re-run.** E001 set out to prove
+  `test-llama-archs` + `test-fusion` + `llama-bench` work too; what got re-tested under the
+  pin is `test-backend-ops` only. Those three remain unverified and are E002's first
+  commands, so E001 is closed on the blocker it actually gates (B1, the correctness gate)
+  and not on its full original scope.
+- The bench box hang is unreproduced and now has to be explained differently: not a general
+  AMD problem. Candidates are the 4-GPU config, a different ROCm version, or a different code
+  state - all three are B2 unknowns. If it recurs there, capture which stage dies.

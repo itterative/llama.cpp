@@ -12,7 +12,7 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
 | id | thread | why it blocks |
 |---|---|---|
 | B0 | make the build un-shadowable: **rpath**, since `GGML_STATIC` is a hard `FATAL_ERROR` on the HIP path | `BUILD_SHARED_LIBS=ON` + `~/.local/lib64` holding a Sep 15 llama.cpp means an unpinned run silently measures old code. Found in E001. `CMAKE_BUILD_RPATH=$PWD/build/bin` is the one-line fix |
-| B1 | triage `test-backend-ops` crashing on AMD GPUs | the tree's correctness + per-op perf gate, so rule 3 has no teeth without it. Two shape facts learned: it has **no insufficient-memory skip logic** (an oversized case OOM-aborts the process) `[s]`, and `-b` is an exact `strcmp` that **exits 0 having tested nothing** on a typo `[v]`. The `test_dsv4_hc*` cases are f32 and tiny, so HC validation should be cheap once the crash is understood |
+| B1 | ~~triage `test-backend-ops` crashing on AMD GPUs~~ **closed on the dev box** | it does not crash here: 1500/1500 non-FA and 3973/3979 FA cases pass on gfx1201 / ROCm 6.4.4, so rule 3 has a working gate (E001 update). The bench-box hang the user remembers is real but box-specific - candidates are the 4-GPU config, its ROCm version, or its code state, all B2 unknowns. Two sharp edges to keep in mind: no insufficient-memory skip logic (oversized case OOM-aborts) `[s]`, and `-b` is an exact `strcmp` that exits 0 having tested nothing on a typo `[v]` |
 | B2 | bench box: ROCm version, PCIe topology, system RAM | gfx target is now known: **gfx1201 on both boxes** (user-confirmed), so a dev build is ISA-valid there. What remains decides whether numbers are comparable, not whether binaries run |
 | B3 | decide the ROCm version policy for the dev box | dev box 6.4.4, user wants 7.x. Only one cmake gate exists (ROCm >= 6.1) `[v]` and there is no `ROCM_VERSION` in-code gating `[s]`, so an upgrade is lower-risk to code paths than assumed - but still a comparability break for measurements |
 
@@ -29,7 +29,7 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
 
 | id | was | now |
 |---|---|---|
-| P1 | which ops fall off the GPU | **probably none.** Against `ggml_backend_cuda_device_supports_op`, every op in the qwen4exp graph has a real HIP kernel; the only `GGML_USE_HIP` conditionals loosen (`TOP_K`) or tighten (`ARGSORT`) `[s]`. Remaining escape hatches: elementwise contiguity gates, and `ARGSORT` needing `ne[0] <= 1024` `[v]` - real `num_experts = 512`, so the router stays on GPU |
+| P1 | which ops fall off the GPU | **now measured, not merely reasoned:** `test-backend-ops support -b ROCm0` over 13 families -> 9906 supported / 2384 unsupported cases, and the non-FA `test` run passed 1500/1500 `[v]`. Every op in the graph has a real HIP kernel. Remaining escape hatches: elementwise contiguity gates, and `ARGSORT` needing `ne[0] <= 1024` `[v]` - real `num_experts = 512`, so the router stays on GPU |
 | P4 | which FA family does gfx1201 get | **`mma_f16` for prompt processing, not for decode.** `amd_wmma_available` + DK 256 + `gqa_ratio_eff 4` gives threshold `Q->ne[1]*4 > 16` (`ggml/src/ggml-cuda/fattn.cu:667-671` `[v]`, `(256,256,*)` instances exist `[v]`). Decode of 1 token falls to tile/vec. Since sparse FA lives only in `mma_f16`, H4b is a **pp-only** win - which is where long-context cost is anyway |
 | H3 | HC kernels may be shape-restricted | **not on HIP.** The gate is dtype-only, all-F32, no shape restriction (`ggml-cuda.cu:5492-5501`) `[v]`. The `ne[1] == 4` rule I feared is Metal/Vulkan's. Replaced by N1 below |
 | P5 | does the model fit | capacity is not the constraint on this box; see `model-shape.md` |
@@ -51,7 +51,7 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
 | H1 | `-sm tensor` unavailable for qwen4exp forces layer split on the 4-GPU box | `llm_arch_supports_sm_tensor` returns false for `LLM_ARCH_QWEN4EXP` (`src/llama-arch.cpp:1161`), upstream `// TODO: fix test-llama-archs`. Layer split on a hybrid stack (36 GDN + 12 QSA + MoE + 1 PLE layer) is imbalanced by construction. Now partly testable locally via N3 |
 | H2 | the hyper-connection chain is under-optimised on HIP | HC replaces every per-layer norm, so it is per-layer and every-token in both modes. Only `_PRE`(gated) and `_POST`(comb=null) are emitted `[x]`; both are f32-only `[v]`; and `rms_norm+mul` fusion was only just enabled (`41abbfd59`). New kernels are usually correct before they are tuned. Bounded by N5 |
 | H4a | stop paying the indexer + mask-rebuild tax while compaction is unavailable | mask rebuild is `fill(-INF)` + `set_rows` + `add` per full-attn layer per ubatch (`src/models/qwen4exp.cpp:735-758`) `[v]` - traffic scaling with context for a mask whose interior the kernel ignores. `:566` already trims the upload to `1/ratio` of cells. Obsolete the moment H4b lands |
-| H4b | port the mask compaction to HIP, then flip `n_kv_max` | narrowed by the survey to: one warp-ballot kernel (`fattn.cu:10-89`, `WARP_SIZE == 32` which gfx1201 has, but `ggml_cuda_pdl_*` are NVIDIA-only), three guards to remove (`:92-96`, `:109-113`, `:133-140`) `[v]`, one call site (`qwen4exp.cpp:767`) `[v]`. Effect size: `indexer_budget 2048` of a 262,144 context, on 12 of 48 layers - and per P4 it applies to the `mma_f16` pp path. Vulkan's `flash_attn_sparse_compact.comp` and Metal's own cap (`n_kv_max > 4096` -> dense) are prior art |
+| H4b | port the mask compaction to HIP, then flip `n_kv_max` | narrowed by the survey to: one warp-ballot kernel (`fattn.cu:10-89`, `WARP_SIZE == 32` which gfx1201 has, but `ggml_cuda_pdl_*` are NVIDIA-only), the `#if !defined(GGML_USE_HIP)` compile guards (`:92-96`, `:109-113`, `:133-140`) `[v]`, and the call site (`qwen4exp.cpp:767`) `[v]`. **Updated by E001: flipping the call site first is inert, not a safe first step** - sparse cases already report SUPPORTED and compute dense, so results and cost are unchanged either way. Effect size: `indexer_budget 2048` of 262,144 context, on 12 of 48 layers, pp-only per P4 |
 | H5 | PLE n-gram hashing | `ple_n_heads = (3-1)*8 = 16` gathers per token from a ~20 M x 2560 table = ~51 B params = 28% of the model, serving one layer, hashed host-side. Superseded in priority by L1/L2 |
 | H6 | fp32 output preference on RDNA4 | `prefer_f32_output` is forced on for RDNA4 (`ggml-cuda.cu:1512`, `:1514`) `[v]`, and `mmvq.cu:417-492` has an RDNA4-only `nwarps` whitelist `[s]`. Confirmed as real, still unmeasured: a per-model override is a plausible small win |
 | H7 | VMM disabled | `GGML_HIP_NO_VMM` defaults ON, and the `VMM: no` banner is just that flag, not a device query `[s]`. Allocation/fragmentation behaviour differs from a CUDA default - relevant to both the 16 GB box and a 4-card split |
@@ -66,6 +66,12 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
 - qwen4exp uses `llama_memory_hybrid_idx`, **not** the `dsa`/`msa`/`iswa` cache classes `[s]`.
 - Sparse-ness is expressed *as the mask*; compaction is what makes a mask cheaper to
   iterate. No separate sparse kernel exists in ggml-cuda `[s]`.
+- `FLASH_ATTN_EXT` has **6 known numeric failures at hsk=192/hsv=128** (gqa 8/16, permuted
+  K/V views, err up to 0.0298 vs 0.0005 tol) `[v]`. Not our shape - do not chase it, but do
+  not mistake it for a regression you introduced when re-running the FA suite.
+- Empirical FA support at our shape: **hsk/hsv 256/256 is 142/142 supported on `ROCm0`**
+  (f16/q4_0/q8_0 KV) `[v]`. Zero support: 96/64, 128/64, 192/192, 64/128 - never assume a
+  mismatched DK/DV pair works.
 
 ## Explicitly out of scope for now
 

@@ -130,11 +130,25 @@ n_embd_head_k`): `gqa_ratio = 12` -> `gqa_ratio_eff = 4`, threshold for DK=256 i
   sparse branch itself `#if !defined(GGML_USE_HIP)` (`:133-140`) `[v]`.
 
 So H4b's port surface is one warp-ballot kernel (`fattn.cu:10-89`, `WARP_SIZE == 32` which
-gfx1201 satisfies, but its `ggml_cuda_pdl_*` hooks are NVIDIA-only) plus removing three
-guards plus flipping `n_kv_max` at `src/models/qwen4exp.cpp:767`. Much narrower than
-"implement sparse attention".
+gfx1201 satisfies, but its `ggml_cuda_pdl_*` hooks are NVIDIA-only) plus removing the
+compile-time `#if !defined(GGML_USE_HIP)` guards (`:92-96`, `:109-113`, `:133-140`) `[v]`
+plus the call site `src/models/qwen4exp.cpp:767`. Much narrower than "implement sparse
+attention", but still kernel work.
+
+**The `GGML_ABORT` is unreachable, and the call site cannot be flipped early.**
+`ggml_cuda_flash_attn_ext_supported` -> `get_best_fattn_kernel != NONE` never consults
+`n_kv_max`, so sparse-shaped cases report `SUPPORTED` on `ROCm0` - all 18 nonzero
+`n_kv_max` cases in `test-backend-ops` do - and then **pass by computing dense over the same
+mask**, because `use_sparse` is false and `compact_mask` is never called `[v]`. Consequence:
+passing `top_k->ne[0]` today is **inert** on ROCm, identical results and identical cost. So
+H4b cannot be staged by toggling that argument, and H4a cannot be probed that way either.
 
 ## qwen4exp op support on HIP - the headline is "everything is on the GPU"
+
+Now backed by execution, not only by reading gates `[v]`: `test-backend-ops support -b ROCm0`
+over 13 op families gives 9906 supported / 2384 unsupported cases, and `FLASH_ATTN_EXT` at
+**hsk/hsv 256/256 is 142/142 supported** (f16, q4_0, q8_0 KV). Shape pairs with zero
+support, so never assume them: 96/64, 128/64, 192/192, 64/128.
 
 Against `ggml_backend_cuda_device_supports_op` (`ggml-cuda.cu:5064`), **every op in the
 qwen4exp graph has a real HIP kernel**; the only `GGML_USE_HIP` conditionals in that function
@@ -175,10 +189,16 @@ shorter:
   `DSV4_HC_*` as unsupported on CUDA and Metal while the kernels exist, and `CUDA.csv` has no
   rows at all for `DSV4_HC*`/`GATED_DELTA_NET`/`LIGHTNING_INDEXER`/`TOPK`. Generated snapshot
   (`scripts/create_ops_docs.py`); never use it as support truth.
-- `test-backend-ops` has **no insufficient-memory skip logic** `[s]` - an oversized case
-  OOM-aborts the process. That, plus `-b`'s silent no-match exit-0, is the current shape of
-  B1. Note `test_dsv4_hc*` cases are f32 and tiny (`:8964-8986`), so the HC ops specifically
-  should be cheap to validate once the crash is understood.
+- `test-backend-ops` **works on gfx1201 / ROCm 6.4.4** `[v]`: 1500/1500 non-FA cases and
+  3973/3979 FA cases passed, no hang. The reported AMD hang is therefore not universal;
+  E001's update has the stages, and the bench-box hang stays open as a box-specific symptom.
+  Two real sharp edges remain: there is **no insufficient-memory skip logic** `[s]` (an
+  oversized case OOM-aborts), and `-b` is an exact `strcmp` that **exits 0 having tested
+  nothing** on a typo `[v]`.
+- known numeric defect, not on our path: `FLASH_ATTN_EXT` fails 6 cases at
+  **hsk=192/hsv=128** (gqa 8/16, permuted K/V views), err up to 0.0298 vs a 0.0005 tol `[v]`.
+  qwen4exp is 256/256, which passes 142/142. Know this before re-running the FA suite and
+  seeing red.
 - qwen4exp uses `llama_memory_hybrid_idx` (`llama-model.cpp:2565`, `:2584-2589`), **not** the
   `dsa`/`msa`/`iswa` cache classes; its `set_input_qsa` is host-side index/bias construction
   with `GGML_ASSERT(r <= 64)` (`llama-memory-hybrid-idx.cpp:273-340`) `[s]` - real
@@ -194,4 +214,3 @@ shorter:
   `-D__GFX12__` probing, or grep the object for the gfx12 ISA.
 - Whether `-cmoe`/`-ncmoe` and `-ot` placement interacts with `ARGSORT`/`MUL_MAT_ID` support
   gates when expert weights live on CPU.
-- The reported `test-backend-ops` crash on AMD (B1) - still unexplained.

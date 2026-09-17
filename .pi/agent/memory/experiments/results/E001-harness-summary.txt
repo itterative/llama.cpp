@@ -1,0 +1,61 @@
+E001 T1-harness evidence, distilled (full logs are regenerable; commands below)
+commit: 9c35c53008c56d5285209b35262ecb2e52bb0796  tree: n/a
+
+### device banner (all stages)
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9070, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 16304 MiB
+
+### stage 1: support probe, per-op supported/unsupported case counts
+$ ./build/bin/test-backend-ops support -b ROCm0 -o "MUL_MAT,MUL_MAT_ID,DSV4_HC_PRE,DSV4_HC_POST,GATED_DELTA_NET,TOP_K,SET_ROWS,GET_ROWS,ARGSORT,SSM_CONV,ROPE,REPEAT,FLASH_ATTN_EXT"
+  ARGSORT NOT SUPPORTED    52
+  ARGSORT SUPPORTED        46
+  FLASH_ATTN_EXT NOT SUPPORTED 1321
+  FLASH_ATTN_EXT SUPPORTED 3979
+  GATED_DELTA_NET SUPPORTED 36
+  GET_ROWS NOT SUPPORTED   24
+  GET_ROWS SUPPORTED       215
+  MUL_MAT_ID NOT SUPPORTED 8
+  MUL_MAT_ID SUPPORTED     913
+  MUL_MAT NOT SUPPORTED    385
+  MUL_MAT SUPPORTED        1296
+  REPEAT NOT SUPPORTED     6
+  REPEAT SUPPORTED         12
+  ROPE NOT SUPPORTED       20
+  ROPE SUPPORTED           450
+  SET_ROWS NOT SUPPORTED   568
+  SET_ROWS SUPPORTED       159
+  SSM_CONV SUPPORTED       45
+  TOP_K SUPPORTED          359
+
+### stage 2: test mode, qwen4exp op set WITHOUT FLASH_ATTN_EXT (1500/1500 passed)
+$ ./build/bin/test-backend-ops test -b ROCm0 -o "DSV4_HC_PRE,DSV4_HC_POST,GATED_DELTA_NET,TOP_K,SET_ROWS,GET_ROWS,ARGSORT,SSM_CONV,REPEAT,ROPE"
+  Backend 2/2: CPU
+    Skipping
+  2/2 backends passed
+  OK
+
+### stage 3: the 18 nonzero-n_kv_max sparse-shaped FA cases -> no abort
+$ ./build/bin/test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT -p "n_kv_max=512"
+    11/11 tests passed
+    Backend ROCm0: OK
+
+### stage 4: FULL FA suite, 6 numeric failures, no hang (rc=1)
+$ ./build/bin/test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT
+    3973/3979 tests passed
+    Backend ROCm0: FAIL
+  failing cases (6):
+    hsk=192,hsv=128 nr23=[16,1] kv=512 nb=32 permute=[0,1,2,3] err=0.009430811 tol=0.0005
+    hsk=192,hsv=128 nr23=[16,1] kv=512 nb=32 permute=[0,1,2,3] err=0.029823253 tol=0.0005
+    hsk=192,hsv=128 nr23=[16,1] kv=512 nb=75 permute=[0,2,1,3] err=0.007923175 tol=0.0005
+    hsk=192,hsv=128 nr23=[8,1]  kv=512 nb=32 permute=[0,2,1,3] err=0.003260387 tol=0.0005
+    hsk=192,hsv=128 nr23=[8,1]  kv=512 nb=32 permute=[0,2,1,3] err=0.007178353 tol=0.0005
+    hsk=192,hsv=128 nr23=[8,1]  kv=512 nb=75 permute=[0,1,2,3] err=0.010186210 tol=0.0005
+
+### provenance
+
+The stage 1/2/4 raw logs were 1.7 MB / 276 KB / 1.5 MB and were distilled away on purpose
+(`PROTOCOL.md` 8: nothing over a few hundred KB committed; those runs are one command each
+to regenerate). The per-op tallies and the six failing cases above were extracted from them
+while they existed, and the `1500/1500` and `3973/3979` lines come from that same session's
+console output. `E001-test-fa-sparse.log` is the only raw log retained, because at 2.9 KB it
+is cheap and it is the evidence for the "sparse cases pass by computing dense" finding.
