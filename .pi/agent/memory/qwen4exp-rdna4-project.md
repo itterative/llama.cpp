@@ -97,8 +97,21 @@ threads as first-guess `tg` bottlenecks.
 Run ledger so far: **E001 done** (B1 closed - `test-backend-ops` passes on gfx1201; dummy
 models generate; the qwen4exp graph runs on `ROCm0`; **`test-fusion` is Metal-only so it
 cannot run here**), **E002 dead-end** (a 19 MB synthetic model measures harness overhead, not
-the bottleneck), **E003 planned but instrument-less** until either E004 (config-shaped dummy,
-needs dims edited in `tests/test-llama-archs.cpp`) or T2.
+the bottleneck), **E005 done** - first real numbers, from the bench box on the user's fork
+(`pp8192` 547 t/s, `tg128` 28.2 t/s, **9% GPU util**), **E006 planned** (flag-only test of
+whether `-sm tensor` collectives are what is costing `tg`), E003/E004 still instrument-less.
+
+**E005 inverted the plan.** Both pp and tg are one to two orders of magnitude off the
+hardware floor (pp ~3.3 TFLOP/s vs ~180-190 TFLOPS WMMA peak; tg 35.5 ms/token vs a ~1-2 ms
+bandwidth floor), so this box is *waiting*, not working. Per-kernel work - including the QSA
+compaction port (H4b) I was keen on - is demoted. Cross-GPU sync, host-side stalls and
+tensor placement are promoted, and the candidate mechanism is ~288 per-token cross-GPU
+collectives over PCIe with no Infinity Fabric on Navi 48.
+
+Immediate next steps: **B4 - pull the fork's changes in** (MMQ fixes, custom AllReduce,
+qwen4exp tensor split; measure after each), B0 (`CMAKE_BUILD_RPATH`, still pending), then
+E006 on the bench box. The `-lzm`/`-ot` placement questions (F1/F3) are flag-level and may
+move more than any kernel change we could write today.
 
 Immediate next steps, in order: B0 (`CMAKE_BUILD_RPATH`, a one-liner), then the decision
 that E002 forced - **build E004 or accept that T1 has no perf instrument and move perf to
@@ -110,7 +123,8 @@ and the rest of B2 (ROCm version, PCIe topology, system RAM) via the paste-block
 Two survey findings that changed the plan: **`GGML_CUDA_DEVICES` exposes virtual devices, so
 multi-GPU `-sm layer` behaviour is testable on this 16 GB box** (N3 - the two-tier design
 just got cheaper), and **`mma_f16` flash attention is used for prompt processing but not
-decode on gfx1201** (P4), which makes the QSA compaction port H4b a pp-only win.
+decode on gfx1201** (P4), which makes the QSA compaction port H4b a pp-only win - and
+therefore, per E005, a small one.
 
 Code-side leads, both verified: **qwen4exp pays for QSA sparsity it cannot collect on ROCm**
 (`n_kv_max = 0` at `src/models/qwen4exp.cpp:767`; compaction aborts under `GGML_USE_HIP` at
