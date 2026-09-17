@@ -71,3 +71,16 @@ Sequence: E002 must land first (a stable synthetic baseline), and B1 (the
 `test-backend-ops` crash) matters here because V1/V2 alter numerics - without a working
 op gate the only available check is that V0 output is unchanged, which is not a check on
 the ablations at all.
+
+Two constraints learned after this record was written, both of which narrow what it can
+prove:
+
+- **the sparsity win is pp-only.** On gfx1201, `mma_f16` FA is selected when
+  `Q->ne[1] * gqa_ratio_eff > 16` for DK 256 (`ggml/src/ggml-cuda/fattn.cu:667-671`), and
+  sparse compaction exists only in that family - so single-token decode is on tile/vec and
+  cannot benefit at all. `tg` measurements are irrelevant to H4b.
+- **the synthetic model has `head_dim` 128, the real one 256**, which is a different tile
+  configuration and a different threshold. E003's sweep therefore shows whether the tax
+  *exists and scales*, never its magnitude. Record `head_dim` of the model actually used
+  next to every number, and treat any extrapolation to 262 k context as a separate claim
+  needing T2.

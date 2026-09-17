@@ -66,8 +66,11 @@ Scaffolding built: PROTOCOL, INDEX, E001 (harness viability, `blocked` by the tr
 above), E002 (synthetic baseline, `planned`), E003 (QSA tax, `planned`), hw profiles
 (both boxes), backlog B0-B3 / P1-P5 / H1-H8 + H4a/H4b + L1-L3, and
 `plans/model-shape.md` (real dims vs the synthetic dummy). Memories written:
-`qwen4exp-arch`, `experiment-protocol`. Still pending: `rdna4-rocm-build` (cmake wiring,
-env knobs, which FA family HIP uses on gfx1201) - waiting on read-only survey `scout-1`.
+`qwen4exp-arch`, `experiment-protocol`, and `rdna4-rocm-build` (from the `scout-1` survey
+merged with my own re-reads, which corrected three claims of mine: the HC op set is
+`_PRE`(gated) + `_POST`(null-comb) only; HIP has **no** shape gate on HC - that was
+Metal/Vulkan; and the WMMA flash-attn branch is `fattn.cu:667`, not `:655` which is
+CDNA-only).
 
 Headline finding, verified: **qwen4exp builds the QSA indexer and a per-layer mask
 rebuild, then calls attention with `n_kv_max = 0`** - and the compaction that would make
@@ -91,11 +94,17 @@ backlog: L1 (is that table resident or `--lazy-mode` page-faulting?), L2 (host-s
 + graph split per ubatch), L3 (10-of-512 expert routing) now sit ahead of the HC/QSA kernel
 threads as first-guess `tg` bottlenecks.
 
-Immediate next steps, in order: resolve B0-B1 (unshadowable build, `test-backend-ops`
-crash triage), then rerun E001 with the pin, then E002 to get the first real baseline. The
-two highest-value *user-side* actions are L1 (one `grep` over a load log they already have)
+Immediate next steps, in order: resolve B0 (now a one-liner: `CMAKE_BUILD_RPATH`) and B1
+(`test-backend-ops` crash triage), then rerun E001 with the pin, then E002 for the first
+real baseline. Highest-value user-side actions: **L1** - one `grep` over a load log that
+already exists, asking whether the Q5 n-gram table is resident or page-faulted on demand -
 and the rest of B2 (ROCm version, PCIe topology, system RAM) via the paste-block in
 `experiments/hw/bench-4x-r9700-32g.md`.
+
+Two survey findings that changed the plan: **`GGML_CUDA_DEVICES` exposes virtual devices, so
+multi-GPU `-sm layer` behaviour is testable on this 16 GB box** (N3 - the two-tier design
+just got cheaper), and **`mma_f16` flash attention is used for prompt processing but not
+decode on gfx1201** (P4), which makes the QSA compaction port H4b a pp-only win.
 
 Code-side leads, both verified: **qwen4exp pays for QSA sparsity it cannot collect on ROCm**
 (`n_kv_max = 0` at `src/models/qwen4exp.cpp:767`; compaction aborts under `GGML_USE_HIP` at
