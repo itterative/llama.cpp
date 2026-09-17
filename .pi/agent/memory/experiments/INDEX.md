@@ -19,6 +19,7 @@ try that?".
 | E011 | 2026-09-17 | T2 | bench-4x-r9700-32g | if tg scales super-linearly with concurrency the cost is per-step host work | **yes**: ~28 ms/step is fixed regardless of tokens (B=1/2/4 -> 32.4/36.7/52.5 ms per step); ~90% of a decode token is per-step cost. Bonus: 40k depth costs only ~10% of tg, bounding H4b | done | [runs/E011-concurrency.md](runs/E011-concurrency.md) |
 | E014 | - | T2 | bench-4x-r9700-32g | `-lzm off` + `-ot ...=CPU` gives a resident table with no demand paging; if tg improves, faults are part of the fixed ~28 ms | - | planned | [runs/E011-concurrency.md](runs/E011-concurrency.md#found-in-the-header-of-this-log--ot-has-never-done-anything) |
 | E015 | 2026-09-17 | T2 | bench-4x-r9700-32g | scheduler op-offload may be the fixed per-step cost | **no** - tg 28.14 vs 28.20, pp 547.5 vs 546.8, CSV confirms `no_op_offload=1` applied | dead-end | [runs/E015-no-op-offload.md](runs/E015-no-op-offload.md) |
+| E017 | 2026-09-17 | T1 | dev-rx9070-16g | a shape-faithful dummy can be generated and run locally | **yes**: 4 real layers + real types, 5.47 ms/step of which ~4.5 ms is per-step host work; decode is flat across a 10x table volume range (182.1/182.7/182.4) while pp4096 gains 6.5% from a small table; shipped as models/q4exp-4l.gguf with a 5.5 GB table | done | [runs/E017-dummy-harness.md](runs/E017-dummy-harness.md) |
 
 ## Comparability breaks
 
@@ -128,6 +129,17 @@ measuring at all. Detail in the topic memories.
   collectives, split mode, graph capture, scheduler op-offload (E015), same-size graph realloc
   (E009). Reuse works. What remains is per-step host work that flags cannot reach -> E016 is a
   host profile, not another A/B.
+
+- **The qwen4exp n-gram table is 160 x 320,001,536 stored as Q5_0** (real file dump, E017).
+  Earlier notes described it as `20M rows x ple_embed_dim 2560`; the total (51.2 B params) was
+  right but the structure was not: `ple_embed_dim` is the **concatenated** per-token width
+  (16 heads x 160), so a row is 160 elements and llama.cpp requires
+  `embedding_length_per_layer_input * ple_n_heads == n_embd`.
+- **The bartowski Q4_K_M file is mixed precision, not uniform Q4** (E017): attn_k/v are Q8_0,
+  attn_output Q5_K, the router and all HC/PLE gammas are F32 (stored flat, 10240 elements),
+  hc_*_inject and the indexer projections are BF16, hc_*_up and ffn_down_exps Q5_0, and
+  attn_q / ssm_out / shexp vary per layer. llama-quantize's own tables would not reproduce
+  it, so the harness writes these types directly.
 
 ## Status legend
 
