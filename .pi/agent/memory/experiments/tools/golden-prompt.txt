@@ -1,0 +1,5 @@
+The quick brown fox jumps over the lazy dog.
+Quantization maps weights onto a small set of representable values.
+A mixture of experts routes each token to a few of many feed-forward blocks.
+Hyper connections mix the residual stream across several parallel paths.
+State space models carry a recurrent state instead of a key value cache.

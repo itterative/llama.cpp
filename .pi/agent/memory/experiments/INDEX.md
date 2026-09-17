@@ -20,6 +20,7 @@ try that?".
 | E014 | - | T2 | bench-4x-r9700-32g | `-lzm off` + `-ot ...=CPU` gives a resident table with no demand paging; if tg improves, faults are part of the fixed ~28 ms | - | planned | [runs/E011-concurrency.md](runs/E011-concurrency.md#found-in-the-header-of-this-log--ot-has-never-done-anything) |
 | E015 | 2026-09-17 | T2 | bench-4x-r9700-32g | scheduler op-offload may be the fixed per-step cost | **no** - tg 28.14 vs 28.20, pp 547.5 vs 546.8, CSV confirms `no_op_offload=1` applied | dead-end | [runs/E015-no-op-offload.md](runs/E015-no-op-offload.md) |
 | E017 | 2026-09-17 | T1 | dev-rx9070-16g | a shape-faithful dummy can be generated and run locally | **yes**: 4 real layers + real types, 5.47 ms/step of which ~4.5 ms is per-step host work; decode is flat across a 10x table volume range (182.1/182.7/182.4) while pp4096 gains 6.5% from a small table; shipped as models/q4exp-4l.gguf with a 5.5 GB table | done | [runs/E017-dummy-harness.md](runs/E017-dummy-harness.md) |
+| E018 | 2026-09-17 | T1 | dev-rx9070-16g | a zero-filled dummy cannot detect a model-level bug | **yes**: seeded pattern fill + `llama-perplexity` fingerprint, `PPL = 262938.7619 +/- 3039.07`, bit-stable across runs, and perf-neutral vs zeros (181.89 vs 182.40, -0.28%); local noise floor measured at ~1% so only >2% deltas count | done | [runs/E018-correctness-gate.md](runs/E018-correctness-gate.md) |
 
 ## Comparability breaks
 
@@ -140,6 +141,13 @@ measuring at all. Detail in the topic memories.
   hc_*_inject and the indexer projections are BF16, hc_*_up and ffn_down_exps Q5_0, and
   attn_q / ssm_out / shexp vary per layer. llama-quantize's own tables would not reproduce
   it, so the harness writes these types directly.
+
+- **`models/q4exp-4l.gguf` is seeded-filled, not zero-filled, and `llama-perplexity` on
+  `tools/golden-corpus.md` is the model-level correctness gate** (E018). The diff contract is
+  'every diff explained', not 'no diff': the QSA compaction port must move the logits.
+- **Local deltas below ~2% on the dummy harness are noise** (E018: same file measured
+  180.3/181.8/181.9 t/s across invocations). Iterate on 1.3 GB smoke builds; the 12.76 GB
+  build takes ~40 s of I/O and should be written once.
 
 ## Status legend
 
