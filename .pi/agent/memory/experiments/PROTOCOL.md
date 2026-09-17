@@ -211,6 +211,13 @@ written, so every T2 experiment is a hand-off. Keep the hand-off explicit:
   destined for a PR.
 - never commit model weights, gguf files, or anything > a few hundred KB. Synthetic
   models live in `/tmp`, and a record links the generating command instead.
+- **naming encodes disposition.** Under `results/`, `.txt` / `.csv` = kept evidence and gets
+  committed; `.log` = ephemeral spew and does not, because llama.cpp ignores `*.log` repo-wide
+  (`.gitignore:17`). That ignore is intentional and shared, so do not work around it with
+  `git add -f`. If a log really must be versioned - a measurement whose exact conditions can
+  never be reproduced, like a pre-merge fork state - rename it to `.txt` and say why in the
+  record. Check `git ls-files results/` after committing: a cited file that is not listed is
+  a dangling reference, and it has already happened once here.
 - `export LD_LIBRARY_PATH=$PWD/build/bin` in every recorded command block, so the
   record is runnable by someone else without inheriting this box's stale `~/.local`.
 - record the GPU idle state (free VRAM) at the start of every T1 run on the dev box -

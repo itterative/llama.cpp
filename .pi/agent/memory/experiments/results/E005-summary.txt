@@ -1,0 +1,52 @@
+E005 - first real qwen4exp numbers, distilled
+=============================================
+
+Committed summary. The raw files are deliberately NOT in git: they are named `.log` and
+llama.cpp's `.gitignore:17` ignores `*.log` repo-wide, which is the user's intent for
+measurement spew. Raw copies exist untracked on the dev box at
+`.pi/agent/memory/experiments/results/user/` (amd-smi.log, amd-smi-prefill.log,
+lspci.log, results.csv.log, results.log, llama-bench.log [empty]). Treat them as
+disposable-but-present; the numbers below are what was read off them.
+
+Run identity: bench box, 2026-09-17T14:35-14:38Z, build `c9a59ef73` (build 11009, the
+user's fork - NOT this branch), model `bartowski/Qwen3.8-Flash-Next-GGUF` Q4_K_M.
+
+  $ llama-bench -m ~/.cache/huggingface/hub/models--bartowski--Qwen3.8-Flash-Next-GGUF/ \
+      snapshots/928589fd.../Qwen3.8-Flash-Next-Q4_K_M/Qwen3.8-Flash-Next-Q4_K_M-00001-of-00004.gguf \
+      -lm none -sm tensor -fa 1 -lzm auto -ot per_layer_token_embd=CPU \
+      -d 40960 -p 512,4096,8192 -n 128 -r 3 -o csv
+
+Results (n=3 each, from results.csv.log):
+
+  test      t/s      stddev    ms/token
+  pp512     397.51   8.99      2.52
+  pp4096    512.04   3.59      1.95
+  pp8192    546.83   6.98      1.83
+  tg128      28.20   1.02     35.46
+
+Model/config fields worth keeping (one row of the CSV, all four tests identical):
+
+  model_size            119,588,006,400 B  (119.6 GB file)
+  model_n_params        176,943,899,520    (vs 179,999,981,459 HF bf16; ~3.05 B gap
+                                            consistent with the dropped MTP layer)
+  model_type reported   "qwen4exp A3B Q4_K - Medium"
+                        ^ A3B is WRONG: size_label is parsed from the repo/file name, not
+                          computed. Real active size ~6 B (user). See backlog F2.
+  n_batch 2048 | n_ubatch 512 | n_threads 8 | poll 50
+  type_k f16 | type_v f16 | flash_attn 1 | n_gpu_layers -1 | n_cpu_moe 0
+  split_mode tensor | tensor_split 0.00 | tensor_buft_overrides per_layer_token_embd=CPU
+  load_mode none | lazy_mode auto | no_op_offload 0 | devices auto | cpu 5800X
+
+Hardware / stack:
+
+  4x AMD Radeon AI PRO R9700 (Navi 48), gfx1201 (0x1201), VMM: no, Wave Size: 32
+  32624 MiB per card, 130496 MiB total
+  ROCm 7.15.0 | Fedora 44 | kernel 7.2.5-200.fc44 | amd-smi 26.5.0 | VBIOS 00158738
+  power cap 210 W/card; idle 30-40 W and 29-30 C; during prefill 92-95 W at 47-49 C
+  idle Mem-Usage 57/32624 MB per card, no other GPU processes
+  topology: all four under one Zen3 (Starship/Matisse) root complex through two levels of
+    PCIe switches, BDF 0000:0b/10/13/19:00.0. No XGMI / Infinity Fabric.
+  GFX utilisation snapshot during prefill: 9% on every card.  One sample, not a profile.
+
+Key derived facts and the priority inversion they caused are in
+`../../runs/E005-real-baseline.md`; this file is only the transcription of record.

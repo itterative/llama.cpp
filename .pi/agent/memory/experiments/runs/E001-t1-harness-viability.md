@@ -106,9 +106,9 @@ fine. Re-tested here under the pin, in widening stages:
 
 **The AMD `test-backend-ops` blocker is removed for the dev box.** Evidence:
 `results/E001-harness-summary.txt` (per-op support tallies, the six failing cases, the
-commands) plus the retained `results/E001-test-fa-sparse.log`. The three large raw logs were
-distilled away rather than committed, per `PROTOCOL.md` 8 - they regenerate from the commands
-in the summary.
+commands) plus `results/E001-test-fa-sparse.txt` (the retained 2.9 KB evidence for the
+"sparse cases pass by computing dense" finding). The three large raw logs were distilled away
+rather than committed, per `PROTOCOL.md` 8 - they regenerate from the commands in the summary.
 
 ### The 6 failures
 

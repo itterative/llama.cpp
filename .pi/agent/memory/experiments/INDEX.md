@@ -10,6 +10,8 @@ try that?".
 | E002 | 2026-09-17 | T1 | dev-rx9070-16g | a synthetic qwen4exp model gives a usable pp/tg baseline | **no**: 19 MB F32 fits in cache, so pp/tg measure launch + input-path overhead, not the real bottleneck | dead-end | [runs/E002-synthetic-baseline.md](runs/E002-synthetic-baseline.md) |
 | E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - (instrument now blocked on E004; `n_kv_max` flip is inert, see E001) | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
 | E004 | - | T1 | dev-rx9070-16g | a config-shaped synthetic model (real head_dim 256 / 24-2 heads / hc_lowrank 320 / budget 2048, fewer experts) is a usable pp instrument | - | planned | (record not yet written) |
+| E005 | 2026-09-17 | **T2** | bench-4x-r9700-32g | real qwen4exp Q4_K_M on 4x R9700 gives us a baseline | pp512/4k/8k = 397/512/547 t/s, tg128 = 28.2 t/s; **~9% GPU util**; **not a baseline** - user's fork, different ROCm | done | [runs/E005-real-baseline.md](runs/E005-real-baseline.md) |
+| E006 | - | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg ~20-40x via per-layer cross-GPU collectives over PCIe (no Infinity Fabric on Navi 48) | - | planned | (record not yet written) |
 
 ## Comparability breaks
 
@@ -17,7 +19,7 @@ Any row here means numbers on either side of it are not valid A/B partners.
 
 | date | machine | change | invalidated |
 |---|---|---|---|
-| - | - | (none yet) | - |
+| 2026-09-17 | both | **the two boxes are not the same stack**: bench is ROCm 7.15.0 / Fedora 44 / kernel 7.2.5, dev is ROCm 6.4.4 / Fedora 43 | no dev-box number may be an A/B partner for a bench-box number, and vice versa. E005's numbers additionally come from a **fork** (`c9a59ef73`) with RDNA4 MMQ fixes, a custom AllReduce, and qwen4exp tensor-split enablement that this branch does not have |
 
 ## Machine profiles
 
@@ -78,6 +80,18 @@ measuring at all. Detail in the topic memories.
   side. See E001 stage 3.
 - **Sparse FA support at qwen4exp's shape is empirically fine on ROCm0:** 142/142
   `FLASH_ATTN_EXT` cases at hsk/hsv 256/256 supported (E001 support probe).
+
+- **The box is nowhere near a hardware floor, so overhead is the project.** E005: pp8192
+  reaches ~3.3 TFLOP/s against a user-reported ~180-190 TFLOPS WMMA fp16 peak, and `GFX` util
+  sampled at **9% on all four cards**. tg128 = 35.5 ms/token vs a ~1-2 ms bandwidth floor.
+  Consequence: per-kernel work (H4b/QSA) is demoted; cross-GPU sync, host-side stalls and
+  placement (E006, F1-F3) are promoted.
+- **`size_label` is a lie, structurally**: it is parsed from the repo/file name
+  (`gguf-py/gguf/metadata.py:314-328`), so this GGUF reported `A3B` for a ~6 B-active model.
+  Derive params yourself (backlog F2).
+- **`-lm none` does not disable lazy reads, and no load mode ever prefetches the lazy table**
+  - the WILLNEED loop excludes lazy ranges and they are marked `MADV_RANDOM`
+  (`src/llama-mmap.cpp:500-510`). Backlog F1.
 
 ## Status legend
 
