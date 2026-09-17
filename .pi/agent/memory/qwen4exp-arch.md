@@ -123,6 +123,14 @@ copies rather than `ggml_conv_1d_dw`, because that op "is documented as unreliab
 (`src/models/qwen4exp.cpp`, PLE conv comment). Conv history lives in its own recurrent
 cache rows - two per layer, which is why the shared `build_conv_state` is not usable.
 
+**Under `-sm tensor` the PLE path is mirrored, not split**
+(`GGML_BACKEND_SPLIT_AXIS_MIRRORED` for the PLE cache, `src/llama-model.cpp:513-515`: "the PLE
+table is model-level and its conv is mirrored, so every device runs the whole conv and needs
+the whole history"). Consequence for memory sizing: putting the ~30 GB table on GPU costs
+~30 GB **per card**, and the QSA indexer cache is mirrored for the same reason (`:508-510`).
+This is why decode-side work targets a row cache rather than the table - see
+`experiments/plans/ple-prefetch.md`.
+
 ## Graph and memory
 
 Always builds `llama_memory_hybrid_idx` (`:368`), so the recurrent+KV hybrid path is in

@@ -112,35 +112,27 @@ independent of split mode** - currently blamed on `-ot per_layer_token_embd=CPU`
 CPU gather + H2D + graph split at layer 1 every step, possibly defeating HIP graph capture
 entirely.
 
-Immediate next steps: **E008** (`GGML_CUDA_DISABLE_GRAPHS=1`, one env var, tests whether HIP
-graph capture is even active - most informative per minute spent), then **E007** (drop
-`-ot ...=CPU` and see if tg jumps; ~48 GB of VRAM is free so the table can probably go on
-GPU), then **E007b** (repeat the `-sm` pp A/B once the table is off CPU - the user expects
-layer split to *win* pp via inter-layer pipeline overlap, and if it does after E007 then a
-single host-stall mechanism explains both the tg cost and the pp anomaly). Then **B4 - pull
-the fork's changes in** (MMQ fixes, custom AllReduce, qwen4exp tensor
-split; measure after each), blocked on getting me the diff. B0 (`CMAKE_BUILD_RPATH`) stays
-parked at the user's choice. Tensor split is confirmed as the mode to keep, so the
-`llama-arch.cpp` guard is an obstacle to clear, not a limitation to work around.
+Immediate next steps: **E008** (`GGML_CUDA_DISABLE_GRAPHS=1`) is the flag-only experiment that
+discriminates the live hypothesis - if tg does not move, HIP graph capture was already inactive
+for this model and the host path is confirmed as the stall. Then warm the table's page range
+externally and rerun tg (no code change; separates fault cost from sync cost), then the offline
+index-log hit-rate study that decides the VRAM row cache (`experiments/plans/ple-prefetch.md`).
+**B4 - pull in the fork's MMQ fixes, custom AllReduce, and qwen4exp tensor-split enablement** -
+is the top code action, blocked only on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays
+parked at the user's choice.
 
-Immediate next steps, in order: B0 (`CMAKE_BUILD_RPATH`, a one-liner), then the decision
-that E002 forced - **build E004 or accept that T1 has no perf instrument and move perf to
-the bench box**. Highest-value user-side actions: **L1** - one `grep` over a load log that
-already exists, asking whether the Q5 n-gram table is resident or page-faulted on demand -
-and the rest of B2 (ROCm version, PCIe topology, system RAM) via the paste-block in
-`experiments/hw/bench-4x-r9700-32g.md`.
+Durable conclusions from E005/E006: **tensor split stays** (it wins decode, as the user
+expects; layer *usually* wins pp via inter-layer pipeline overlap, which our run did not see -
+that anomaly is now read as a symptom of the CPU-placed table splitting the graph at layer 1,
+and is re-tested by removing the split rather than by moving the table); **E007 is dead** for
+the same reason (`src/llama-model.cpp:513-515`: PLE is mirrored, so ~30 GB becomes ~30 GB per
+card); and the **QSA compaction port (H4b) is demoted** - it is a pp-only optimisation on a
+subsystem not yet shown to be the bottleneck, and the earlier claim that this box is "limited
+to layer split" was simply wrong.
 
-Two survey findings that changed the plan: **`GGML_CUDA_DEVICES` exposes virtual devices, so
-multi-GPU `-sm layer` behaviour is testable on this 16 GB box** (N3 - the two-tier design
-just got cheaper), and **`mma_f16` flash attention is used for prompt processing but not
-decode on gfx1201** (P4), which makes the QSA compaction port H4b a pp-only win - and
-therefore, per E005, a small one.
-
-Code-side leads, both verified: **qwen4exp pays for QSA sparsity it cannot collect on ROCm**
-(`n_kv_max = 0` at `src/models/qwen4exp.cpp:767`; compaction aborts under `GGML_USE_HIP` at
-`ggml/src/ggml-cuda/fattn.cu:93-97`), and **`-sm tensor` is unavailable for this arch**
-(`src/llama-arch.cpp:1161`, upstream `// TODO: fix test-llama-archs`), so the 4-GPU box is
-limited to layer split.
+Two facts that keep paying off: **`GGML_CUDA_DEVICES` exposes virtual devices, so multi-GPU
+behaviour is testable on this 16 GB box** (N3), and **`mma_f16` flash attention is used for
+prompt processing but not decode on gfx1201** (P4).
 
 ## Related memories
 
