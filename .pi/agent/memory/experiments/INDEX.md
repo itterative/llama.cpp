@@ -6,7 +6,7 @@ try that?".
 
 | id | date | tier | machine | hypothesis (one line) | headline result | verdict | record |
 |---|---|---|---|---|---|---|---|
-| E001 | 2026-09-17 | T1 | dev-rx9070-16g | the T1 harness (dummy models + fusion counts + bench) runs on ROCm0 | harness not yet clean: loader trap + `test-llama-archs` produced nothing | blocked | [runs/E001-t1-harness-viability.md](runs/E001-t1-harness-viability.md) |
+| E001 | 2026-09-17 | T1 | dev-rx9070-16g | the T1 harness (dummy models + fusion counts + bench) runs on ROCm0 | loader trap was the whole story; `test-backend-ops` passes on gfx1201 (1500/1500 non-FA, 3973/3979 FA) | done | [runs/E001-t1-harness-viability.md](runs/E001-t1-harness-viability.md) |
 | E002 | - | T1 | dev-rx9070-16g | a synthetic qwen4exp model gives a stable, reproducible pp/tg baseline | - | planned | [runs/E002-synthetic-baseline.md](runs/E002-synthetic-baseline.md) |
 | E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
 
@@ -56,6 +56,18 @@ measuring at all. Detail in the topic memories.
   are limited to layer split. Drives H1.
 - The dev box's `~/.local/lib64` shadows the working tree for every dynamic binary, and it
   already produced two false failures. Drives B0.
+
+- **`test-backend-ops` is not broken on AMD.** On gfx1201 / ROCm 6.4.4 it passed 1500/1500
+  non-FA and 3973/3979 FA cases with no hang (E001 update). The 6 failures are all
+  `hsk=192/hsv=128`, a shape qwen4exp does not use. So B1 is closed for the dev box and the
+  bench-box hang is a box-specific symptom needing a different explanation - 4-GPU config,
+  ROCm version, or code state, all B2 unknowns.
+- **Flipping `n_kv_max` on ROCm is inert, not risky.** Sparse-shaped FA cases report
+  `SUPPORTED` and then silently compute dense, because `use_sparse` is false on HIP and
+  `compact_mask` is never reached. H4b is kernel work; it cannot be staged from the model
+  side. See E001 stage 3.
+- **Sparse FA support at qwen4exp's shape is empirically fine on ROCm0:** 142/142
+  `FLASH_ATTN_EXT` cases at hsk/hsv 256/256 supported (E001 support probe).
 
 ## Status legend
 
