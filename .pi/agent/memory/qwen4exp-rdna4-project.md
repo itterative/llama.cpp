@@ -115,7 +115,10 @@ entirely.
 Immediate next steps: **E008** (`GGML_CUDA_DISABLE_GRAPHS=1`, one env var, tests whether HIP
 graph capture is even active - most informative per minute spent), then **E007** (drop
 `-ot ...=CPU` and see if tg jumps; ~48 GB of VRAM is free so the table can probably go on
-GPU). Then **B4 - pull the fork's changes in** (MMQ fixes, custom AllReduce, qwen4exp tensor
+GPU), then **E007b** (repeat the `-sm` pp A/B once the table is off CPU - the user expects
+layer split to *win* pp via inter-layer pipeline overlap, and if it does after E007 then a
+single host-stall mechanism explains both the tg cost and the pp anomaly). Then **B4 - pull
+the fork's changes in** (MMQ fixes, custom AllReduce, qwen4exp tensor
 split; measure after each), blocked on getting me the diff. B0 (`CMAKE_BUILD_RPATH`) stays
 parked at the user's choice. Tensor split is confirmed as the mode to keep, so the
 `llama-arch.cpp` guard is an obstacle to clear, not a limitation to work around.

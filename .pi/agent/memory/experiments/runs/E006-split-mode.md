@@ -52,16 +52,23 @@ default.
 
 ## What it establishes
 
-1. **`-sm tensor` is better for both pp and tg on this box**, confirming the user's prior
-   and retiring my suggestion that tensor split might be the wrong mode for decode. H1's
-   "we may be forced into layer split anyway" framing is moot: they would not want it.
-2. **pp wants parallel cards, tg does not care.** pp scales x1.38 from 512 to 8192 under
-   tensor and only x1.06 under layer - i.e. under layer split three cards sit idle for each
-   layer segment and extra tokens buy nothing. tg is within 12% between modes.
-3. **Therefore the tg cost is serial and shared by both modes**, and it is large: 35.5 ms and
-   40.5 ms/token against a 0.8-3.3 ms floor, i.e. **12-44x off**, with split mode unable to
-   move it. That is the single most useful thing this experiment produced: it tells us where
-   the time is *not*, which is everywhere the split mode can reach.
+1. **`-sm tensor` wins tg here, which matches the user's expectation** (their experience: for
+   decode, tensor always wins). My earlier suggestion that layer split might be preferable for
+   decode is dead.
+2. **pp under layer split did something it should not have done.** Corrected per the user:
+   *usually* layer split wins pp, because layers run in a pipeline across cards so the
+   inter-card transfers are hidden behind compute overlap between layers (and may be smaller
+   in volume than tensor's). Here layer lost pp by 12-32% and barely scaled with depth
+   (x1.06 from 512 to 8192 vs tensor's x1.38). So this is **not** confirmation that "pp wants
+   parallel cards" - that assertion was mine and it rested on a false baseline. It is an
+   anomaly needing its own explanation.
+3. The anomaly and the tg insensitivity have one candidate that explains both: the **CPU split
+   at layer index 1** from `-ot per_layer_token_embd=CPU`. A host stall mid-graph destroys the
+   very inter-layer overlap that makes layer-split pp fast, *and* it is mode-independent, so it
+   hits tg in both. That makes this pp result supporting evidence for F3 rather than a separate
+   finding - the opposite of what I claimed from the same numbers an hour earlier.
+4. Still true regardless: the tg cost is serial and shared - split mode moves it 12% where
+   bandwidth predicted 75% and my collectives theory predicted the wrong sign.
 
 ## Leading hypothesis now
 
