@@ -1,7 +1,7 @@
 # E003 - what does the QSA machinery cost when its sparsity is not collected
 
 - date: -
-- machine: dev-rx9070-16g (ablation, T1) -> bench-4xr9700 for the real effect size
+- machine: dev-rx9070-16g (ablation, T1) -> bench-4x-r9700-32g for the real effect size
 - tier: T1
 - status: planned
 - parent: E002

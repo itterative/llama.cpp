@@ -69,7 +69,7 @@ the model size you cannot run here.
 | tier | where | what it can prove | cost |
 |---|---|---|---|
 | **T1** op-level | dev box (`hw/dev-rx9070-16g.md`) | correctness of a kernel; per-op throughput; fusion-pattern counts; graph-split counts; behaviour on a synthetic `qwen4exp` model | minutes |
-| **T2** end-to-end | 4-GPU bench box (`hw/bench-4xr9700.md`), real weights | real pp/tg throughput, VRAM headroom, multi-GPU scaling, quality on long context | hours, manual |
+| **T2** end-to-end | 4-GPU bench box (`hw/bench-4x-r9700-32g.md`), real weights | real pp/tg throughput, VRAM headroom, multi-GPU scaling, quality on long context | hours, manual |
 
 T1 is authoritative for *does the mechanism work*; T2 is authoritative for *does it
 matter*. A T2-only number (no T1 anchor) gets flagged `unmechanised` in the record -
@@ -157,7 +157,7 @@ Copy to `runs/E<nnn>-<slug>.md`. Fill the top block *before* running.
 # E<nnn> - <title>
 
 - date: YYYY-MM-DD
-- machine: dev-rx9070-16g | bench-4xr9700
+- machine: dev-rx9070-16g | bench-4x-r9700-32g
 - tier: T1 | T2
 - status: planned | running | done | blocked | dead-end
 - parent: - | E<nnn>
