@@ -15,7 +15,8 @@ try that?".
 | E007 | - | T2 | bench-4x-r9700-32g | move the n-gram table onto VRAM to avoid the host gather | **impossible**: the PLE path is *mirrored* under `-sm tensor` (`src/llama-model.cpp:513-515`), so ~30 GB becomes ~30 GB/card on a 128 GB box | dead-end | folded into [plans/ple-prefetch.md](plans/ple-prefetch.md) |
 | E008 | 2026-09-17 | T2 | bench-4x-r9700-32g | the CPU-placed table might defeat HIP graph capture | **no** - capture is active: graphs off costs 7% of tg and ~7% of deep pp. Bounds total launch-submission cost at ~2.7 ms/token | done | [runs/E008-graph-capture.md](runs/E008-graph-capture.md) |
 | E009 | - | T2 | bench-4x-r9700-32g | decode may reallocate its graph every step, which graphs cannot remove | - | planned | (see backlog Next runs) |
-| E011 | - | T2 | bench-4x-r9700-32g | if tg scales super-linearly with concurrent sequences, the cost is per-step host work | - | planned | (see backlog Next runs) |
+| E011 | 2026-09-17 | T2 | bench-4x-r9700-32g | if tg scales super-linearly with concurrency the cost is per-step host work | **yes**: ~28 ms/step is fixed regardless of tokens (B=1/2/4 -> 32.4/36.7/52.5 ms per step); ~90% of a decode token is per-step cost. Bonus: 40k depth costs only ~10% of tg, bounding H4b | done | [runs/E011-concurrency.md](runs/E011-concurrency.md) |
+| E014 | - | T2 | bench-4x-r9700-32g | `-lzm off` + `-ot ...=CPU` gives a resident table with no demand paging; if tg improves, faults are part of the fixed ~28 ms | - | planned | [runs/E011-concurrency.md](runs/E011-concurrency.md#found-in-the-header-of-this-log--ot-has-never-done-anything) |
 
 ## Comparability breaks
 
@@ -110,6 +111,11 @@ measuring at all. Detail in the topic memories.
   ~2.7 ms of a 35.5 ms token). PLE page faults are bounded at ~0.1-4 ms by arithmetic. What is
   left is per-step **host-side graph build/alloc**, which graph replay cannot remove - hence
   E009/E010/E011.
+
+- **`-ot per_layer_token_embd=CPU` has never applied** - lazy-read tensors ignore tensor
+  overrides (`W llama_model_loader: tensor overrides do not apply to lazy-read tensors`), and
+  lazy mode itself forces the CPU buffer type (`src/llama-model-loader.cpp:1080-1086`). The
+  placement is real; the mechanism was not what F3 claimed. See E011.
 
 ## Status legend
 
