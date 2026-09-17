@@ -112,15 +112,16 @@ independent of split mode** - currently blamed on `-ot per_layer_token_embd=CPU`
 CPU gather + H2D + graph split at layer 1 every step, possibly defeating HIP graph capture
 entirely.
 
-Immediate next steps: **E008 is done and it says graphs are fine** - capture is active, worth
-~7% of tg, which bounds total launch cost at ~2.7 ms of a 35.5 ms token. So the remaining
-question is per-step **host-side graph build/alloc**, and the probes are **E011**
-(`llama-batched-bench -np 1,2,4` - cleanest, no debug hooks: super-linear tg scaling with
-concurrency proves per-step host cost), **E009** (`GGML_SCHED_DEBUG_REALLOC=1`) and **E010**
-(`LLAMA_GRAPH_REUSE_DISABLE=1`), plus the free `iostat`/`vmstat` look (E008b) that decides
-whether the PLE fault ceiling argument holds. **B4 - pull in the fork's MMQ fixes, custom
-AllReduce, and qwen4exp tensor-split enablement** - is still the top code action, blocked only
-on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays parked at the user's choice.
+Immediate next steps: **E014** (`-lzm off`, keeping `-ot ...=CPU` which now finally applies) - a
+resident table with no demand paging, and the cleanest remaining cut at the fixed per-step cost;
+plus **E008b** (`free -h` / `vmstat` / `iostat` during decode, and system RAM), which E014 depends
+on. **E011 is the headline so far: ~90% of a decode step is fixed per-step cost** (~28 ms) no
+matter how many tokens it carries, and 40 k depth costs only ~10% of tg - which also bounds what
+the QSA port could ever return on decode. Remaining graph-side probes: E009
+(`GGML_SCHED_DEBUG_REALLOC=1`), E010 (`LLAMA_GRAPH_REUSE_DISABLE=1`). **B4 - pull in the fork's
+MMQ fixes, custom AllReduce, and qwen4exp tensor-split enablement** - is still the top code
+action, blocked only on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays parked at the
+user's choice.
 
 Durable conclusions from E005/E006/E008: **tensor split stays** (it wins decode, as the user
 expects; layer *usually* wins pp via inter-layer pipeline overlap, which our run did not see -
