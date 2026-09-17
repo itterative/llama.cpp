@@ -51,10 +51,12 @@ anything - it defines the tiers, the naming, and the rules.
 2. **Device name is `ROCm0`.** Not `CUDA0`, not `HIP0`. `test-backend-ops -b` and
    `test-fusion --device` take it verbatim. A non-matching filter is **silent**: it
    prints "N/N backends passed / OK" having tested nothing.
-3. **ROCm here is 6.4.4**, not the 7.2 the user believed. Fedora-packaged, `/opt/rocm-6.4.0`,
-   hipcc `19-14.rocm6.4.2.fc43`, `offload-arch` absent, `AMDGPU_TARGETS` unset (so the
-   binary is gfx1201-only). The user intends to upgrade - that is a comparability break
-   when it happens.
+3. **ROCm here is 7.1.1** (hw profile v2), Fedora 44, kernel 7.2.5-200 - the same kernel as the
+   bench box. This **supersedes** an earlier note here claiming 6.4.4 / `/opt/rocm-6.4.0`, which
+   was true until 2026-09-17 17:47: the upgrade deleted the SONAMEs our build links
+   (`libamdhip64.so.6`, `librocblas.so.4`, `libhipblas.so.2`), so `build/` is unloadable and every
+   v1 dev number (E001, E002) belongs to the old stack. Prefix is unchanged
+   (`/usr/lib64/rocm`), so the cmake line is unchanged. See B5.
 4. **`test-backend-ops` reportedly crashes on AMD GPUs** (user statement, not yet
    reproduced on this branch). Until triaged it cannot serve as the correctness gate.
 5. Local GPU is `gfx1201`, RX 9070, 56 CU, 16304 MiB, `VMM: no`, wave 32, and it drives
