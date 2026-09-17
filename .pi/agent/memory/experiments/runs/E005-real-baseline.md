@@ -23,6 +23,24 @@
 
 n = 3 each. Spread is 2-4%, so the measurement itself is well-behaved.
 
+### Caveat found later: these are shallow-context measurements
+
+The command line had `-d 40960`, and the CSV's `n_depth` column reports 40960, but that is
+**allocation, not depth**. `n_depth` only feeds `cparams.n_ctx = n_prompt + n_gen + n_depth`
+(`tools/llama-bench/llama-bench.cpp:1293`) and the CSV/label output - no code path fills the KV
+up to that depth before measuring (`[v]`: the only other `n_depth` uses are the test tuple,
+the CSV writer, and an ` @ d%d` display suffix). A pure `-n` decode test therefore attends over
+~`n_gen` tokens of real content no matter what `-d` says.
+
+Two consequences, and both make the picture sharper rather than softer:
+
+- **we have no long-context data at all yet.** The 262 k regime that motivated the QSA thread
+  has never been measured. A real depth test needs `-pg <pp>,<tg>` so the prompt is actually
+  processed before generation, not `-p`/`-n` with a large `-d`.
+- **the tg gap is worse than stated.** At ~zero KV, decode of 35.5 ms/token has essentially no
+  attention-over-history cost in it at all. So the missing time is not hiding in KV reads,
+  which removes another candidate without an experiment.
+
 ## hardware and stack, from the same session
 
 | field | value |

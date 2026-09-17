@@ -11,7 +11,11 @@ try that?".
 | E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - (instrument now blocked on E004; `n_kv_max` flip is inert, see E001) | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
 | E004 | - | T1 | dev-rx9070-16g | a config-shaped synthetic model (real head_dim 256 / 24-2 heads / hc_lowrank 320 / budget 2048, fewer experts) is a usable pp instrument | - | planned | (record not yet written) |
 | E005 | 2026-09-17 | **T2** | bench-4x-r9700-32g | real qwen4exp Q4_K_M on 4x R9700 gives us a baseline | pp512/4k/8k = 397/512/547 t/s, tg128 = 28.2 t/s; **~9% GPU util**; **not a baseline** - user's fork, different ROCm | done | [runs/E005-real-baseline.md](runs/E005-real-baseline.md) |
-| E006 | 2026-09-17 | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg via per-layer cross-GPU collectives (no Infinity Fabric on Navi 48) | **refuted by sign**: layer split does ~zero collectives and is *slower* (tg 24.7 vs 28.2). Also refutes bandwidth-bound (predicted 0.25 ratio, measured 0.88). tg cost is serial and mode-independent | done | [runs/E006-split-mode.md](runs/E006-split-mode.md) |
+| E006 | 2026-09-17 | T2 | bench-4x-r9700-32g | `-sm tensor` costs tg via per-layer cross-GPU collectives (no Infinity Fabric on Navi 48) | **refuted by sign**: layer split does ~zero collectives and is *slower* (tg 24.7 vs 28.2); also refutes bandwidth-bound (predicted 0.25 ratio, measured 0.88). tg is serial and mode-independent | done | [runs/E006-split-mode.md](runs/E006-split-mode.md) |
+| E007 | - | T2 | bench-4x-r9700-32g | move the n-gram table onto VRAM to avoid the host gather | **impossible**: the PLE path is *mirrored* under `-sm tensor` (`src/llama-model.cpp:513-515`), so ~30 GB becomes ~30 GB/card on a 128 GB box | dead-end | folded into [plans/ple-prefetch.md](plans/ple-prefetch.md) |
+| E008 | 2026-09-17 | T2 | bench-4x-r9700-32g | the CPU-placed table might defeat HIP graph capture | **no** - capture is active: graphs off costs 7% of tg and ~7% of deep pp. Bounds total launch-submission cost at ~2.7 ms/token | done | [runs/E008-graph-capture.md](runs/E008-graph-capture.md) |
+| E009 | - | T2 | bench-4x-r9700-32g | decode may reallocate its graph every step, which graphs cannot remove | - | planned | (see backlog Next runs) |
+| E011 | - | T2 | bench-4x-r9700-32g | if tg scales super-linearly with concurrent sequences, the cost is per-step host work | - | planned | (see backlog Next runs) |
 
 ## Comparability breaks
 
@@ -99,6 +103,13 @@ measuring at all. Detail in the topic memories.
 - **`-lm none` does not disable lazy reads, and no load mode ever prefetches the lazy table**
   - the WILLNEED loop excludes lazy ranges and they are marked `MADV_RANDOM`
   (`src/llama-mmap.cpp:500-510`). Backlog F1.
+
+- **Four mechanisms for the tg gap have now been eliminated by measurement, not argument**:
+  weight bandwidth (E006 ratio 0.88 vs 0.25 predicted), cross-GPU collectives (E006, refuted
+  by sign), split-mode choice (E006), and graph capture / launch submission (E008, worth only
+  ~2.7 ms of a 35.5 ms token). PLE page faults are bounded at ~0.1-4 ms by arithmetic. What is
+  left is per-step **host-side graph build/alloc**, which graph replay cannot remove - hence
+  E009/E010/E011.
 
 ## Status legend
 

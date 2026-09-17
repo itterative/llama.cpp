@@ -112,23 +112,22 @@ independent of split mode** - currently blamed on `-ot per_layer_token_embd=CPU`
 CPU gather + H2D + graph split at layer 1 every step, possibly defeating HIP graph capture
 entirely.
 
-Immediate next steps: **E008** (`GGML_CUDA_DISABLE_GRAPHS=1`) is the flag-only experiment that
-discriminates the live hypothesis - if tg does not move, HIP graph capture was already inactive
-for this model and the host path is confirmed as the stall. Then warm the table's page range
-externally and rerun tg (no code change; separates fault cost from sync cost), then the offline
-index-log hit-rate study that decides the VRAM row cache (`experiments/plans/ple-prefetch.md`).
-**B4 - pull in the fork's MMQ fixes, custom AllReduce, and qwen4exp tensor-split enablement** -
-is the top code action, blocked only on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays
-parked at the user's choice.
+Immediate next steps: **E008 is done and it says graphs are fine** - capture is active, worth
+~7% of tg, which bounds total launch cost at ~2.7 ms of a 35.5 ms token. So the remaining
+question is per-step **host-side graph build/alloc**, and the probes are **E011**
+(`llama-batched-bench -np 1,2,4` - cleanest, no debug hooks: super-linear tg scaling with
+concurrency proves per-step host cost), **E009** (`GGML_SCHED_DEBUG_REALLOC=1`) and **E010**
+(`LLAMA_GRAPH_REUSE_DISABLE=1`), plus the free `iostat`/`vmstat` look (E008b) that decides
+whether the PLE fault ceiling argument holds. **B4 - pull in the fork's MMQ fixes, custom
+AllReduce, and qwen4exp tensor-split enablement** - is still the top code action, blocked only
+on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays parked at the user's choice.
 
-Durable conclusions from E005/E006: **tensor split stays** (it wins decode, as the user
+Durable conclusions from E005/E006/E008: **tensor split stays** (it wins decode, as the user
 expects; layer *usually* wins pp via inter-layer pipeline overlap, which our run did not see -
-that anomaly is now read as a symptom of the CPU-placed table splitting the graph at layer 1,
-and is re-tested by removing the split rather than by moving the table); **E007 is dead** for
-the same reason (`src/llama-model.cpp:513-515`: PLE is mirrored, so ~30 GB becomes ~30 GB per
-card); and the **QSA compaction port (H4b) is demoted** - it is a pp-only optimisation on a
-subsystem not yet shown to be the bottleneck, and the earlier claim that this box is "limited
-to layer split" was simply wrong.
+still unexplained); **E007 is dead** (PLE is mirrored under `-sm tensor`, so ~30 GB becomes
+~30 GB per card, `src/llama-model.cpp:513-515`); **graph capture is not the problem** (E008);
+and the **QSA compaction port (H4b) is demoted** as a pp-only optimisation on a subsystem not
+yet shown to be the bottleneck.
 
 Two facts that keep paying off: **`GGML_CUDA_DEVICES` exposes virtual devices, so multi-GPU
 behaviour is testable on this 16 GB box** (N3), and **`mma_f16` flash attention is used for
