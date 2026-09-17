@@ -41,8 +41,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON \
 Only one ROCm-version gate exists in cmake: **ROCm >= 6.1 required**
 (`:54-56`) `[v]`. There is **no** `#if ROCM_VERSION >= ...` anywhere in `ggml/src/ggml-cuda/`
 `[s]`; in-code version sensitivity is via `HIP_VERSION` (`vendors/hip.h:163-175`, `:251-255`)
-and it only affects fp8 + CDNA, so a 6.4 -> 7.x upgrade changes less here than feared -
-but it is still a comparability break for measurements.
+and it only affects fp8 + CDNA, so the 6.4 -> 7.1 upgrade this box actually made on
+2026-09-17 changed nothing in the source - but it broke the **build tree**: the runtime SONAMEs
+all moved (`libamdhip64` .6 -> .7, `librocblas` .4 -> .5, `libhipblas` .2 -> .3, all under
+`/lib64`, and `/opt/rocm*` is gone entirely) so a tree built against 6.4 will not load `[v]`.
 
 `GGML_STATIC` is a hard `FATAL_ERROR` on the HIP path (`:136-138`) `[s]`, which is why the
 build is `BUILD_SHARED_LIBS=ON` and why the loader-shadowing trap on this box exists.
@@ -209,7 +211,8 @@ as experienced expectation, not verified behaviour.
   `DSV4_HC_*` as unsupported on CUDA and Metal while the kernels exist, and `CUDA.csv` has no
   rows at all for `DSV4_HC*`/`GATED_DELTA_NET`/`LIGHTNING_INDEXER`/`TOPK`. Generated snapshot
   (`scripts/create_ops_docs.py`); never use it as support truth.
-- `test-backend-ops` **works on gfx1201 / ROCm 6.4.4** `[v]`: 1500/1500 non-FA cases and
+- `test-backend-ops` **works on gfx1201 / ROCm 6.4.4** `[v]` (dev hw **v1**; not re-verified on
+  7.1.1, and ROCm 7 codegen can move op results): 1500/1500 non-FA cases and
   3973/3979 FA cases passed, no hang. The reported AMD hang is therefore not universal;
   E001's update has the stages, and the bench-box hang stays open as a box-specific symptom.
   Two real sharp edges remain: there is **no insufficient-memory skip logic** `[s]` (an

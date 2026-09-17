@@ -26,13 +26,13 @@ Any row here means numbers on either side of it are not valid A/B partners.
 
 | date | machine | change | invalidated |
 |---|---|---|---|
-| 2026-09-17 | both | **the two boxes are not the same stack**: bench is ROCm 7.15.0 / Fedora 44 / kernel 7.2.5, dev is ROCm 6.4.4 / Fedora 43 | no dev-box number may be an A/B partner for a bench-box number, and vice versa. E005's numbers additionally come from a **fork** (`c9a59ef73`) with RDNA4 MMQ fixes, a custom AllReduce, and qwen4exp tensor-split enablement that this branch does not have |
+| 2026-09-17 | both | **the two boxes are not the same stack**: bench is ROCm 7.15.0 / Fedora 44 / kernel 7.2.5, dev **was** ROCm 6.4.4 / Fedora 43. Dev was upgraded to **ROCm 7.1.1 / Fedora 44 / kernel 7.2.5-200** at 17:47 the same day (hw profile v2), so the ROCm gap narrowed but GPU count and code state still differ | no dev-box number may be an A/B partner for a bench-box number, and vice versa. E005's numbers additionally come from a **fork** (`c9a59ef73`) with RDNA4 MMQ fixes, a custom AllReduce, and qwen4exp tensor-split enablement that this branch does not have |
 
 ## Machine profiles
 
 | profile | role | state |
 |---|---|---|
-| [hw/dev-rx9070-16g.md](hw/dev-rx9070-16g.md) | T1: build, op-level, synthetic models | v1, characterised. ROCm 6.4.4 (upgrade wanted) |
+| [hw/dev-rx9070-16g.md](hw/dev-rx9070-16g.md) | T1: build, op-level, synthetic models | **v2** since 2026-09-17: ROCm 7.1.1, Fedora 44. **All v1 dev numbers predate the stack change and its `build/` is unloadable** - reconfigure before any T1 work |
 | [hw/bench-4x-r9700-32g.md](hw/bench-4x-r9700-32g.md) | T2: real weights, end-to-end, multi-GPU | v1: gfx1201 confirmed, 4x32 GB = 128 GB. Runs Q4_K_M on GPU + Q5 PLE table in RAM. ROCm ver / topology / sys RAM still unknown |
 
 ## Open threads (not yet experiments)
@@ -83,7 +83,7 @@ measuring at all. Detail in the topic memories.
 - The dev box's `~/.local/lib64` shadows the working tree for every dynamic binary, and it
   already produced two false failures. Drives B0.
 
-- **`test-backend-ops` is not broken on AMD.** On gfx1201 / ROCm 6.4.4 it passed 1500/1500
+- **`test-backend-ops` is not broken on AMD.** On gfx1201 / ROCm 6.4.4 (dev hw v1) it passed 1500/1500
   non-FA and 3973/3979 FA cases with no hang (E001 update). The 6 failures are all
   `hsk=192/hsv=128`, a shape qwen4exp does not use. So B1 is closed for the dev box and the
   bench-box hang is a box-specific symptom needing a different explanation - 4-GPU config,
