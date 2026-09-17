@@ -36,7 +36,11 @@ only when it has a falsifiable hypothesis written down.
 Substrate reference: [plans/model-shape.md](plans/model-shape.md) - real `qwen4exp`
 dimensions vs what the synthetic dummy uses, and the list of places where the dummy's
 value sits on a kernel-selection boundary. Needs the HF `config.json` (text only, no
-weights) to fill.
+weights) to fill. **Filled 2026-09-17.**
+
+Design reference: [plans/ple-prefetch.md](plans/ple-prefetch.md) - the n-gram table
+prefetch/cache options (warm page cache; VRAM row cache with an S3-FIFO/SIEVE-class policy;
+why the whole table cannot go on GPU), and what has to be measured before any of it is built.
 
 ## Findings that are not experiments
 
@@ -64,8 +68,11 @@ measuring at all. Detail in the topic memories.
   loads and runs on `ROCm0`, with and without `-fa 1`.
 - **Dummy GGUFs abort anything that tokenizes** - `llama-vocab.cpp:3393` assert, no
   tokenizer in the file. Use token-id consumers (`llama-bench`, `test-save-load-state`).
-- `-sm tensor` is not supported for this arch (`src/llama-arch.cpp:1161`), so 4-GPU runs
-  are limited to layer split. Drives H1.
+- **`-sm tensor` throws on this branch for qwen4exp but is what the bench box actually
+  runs**: `llm_arch_supports_sm_tensor` returns false (`src/llama-arch.cpp:1161`) and
+  `llama_model_create` raises (`src/llama-model.cpp:358`); the user's fork enables it, and
+  E006 measured tensor split winning decode. So this is an obstacle for B4, not a hardware
+  limitation - and I previously had it backwards, claiming the box was stuck on layer split.
 - The dev box's `~/.local/lib64` shadows the working tree for every dynamic binary, and it
   already produced two false failures. Drives B0.
 

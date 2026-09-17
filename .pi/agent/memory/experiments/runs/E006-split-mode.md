@@ -91,7 +91,7 @@ Note (a) and (b) are not alternatives so much as: (a) is the most likely *cause*
 
 | id | change | if the hypothesis is right |
 |---|---|---|
-| E007 | drop `-ot per_layer_token_embd=CPU`, keep everything else | tg rises a lot. Feasible: ~80 GB of weights in 128 GB of VRAM leaves ~48 GB for a ~30 GB table. If it OOMs at 40960 ctx, retry with `-c 8192` and note the changed conditions |
+| ~~E007~~ | ~~drop `-ot per_layer_token_embd=CPU` and put the table on GPU~~ **killed, and I was wrong to propose it** | under `-sm tensor` the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`), so ~30 GB on each of 4 cards is ~120 GB of the 128 GB box - my "~48 GB free so it fits" arithmetic ignored the replication entirely. Replaced by `plans/ple-prefetch.md`, whose leading option is a few-hundred-MB VRAM **row** cache rather than the whole table |
 | E008 | keep today's config, add `GGML_CUDA_DISABLE_GRAPHS=1` | tg barely changes - which would show graphs were **already** not being captured, corroborating (a) independently of E007. If tg instead gets much worse, capture *is* active and the cost is elsewhere |
 
 E008 is the more informative of the two per minute spent, and it cannot make anything
