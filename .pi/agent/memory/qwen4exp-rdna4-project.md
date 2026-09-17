@@ -94,9 +94,15 @@ backlog: L1 (is that table resident or `--lazy-mode` page-faulting?), L2 (host-s
 + graph split per ubatch), L3 (10-of-512 expert routing) now sit ahead of the HC/QSA kernel
 threads as first-guess `tg` bottlenecks.
 
-Immediate next steps, in order: resolve B0 (now a one-liner: `CMAKE_BUILD_RPATH`) and B1
-(`test-backend-ops` crash triage), then rerun E001 with the pin, then E002 for the first
-real baseline. Highest-value user-side actions: **L1** - one `grep` over a load log that
+Run ledger so far: **E001 done** (B1 closed - `test-backend-ops` passes on gfx1201; dummy
+models generate; the qwen4exp graph runs on `ROCm0`; **`test-fusion` is Metal-only so it
+cannot run here**), **E002 dead-end** (a 19 MB synthetic model measures harness overhead, not
+the bottleneck), **E003 planned but instrument-less** until either E004 (config-shaped dummy,
+needs dims edited in `tests/test-llama-archs.cpp`) or T2.
+
+Immediate next steps, in order: B0 (`CMAKE_BUILD_RPATH`, a one-liner), then the decision
+that E002 forced - **build E004 or accept that T1 has no perf instrument and move perf to
+the bench box**. Highest-value user-side actions: **L1** - one `grep` over a load log that
 already exists, asking whether the Q5 n-gram table is resident or page-faulted on demand -
 and the rest of B2 (ROCm version, PCIe topology, system RAM) via the paste-block in
 `experiments/hw/bench-4x-r9700-32g.md`.

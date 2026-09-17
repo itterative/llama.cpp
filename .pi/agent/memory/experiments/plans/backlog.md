@@ -73,6 +73,8 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
   (f16/q4_0/q8_0 KV) `[v]`. Zero support: 96/64, 128/64, 192/192, 64/128 - never assume a
   mismatched DK/DV pair works.
 
+| T1 | implement `ggml_backend_fusion_*` for the CUDA/HIP backend | would unlock `test-fusion` on `ROCm0`, i.e. per-arch fusion counts and a `CUDA.csv` baseline (upstream ships only MTL). Only worth it if N1 (IMROPE fusion gap) or H2 need *counting* rather than timing. It is tooling, not a perf win, and it is a real chunk of work - P3 died on this |
+
 ## Explicitly out of scope for now
 
 - Vulkan, SYCL, OpenCL, CPU-only paths. Vulkan appears above only as a reference for what a
@@ -84,4 +86,7 @@ memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dim
 
 ## Dead ends
 
-(empty by construction - promote a row here from a `dead-end` verdict in `INDEX.md`)
+| id | what died | why it is still useful |
+|---|---|---|
+| E002 | a synthetic qwen4exp model as a pp/tg baseline | the 19 MB F32 model fits in cache, so pp/tg measure harness overhead, not bandwidth. Killed cheaply and on purpose, which is the point: nobody should treat `tg` 325 t/s as a reference number. Replacement is E004 (config-shaped dummy) or T2-only |
+| P3 | `test-fusion` counts on ROCm0 | the fusion debug API is Metal-only `[v]`; the tool refuses to run rather than returning empty numbers. See T1 if the signal is ever worth building |

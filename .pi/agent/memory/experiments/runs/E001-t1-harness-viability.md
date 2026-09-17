@@ -143,3 +143,33 @@ landmine, and the implication for the model is sharper than I put it -
 - The bench box hang is unreproduced and now has to be explained differently: not a general
   AMD problem. Candidates are the 4-GPU config, a different ROCm version, or a different code
   state - all three are B2 unknowns. If it recurs there, capture which stage dies.
+
+---
+
+## Update 2 - the rest of the harness, pinned
+
+Closes E001's residual scope. One of the three legs passed, one is structurally impossible
+on this backend, and the smoke run produced a trap worth writing down.
+
+| leg | result |
+|---|---|
+| `test-llama-archs -o /tmp/dummy-models` | **rc=0, 111 models, no errors.** Confirms the original 0-files failure was purely the loader trap. `qwen4exp-moe.gguf` = 19.24 MB, 4.80 M params, all F32, 2 layers |
+| `test-fusion --model .../qwen4exp-moe.gguf --device ROCm0` | **cannot run on this backend at all**: `device 'ROCm0' does not export the generic fusion debugging API (ggml_backend_fusion_*)`. Only `ggml/src/ggml-metal/ggml-metal.cpp` implements it `[v]`, which is why `tests/fusion/` contains exactly one CSV (MTL). Closes P3 as not-doable and puts the N1 IMROPE-fusion gap back to needing a different instrument |
+| qwen4exp graph on GPU | **executes end to end.** `llama-bench -ngl 99 -p 32 -n 8` -> rc=0; also rc=0 with `-fa 1`, so `FLASH_ATTN_EXT` runs on this arch's real graph. Load log: `offloaded 3/3 layers to GPU`, `layer 0/1/2 assigned to device ROCm0`. Not a trivial outcome given `36b101543` fixed a "cuda abort" for this model |
+
+Trap: **do not feed a dummy model to a tool that tokenizes.** `llama-cli` aborted with
+`src/llama-vocab.cpp:3393: GGML_ASSERT(tokenizer && "Tokenizer not initialized...")`,
+backtrace through `tokenize_input_prompts` - i.e. a vocabulary failure, nothing to do with
+the backend. Dummy GGUFs are for token-id consumers (`llama-bench`,
+`test-save-load-state`, which is what `tests/CMakeLists.txt:247` uses them for).
+
+Also: `-no-conversation`/`--no-conversation` was rejected by `llama-cli` here; `-st` is the
+flag for a non-interactive run.
+
+### What this does *not* establish
+
+The t/s numbers (`pp32` 11768, `tg8` 325) are not a baseline and are not recorded as one -
+see E002. A 4.8 M-param 2-layer model in F32 fits in cache, so its timings measure launch
+and input-path overhead, not the real bottleneck. Chasing graph splits from that number was
+dropped: `GGML_SCHED_DEBUG` only calls `ggml_backend_sched_print_assignments`, and llama-bench
+didn't surface useful output - an unproductive thread, noted so it is not retried blindly.

@@ -6,9 +6,10 @@ try that?".
 
 | id | date | tier | machine | hypothesis (one line) | headline result | verdict | record |
 |---|---|---|---|---|---|---|---|
-| E001 | 2026-09-17 | T1 | dev-rx9070-16g | the T1 harness (dummy models + fusion counts + bench) runs on ROCm0 | loader trap was the whole story; `test-backend-ops` passes on gfx1201 (1500/1500 non-FA, 3973/3979 FA) | done | [runs/E001-t1-harness-viability.md](runs/E001-t1-harness-viability.md) |
-| E002 | - | T1 | dev-rx9070-16g | a synthetic qwen4exp model gives a stable, reproducible pp/tg baseline | - | planned | [runs/E002-synthetic-baseline.md](runs/E002-synthetic-baseline.md) |
-| E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
+| E001 | 2026-09-17 | T1 | dev-rx9070-16g | the T1 harness (dummy models + fusion counts + bench) runs on ROCm0 | loader trap was the whole story. `test-backend-ops` passes (1500/1500 non-FA, 3973/3979 FA); 111 dummy models generate; qwen4exp graph runs on GPU incl. `-fa 1`; **`test-fusion` is impossible here - the fusion debug API is Metal-only** | done | [runs/E001-t1-harness-viability.md](runs/E001-t1-harness-viability.md) |
+| E002 | 2026-09-17 | T1 | dev-rx9070-16g | a synthetic qwen4exp model gives a usable pp/tg baseline | **no**: 19 MB F32 fits in cache, so pp/tg measure launch + input-path overhead, not the real bottleneck | dead-end | [runs/E002-synthetic-baseline.md](runs/E002-synthetic-baseline.md) |
+| E003 | - | T1 | dev-rx9070-16g | qwen4exp pays a context-scaling QSA tax for sparsity it cannot collect on ROCm | - (instrument now blocked on E004; `n_kv_max` flip is inert, see E001) | planned | [runs/E003-qsa-tax.md](runs/E003-qsa-tax.md) |
+| E004 | - | T1 | dev-rx9070-16g | a config-shaped synthetic model (real head_dim 256 / 24-2 heads / hc_lowrank 320 / budget 2048, fewer experts) is a usable pp instrument | - | planned | (record not yet written) |
 
 ## Comparability breaks
 
@@ -52,6 +53,15 @@ measuring at all. Detail in the topic memories.
   user; `-lzm auto` lazy-reads any tensor over 4 GiB
   (`src/llama-model-loader.cpp:1093`), so "in RAM" may mean "page-faulted on demand".
   Backlog L1/L2. Full shape in [plans/model-shape.md](plans/model-shape.md).
+- **`test-fusion` does not exist for this backend.** The generic fusion debugging API
+  (`ggml_backend_fusion_*`) is implemented only in `ggml/src/ggml-metal/ggml-metal.cpp` `[v]`,
+  so `--device ROCm0` refuses to run and `tests/fusion/` has exactly one baseline CSV. This
+  kills P3 and removes the natural instrument for N1 (the IMROPE fusion gap). Backlog T1.
+- **A synthetic qwen4exp model is not a perf baseline** (E002, dead-end): 19 MB F32 fits in
+  cache, so pp/tg report harness overhead. It *is* a valid structural instrument - the graph
+  loads and runs on `ROCm0`, with and without `-fa 1`.
+- **Dummy GGUFs abort anything that tokenizes** - `llama-vocab.cpp:3393` assert, no
+  tokenizer in the file. Use token-id consumers (`llama-bench`, `test-save-load-state`).
 - `-sm tensor` is not supported for this arch (`src/llama-arch.cpp:1161`), so 4-GPU runs
   are limited to layer split. Drives H1.
 - The dev box's `~/.local/lib64` shadows the working tree for every dynamic binary, and it
