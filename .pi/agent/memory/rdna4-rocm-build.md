@@ -199,6 +199,16 @@ shorter:
   **hsk=192/hsv=128** (gqa 8/16, permuted K/V views), err up to 0.0298 vs a 0.0005 tol `[v]`.
   qwen4exp is 256/256, which passes 142/142. Know this before re-running the FA suite and
   seeing red.
+- **`test-fusion` cannot run on this backend.** It requires `ggml_backend_fusion_*`, which
+  only `ggml/src/ggml-metal/ggml-metal.cpp` exports `[v]`; `--device ROCm0` exits 1 with
+  "device does not export the generic fusion debugging API". That is why `tests/fusion/` has
+  one CSV. So fusion coverage on ROCm has to be read from the dispatch code (see N1) or timed,
+  never counted.
+- **Dummy GGUFs from `test-llama-archs` abort on anything that tokenizes** `[v]`:
+  `src/llama-vocab.cpp:3393` `GGML_ASSERT(tokenizer ...)` via `tokenize_input_prompts`. Use
+  token-id consumers instead (`llama-bench`, `test-save-load-state`). Their weights are all
+  F32 and tiny (qwen4exp: 4.80 M params, 19.24 MB), which also makes them useless as a perf
+  baseline - see E002.
 - qwen4exp uses `llama_memory_hybrid_idx` (`llama-model.cpp:2565`, `:2584-2589`), **not** the
   `dsa`/`msa`/`iswa` cache classes; its `set_input_qsa` is host-side index/bias construction
   with `GGML_ASSERT(r <= 64)` (`llama-memory-hybrid-idx.cpp:273-340`) `[s]` - real
