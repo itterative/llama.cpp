@@ -101,17 +101,24 @@ the bottleneck), **E005 done** - first real numbers, from the bench box on the u
 (`pp8192` 547 t/s, `tg128` 28.2 t/s, **9% GPU util**), **E006 planned** (flag-only test of
 whether `-sm tensor` collectives are what is costing `tg`), E003/E004 still instrument-less.
 
-**E005 inverted the plan.** Both pp and tg are one to two orders of magnitude off the
-hardware floor (pp ~3.3 TFLOP/s vs ~180-190 TFLOPS WMMA peak; tg 35.5 ms/token vs a ~1-2 ms
-bandwidth floor), so this box is *waiting*, not working. Per-kernel work - including the QSA
-compaction port (H4b) I was keen on - is demoted. Cross-GPU sync, host-side stalls and
-tensor placement are promoted, and the candidate mechanism is ~288 per-token cross-GPU
-collectives over PCIe with no Infinity Fabric on Navi 48.
+**E005 inverted the plan, and E006 narrowed it again.** Both pp and tg are one to two orders
+of magnitude off the hardware floor (pp ~3.3 TFLOP/s vs ~180-190 TFLOPS WMMA peak; tg
+35.5 ms/token vs a ~1-3 ms bandwidth floor), so this box is *waiting*, not working, and
+per-kernel work - including the QSA compaction port (H4b) I was keen on - is demoted. My own
+collective-latency explanation for `tg` was **refuted by sign** in E006: `-sm layer` does
+essentially no cross-GPU reduces and is *slower*, and its 0.88 ratio vs a predicted 0.25 also
+kills bandwidth-bound. What survives is that the `tg` cost is **serial, host-side, and
+independent of split mode** - currently blamed on `-ot per_layer_token_embd=CPU` forcing a
+CPU gather + H2D + graph split at layer 1 every step, possibly defeating HIP graph capture
+entirely.
 
-Immediate next steps: **B4 - pull the fork's changes in** (MMQ fixes, custom AllReduce,
-qwen4exp tensor split; measure after each), B0 (`CMAKE_BUILD_RPATH`, still pending), then
-E006 on the bench box. The `-lzm`/`-ot` placement questions (F1/F3) are flag-level and may
-move more than any kernel change we could write today.
+Immediate next steps: **E008** (`GGML_CUDA_DISABLE_GRAPHS=1`, one env var, tests whether HIP
+graph capture is even active - most informative per minute spent), then **E007** (drop
+`-ot ...=CPU` and see if tg jumps; ~48 GB of VRAM is free so the table can probably go on
+GPU). Then **B4 - pull the fork's changes in** (MMQ fixes, custom AllReduce, qwen4exp tensor
+split; measure after each), blocked on getting me the diff. B0 (`CMAKE_BUILD_RPATH`) stays
+parked at the user's choice. Tensor split is confirmed as the mode to keep, so the
+`llama-arch.cpp` guard is an obstacle to clear, not a limitation to work around.
 
 Immediate next steps, in order: B0 (`CMAKE_BUILD_RPATH`, a one-liner), then the decision
 that E002 forced - **build E004 or accept that T1 has no perf instrument and move perf to

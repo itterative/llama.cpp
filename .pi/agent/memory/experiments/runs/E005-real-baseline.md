@@ -87,25 +87,24 @@ sync, graph splits and host-side stalls move to the front, and per-kernel work (
 compaction port, H4b) moves back - a pp-only optimisation for a subsystem that is not the
 bottleneck at 8k context.
 
-### Candidate mechanism for tg, and it is checkable
+### Candidate mechanism for tg - RETRACTED by E006
 
-`-sm tensor` on 4 cards implies a cross-GPU reduce per split matmul: roughly 6 matmuls x 48
-layers = **~288 collectives per token**. Bytes are negligible (hidden 2560 in f16 = 5 KB, so
-single-digit MB/token), but **Navi 48 has no Infinity Fabric** - `lspci` puts all four cards
-under one Zen3 root complex through two switch levels - so each collective pays PCIe
-round-trip latency. 288 x 50-150 us = **14-43 ms/token**, which brackets the measured 35.5
-ms/token.
+I proposed here that ~288 cross-GPU collectives per token (`-sm tensor`, 6 matmuls x 48
+layers) at 50-150 us each over PCIe - with no Infinity Fabric on Navi 48 - "bracketed" the
+measured 35.5 ms/token. **E006 refuted it by sign**: with `-sm layer` there are essentially
+zero collectives, and layer split is *slower*, not faster. A mechanism that predicts the
+wrong inequality is wrong however neatly its numbers fit, and the latency figure was too
+generous to PCIe anyway. Kept here rather than deleted, because "a plausible story that fit
+the arithmetic" is exactly the failure this ledger is meant to catch.
 
-That story would explain three things at once: why the custom AllReduce matters more than
-any kernel change; why tensor split helps pp (latency amortised over a 512-token ubatch) and
-hurts tg (identical cost for one token); and why tg is 21-44x off its bandwidth floor rather
-than 2x off. E006 tests it with flags only. Note this mechanism is **independent of the
-3 B / 6 B question**, since it counts collectives, not FLOPs.
+E006 also refuted bandwidth-bound (predicted layer/tensor ~0.25 if the cards are used
+serially, measured 0.88). What survives is narrower and more useful: the tg cost is serial
+and shared by both split modes, ~12-44x above the floor, and therefore lives in the host-side
+path - see E006 and the E007/E008 proposals.
 
-Caveat on the util figure: `GFX-Uti` is a one-shot sample, not a profile. It agrees with the
-arithmetic here, which is why I trust it enough to write it down and not enough to conclude
-from it. A proper per-kernel attribution (N4: `GGML_HIP_EXPORT_METRICS`) is what turns this
-from "strongly suggests" into "shows".
+Caveat on the util figure: `GFX-Uti` is a one-shot sample, not a profile, and it was taken
+during *prefill*, so it says nothing directly about decode. A proper per-kernel attribution
+(`GGML_HIP_EXPORT_METRICS`, still unverified) is what turns "strongly suggests" into "shows".
 
 ### Derived: the lazy table is never prefetched, in *any* load mode
 
