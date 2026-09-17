@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import zlib
 import sys
 from pathlib import Path
 
@@ -30,6 +31,9 @@ def main() -> int:
     ap.add_argument("--repo", type=Path, default=Path("."), help="llama.cpp checkout (for gguf-py)")
     ap.add_argument("--srcdir", type=Path, required=True, help="dir with config.json + tokenizer files")
     ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--fill", choices=("pattern", "zeros"), default="pattern",
+                    help="pattern = seeded per-tensor payload, needed for logit fingerprints")
+    ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--ctx", type=int, default=40960)
     ap.add_argument("--ple-head-rows", type=int, default=1_250_000)
     ap.add_argument("--experts", type=int, default=0, help="override num_experts (bring-up tests only)")
@@ -159,7 +163,10 @@ def main() -> int:
 
     if ple_rows:
         kv_uint32(kv + "embedding_length_per_layer_input", ple_head_dim)
-        kv_uint32(kv + "ple.layers", [i for i in range(n_layer) if is_ple(i)])
+        # gguf forbids empty arrays, and a sub-2-layer build has no PLE layer at all
+        ple_layers = [i for i in range(n_layer) if is_ple(i)]
+        if ple_layers:
+            kv_uint32(kv + "ple.layers", ple_layers)
         gw.add_uint32(kv + "ple.ngram_size", ngram_size)
         gw.add_uint32(kv + "ple.heads_per_ngram", heads_per_ng)
         gw.add_uint32(kv + "ple.conv_kernel", int(t.get("ple_conv_kernel_size", 4)))
@@ -211,21 +218,75 @@ def main() -> int:
         assert ne0 % blck == 0, f"{ne0} not a multiple of {blck} for {gtype.name}"
         return ne0 // blck * size
 
+    # Payload fill. Zeros make a fast file but a blind one: a wrong gather row or expert index
+    # returns the same value, so model-level bugs are invisible. "pattern" instead writes
+    # pseudo-random bytes seeded per tensor name, which is position-sensitive and what makes the
+    # logits usable as a correctness fingerprint. Quantized payloads are filled in the byte
+    # domain because quantizing ~10 B params through numpy would need a 40 GB f32 source; the
+    # fields a block format reads as a scale are pinned to small constants: random bytes there
+    # can land on inf/NaN encodings, and a K-quant sub-block scale of zero would erase the
+    # payload instead of shrinking it
+    # since random bytes there can land on inf/NaN encodings (see block_q* in
+    # ggml/src/ggml-common.h - note Q6_K stores d last, at byte 208 of 210).
+    DBYTES = np.frombuffer(np.float16(0.001 if args.fill == "pattern" else 0.0).tobytes(), np.uint8)
+    PIN = {  # block size in bytes -> [(offset, length, byte value or f16 bytes)]
+        34:  [(0, 2, DBYTES)],                 # Q8_0: d
+        22:  [(0, 2, DBYTES)],                 # Q5_0: d
+        144: [(0, 2, DBYTES), (2, 2, 0), (4, 12, 0x11)],   # Q4_K: d, dmin, scales+mins
+        176: [(0, 2, DBYTES), (2, 2, 0), (4, 12, 0x11)],   # Q5_K: d, dmin, scales
+        210: [(192, 16, 0x01), (208, 2, DBYTES)],          # Q6_K: scales, then d
+    }
+    CHUNK = 1 << 28
+
+    def quant_payload(name: str, nbytes: int, size: int) -> np.ndarray:
+        data = np.empty(nbytes, dtype=np.uint8)
+        rng = np.random.default_rng([args.seed, zlib.crc32(name.encode())])
+        for off in range(0, nbytes, CHUNK):
+            n = min(CHUNK, nbytes - off)
+            data[off:off + n] = rng.integers(0, 256, n, dtype=np.uint8)
+        if args.fill == "pattern":
+            blocks = data.reshape(-1, size)
+            for pos, ln, val in PIN[size]:
+                blocks[:, pos:pos + ln] = val
+        return data
+
+    def float_payload(name: str, ne: tuple[int, ...], gtype: gguf.GGMLQuantizationType) -> np.ndarray:
+        n = int(np.prod(ne))
+        if args.fill == "zeros":
+            dt = np.float32 if gtype == G.F32 else np.float16
+            return np.zeros(n, dtype=dt)
+        # gammas and norms want to sit near 1.0 or they squash the signal they scale; everything
+        # else, router logits included, stays small so the softmax paths do not saturate
+        rng = np.random.default_rng([args.seed, zlib.crc32(name.encode())])
+        if name.endswith(".ssm_a"):
+            # the GDN log-decay has to be negative: near +1 the state integrates over the whole
+            # sequence instead of decaying, which makes the logits explode and the fingerprint
+            # useless (first attempt measured PPL 4.3e74 +/- 3.6e74)
+            x = (-rng.uniform(0.5, 2.0, n)).astype(np.float32)
+        else:
+            scale, base = (0.05, 1.0) if name.endswith("_norm.weight") else (0.02, 0.0)
+            x = (rng.standard_normal(n) * scale + base).astype(np.float32)
+        if gtype == G.F32:
+            return x
+        if gtype == G.F16:
+            return x.astype(np.float16)
+        return (x.view(np.uint32) >> 16).astype(np.uint16)  # bf16 by truncation
+
     def add(name: str, ne: tuple[int, ...], gtype: gguf.GGMLQuantizationType) -> None:
         # ne is ggml order (ne[0] fastest); gguf-py wants HF/numpy order and, for quantized
         # payloads, a uint8 buffer whose last axis is byte-count (see conversion/base.py:1111)
         nonlocal total, n_written
-        blck, size = GGML_QUANT_SIZES[gtype.value]
         hf_shape = list(reversed(ne))
-        if gtype.value >= gguf.GGMLQuantizationType.Q4_0.value:
+        # BF16 has a higher enum value than Q4_0, so "quantized" cannot be tested by range
+        if gtype in (G.F32, G.F16, G.BF16):
+            data = float_payload(name, ne, gtype)
+            nbytes = data.nbytes
+        else:
+            _, size = GGML_QUANT_SIZES[gtype.value]
+            assert size in PIN, f"unpinned scale fields for {gtype.name}"
             hf_shape[-1] = row_bytes(gtype, ne[0])
             nbytes = int(np.prod(hf_shape))
-            data = np.zeros(nbytes, dtype=np.uint8)
-        else:
-            itemsize = 4 if gtype == G.F32 else 2
-            nbytes = int(np.prod(hf_shape)) * itemsize
-            dt = np.float32 if gtype == G.F32 else (np.float16 if gtype == G.F16 else np.uint16)
-            data = np.zeros(nbytes // itemsize, dtype=dt)
+            data = quant_payload(name, nbytes, size)
         gw.add_tensor(name, data, raw_shape=tuple(hf_shape), raw_dtype=gtype)
         total += nbytes
         n_written += 1
