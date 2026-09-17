@@ -52,17 +52,18 @@ anything - it defines the tiers, the naming, and the rules.
    `test-fusion --device` take it verbatim. A non-matching filter is **silent**: it
    prints "N/N backends passed / OK" having tested nothing.
 3. **ROCm here is 7.1.1** (hw profile v2), Fedora 44, kernel 7.2.5-200 - the same kernel as the
-   bench box. This **supersedes** an earlier note here claiming 6.4.4 / `/opt/rocm-6.4.0`, which
-   was true until 2026-09-17 17:47: the upgrade deleted the SONAMEs our build links
-   (`libamdhip64.so.6`, `librocblas.so.4`, `libhipblas.so.2`), so `build/` is unloadable and every
-   v1 dev number (E001, E002) belongs to the old stack. Prefix is unchanged
-   (`/usr/lib64/rocm`), so the cmake line is unchanged. See B5.
+   bench box. This **supersedes** an earlier note here claiming 6.4.4 / `/opt/rocm-6.4.0`. The
+   upgrade deleted the SONAMEs the old build linked (`libamdhip64.so.6`, `librocblas.so.4`,
+   `libhipblas.so.2`), so every v1 dev number (E001, E002) belongs to the old stack.
+   **B5 is done**: rebuilt on 2026-09-17 with the same cmake line (prefix `/usr/lib64/rocm` is
+   unchanged), except that `-DCMAKE_C_COMPILER=clang` in the recipe is wrong here - there is no
+   `clang` on PATH, let cmake pick the default.
 4. **`test-backend-ops` reportedly crashes on AMD GPUs** (user statement, not yet
    reproduced on this branch). Until triaged it cannot serve as the correctness gate.
 5. Local GPU is `gfx1201`, RX 9070, 56 CU, 16304 MiB, `VMM: no`, wave 32, and it drives
    the display - it is not a quiet measurement device.
 
-## Status (as of 2026-09-17)
+## Status (as of 2026-09-17, refreshed after E018)
 
 Scaffolding built: PROTOCOL, INDEX, E001 (harness viability, `blocked` by the traps
 above), E002 (synthetic baseline, `planned`), E003 (QSA tax, `planned`), hw profiles
@@ -96,34 +97,25 @@ backlog: L1 (is that table resident or `--lazy-mode` page-faulting?), L2 (host-s
 + graph split per ubatch), L3 (10-of-512 expert routing) now sit ahead of the HC/QSA kernel
 threads as first-guess `tg` bottlenecks.
 
-Run ledger so far: **E001 done** (B1 closed - `test-backend-ops` passes on gfx1201; dummy
-models generate; the qwen4exp graph runs on `ROCm0`; **`test-fusion` is Metal-only so it
-cannot run here**), **E002 dead-end** (a 19 MB synthetic model measures harness overhead, not
-the bottleneck), **E005 done** - first real numbers, from the bench box on the user's fork
-(`pp8192` 547 t/s, `tg128` 28.2 t/s, **9% GPU util**), **E006 planned** (flag-only test of
-whether `-sm tensor` collectives are what is costing `tg`), E003/E004 still instrument-less.
+Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
+runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness
+overhead), **E005** first real numbers from the bench on the user's fork (`pp8192` 547 t/s,
+`tg128` 28.2 t/s, **9% GPU util**), **E006** tensor wins decode / layer wins pp usually, **E007
+killed** (PLE is mirrored under `-sm tensor`, ~30 GB/card), **E008** graphs are captured (adding
+`GGML_CUDA_DISABLE_GRAPHS=1` costs 7% of tg), **E009** no failed same-size reallocs, **E010**
+graph reuse works (~22 ms/step if disabled), **E011 headline** (~90% of a decode step is fixed
+per-step cost, ~28 ms, independent of tokens in the step; 40 k depth costs ~10% of tg), **E015**
+`-nopo` zero effect, **E017/E018** the local dummy harness (below). Not run: E012 (`-sm row`),
+E014 (`-lzm off`), E008b (fault counting), E016 (`perf record -g`), E003/E004 (still
+instrument-less).
 
-**E005 inverted the plan, and E006 narrowed it again.** Both pp and tg are one to two orders
-of magnitude off the hardware floor (pp ~3.3 TFLOP/s vs ~180-190 TFLOPS WMMA peak; tg
-35.5 ms/token vs a ~1-3 ms bandwidth floor), so this box is *waiting*, not working, and
-per-kernel work - including the QSA compaction port (H4b) I was keen on - is demoted. My own
-collective-latency explanation for `tg` was **refuted by sign** in E006: `-sm layer` does
-essentially no cross-GPU reduces and is *slower*, and its 0.88 ratio vs a predicted 0.25 also
-kills bandwidth-bound. What survives is that the `tg` cost is **serial, host-side, and
-independent of split mode** - currently blamed on `-ot per_layer_token_embd=CPU` forcing a
-CPU gather + H2D + graph split at layer 1 every step, possibly defeating HIP graph capture
-entirely.
-
-Immediate next steps: **E014** (`-lzm off`, keeping `-ot ...=CPU` which now finally applies) - a
-resident table with no demand paging, and the cleanest remaining cut at the fixed per-step cost;
-plus **E008b** (`free -h` / `vmstat` / `iostat` during decode, and system RAM), which E014 depends
-on. **E011 is the headline so far: ~90% of a decode step is fixed per-step cost** (~28 ms) no
-matter how many tokens it carries, and 40 k depth costs only ~10% of tg - which also bounds what
-the QSA port could ever return on decode. Remaining graph-side probes: E009
-(`GGML_SCHED_DEBUG_REALLOC=1`), E010 (`LLAMA_GRAPH_REUSE_DISABLE=1`). **B4 - pull in the fork's
-MMQ fixes, custom AllReduce, and qwen4exp tensor-split enablement** - is still the top code
-action, blocked only on getting the diff here. B0 (`CMAKE_BUILD_RPATH`) stays parked at the
-user's choice.
+**E005 inverted the plan and E011 finished the bench phase** (user decision, 2026-09-17): both
+pp and tg sit one to two orders of magnitude off the hardware floor (pp ~3.3 TFLOP/s vs ~180-190
+TFLOPS WMMA peak; tg 35.5 ms/token vs a ~1-3 ms bandwidth floor), six mechanisms are excluded, one
+graph build costs ~20-22 ms (E010) and ~28 ms/step is fixed per-step host cost (E011), so 40 k
+depth accounts for only ~10% of tg. That demotes kernel-level work: no per-kernel change can pay
+for the fixed cost that dominates it. My own collective-latency explanation for `tg` was **refuted
+by sign** in E006, and the "CPU split defeats graph capture" story died in E008.
 
 Durable conclusions from E005/E006/E008: **tensor split stays** (it wins decode, as the user
 expects; layer *usually* wins pp via inter-layer pipeline overlap, which our run did not see -
@@ -135,6 +127,37 @@ yet shown to be the bottleneck.
 Two facts that keep paying off: **`GGML_CUDA_DEVICES` exposes virtual devices, so multi-GPU
 behaviour is testable on this 16 GB box** (N3), and **`mma_f16` flash attention is used for
 prompt processing but not decode on gfx1201** (P4).
+
+
+## The dummy harness (what we do locally now)
+
+`experiments/tools/mkq4expdummy.py` writes a shape-faithful qwen4exp GGUF from the real
+`config.json` + tokenizer (kept outside the repo, in the session scratchpad) with the real file's
+per-tensor types and a seeded payload. Shipped artifact: **`models/q4exp-4l.gguf`** (4 real-dims
+layers = lin, lin+PLE, lin, full; 512 experts; 5.5 GB n-gram table row-cut from 320M rows/head to
+3.1M; 12.76 GB; ignored by `.gitignore`'s `/models/*`). ~40 s to build; iterate fill/metadata
+changes on a `--layers 2 --experts 32 --ple-head-rows 65536` smoke (1.3 GB, seconds) and write the
+big one once. Runs on this box as `-ngl 99 -lm none -sm none -fa 1`: **tg128 @ d40960 = 181.89
+t/s = 5.47 ms/step**, of which ~4.5 ms is not attributable to GPU math - same class as the bench's
+fixed cost, ~1/6 the magnitude, because per-node host work scales with layer count.
+
+Three rules that come from E017/E018 and must not be re-derived:
+- **Correctness gate**: `llama-perplexity -m models/q4exp-4l.gguf -f
+  experiments/tools/golden-corpus.md` -> `PPL = 262938.7619 +/- 3039.06817`, bit-stable across
+  runs. It covers the *prefill* path only, and its contract is "every diff is explained", not "no
+  diff" - the QSA compaction port must move it.
+- **Noise floor ~1%**: the same file measured 180.3 / 181.8 / 181.9 t/s across invocations, and
+  this GPU drives a display. Sub-2% local deltas are not findings.
+- **Decode does not care about table volume** (182.1 / 182.7 / 182.4 at 35 / 3.7 / 5.5 GB) but
+  **pp4096 gained 6.5% from the small table**, which is the first positive evidence for F1 (lazy
+  ranges are never prefetched, get `MADV_RANDOM`, `MAP_POPULATE` deliberately skipped).
+
+Immediate next steps: **B4 - the fork diff** (MMQ fixes, custom AllReduce, and the user's own
+`sm tensor` enablement, which the upstream guard blames on `test-llama-archs` - our harness is now
+the thing that could satisfy it) remains the top code action and is still blocked on getting the
+diff here. Prerequisites the user accepted: re-baseline `test-backend-ops` on 7.1.1. Deferred by
+the user: B0 rpath, a RelWithDebInfo/frame-pointer build for local `perf`, and N4
+(`__GFX12__` emitted for gfx1201?).
 
 ## Related memories
 
