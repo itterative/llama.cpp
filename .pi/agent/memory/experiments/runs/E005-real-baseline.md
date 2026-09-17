@@ -23,23 +23,37 @@
 
 n = 3 each. Spread is 2-4%, so the measurement itself is well-behaved.
 
-### Caveat found later: these are shallow-context measurements
+### Depth: corrected twice, and the second correction is the one that matters
 
-The command line had `-d 40960`, and the CSV's `n_depth` column reports 40960, but that is
-**allocation, not depth**. `n_depth` only feeds `cparams.n_ctx = n_prompt + n_gen + n_depth`
-(`tools/llama-bench/llama-bench.cpp:1293`) and the CSV/label output - no code path fills the KV
-up to that depth before measuring (`[v]`: the only other `n_depth` uses are the test tuple,
-the CSV writer, and an ` @ d%d` display suffix). A pure `-n` decode test therefore attends over
-~`n_gen` tokens of real content no matter what `-d` says.
+I first read `-d 40960` as *allocation only* and wrote a caveat saying these were
+shallow-context measurements. **That was wrong**, and the corrected reading is more
+interesting: `llama-bench.cpp:2408-2433` really does fill the context -
 
-Two consequences, and both make the picture sharper rather than softer:
+```c
+if (t.n_depth > 0) {
+    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);   // processes n_depth tokens
+    cstate.depth = t.n_depth;                                        // state saved via llama_state_seq_get_data
+```
 
-- **we have no long-context data at all yet.** The 262 k regime that motivated the QSA thread
-  has never been measured. A real depth test needs `-pg <pp>,<tg>` so the prompt is actually
-  processed before generation, not `-p`/`-n` with a large `-d`.
-- **the tg gap is worse than stated.** At ~zero KV, decode of 35.5 ms/token has essentially no
-  attention-over-history cost in it at all. So the missing time is not hiding in KV reads,
-  which removes another candidate without an experiment.
+and it caches that state across repetitions (`is_cached` at `:2409`, restored with
+`llama_state_seq_set_data`), so the fill happens once and is **not** inside the timed region.
+
+Consequences, all of which strengthen the baseline rather than weaken it:
+
+- **every number in this record was measured at ~40 k context depth**, including `tg128`.
+  That is the regime that actually matters for this model, not a toy one.
+- the tg floor has to include KV. 12 full-attention layers x 2 KV heads x 256 x (K+V) x f16
+  = ~24.6 KB of cache per token, so at 40960 depth a decode step reads **~1.0 GB of KV** on
+  top of ~2.7 GB of active weights (plus ~0.2 GB of GDN recurrent state, fp32, 36 layers).
+  Call it ~3.9 GB/token -> ~0.98 GB/card -> **~2 ms floor at a conservative 500 GB/s/card**.
+- so the gap is **~18x**, not the 25-40x implied by the earlier weight-only floor. Smaller,
+  and still far too large for bandwidth to be the story. E006's layer/tensor ratio of 0.88
+  refutes bandwidth-bound independently of this arithmetic, so the conclusion stands on the
+  measurement rather than on my estimate.
+- one thing this *does* reopen: attention over 40 k was live in every measurement, and
+  `-fa 1` was on throughout. If attention were ~2 ms of a 35.5 ms token, that is exactly the
+  kind of contribution my "no KV in these numbers" error would have hidden. See E013, which
+  survives but with a different justification: we have **one depth point, not a curve**.
 
 ## hardware and stack, from the same session
 
@@ -84,18 +98,24 @@ configuration on this hardware and says how far the current branch is from it.
 
 ## The actual finding: neither pp nor tg is bandwidth- or compute-bound
 
-Active params: **3 B or 6 B, unresolved** (see above). At Q4_K_M ~0.55 B/param a decoded
-token touches ~1.65 GB or ~3.3 GB of weights; `-sm tensor` splits that across four cards.
+Active params: **~6 B** (resolved after this record was first written - the GGUF's `A3B`
+`size_label` is parsed from the file name and is not to be trusted, backlog F2). At Q4_K_M
+~0.55 B/param that is ~3.3 GB of weights per decoded token, and `-sm tensor` splits it across
+the four cards.
 
-- **tg**: 35.5 ms/token. At a conservative 500 GB/s/card, the per-card weight read is ~0.41 GB
-  (3 B case) -> ~0.8 ms, or ~0.83 GB (6 B case) -> ~1.7 ms. Measured is **21-44x** that. Even
-  allowance for KV reads, the 16 PLE gathers and 48 layers of launch overhead cannot cover a
-  gap that size, and neither case makes it bandwidth.
-- **pp**: at pp8192, 1.83 ms/token. Compute is ~6 GFLOP/token (3 B) or ~12 GFLOP/token (6 B),
-  so 546.8 t/s is **3.3 or 6.6 TFLOP/s aggregate**. RDNA4 WMMA fp16 peak is ~180-190 TFLOPS
-  (user-reported; **per card or per box not yet confirmed**). Every combination lands between
-  ~0.4% and ~3.5% of peak. Prefill is not compute-limited by any margin, which agrees with the
-  9% util snapshot.
+- **tg**: 35.5 ms/token. Corrected floor, since `-d 40960` really does fill the KV (see the
+  depth section above): ~3.3 GB weights + ~1.0 GB KV (12 full-attention layers x 24.6 KB per
+  token-position at 40960 depth) + ~0.2 GB fp32 GDN state = **~3.9 GB/token**, so ~0.98 GB per
+  card, ~2 ms at a conservative 500 GB/s/card. Measured is **~18x** that. E008 separately bounds
+  all launch-submission cost at ~2.7 ms, and E006 refutes bandwidth by ratio (0.88 measured vs
+  ~0.25 predicted), so the gap is not bandwidth and not launches - and it is not KV, since KV is
+  already counted here.
+- **pp**: at pp8192, 1.83 ms/token, ~12 GFLOP/token of active compute for 6 B params ->
+  **~6.6 TFLOP/s aggregate**. RDNA4 WMMA fp16 peak is ~180-190 TFLOPS (user-reported; **per card
+  or per box not yet confirmed**). Either way that is ~0.9% or ~3.5% of peak. Prefill is not
+  compute-limited by any margin, which agrees with the 9% util snapshot - though that snapshot
+  was taken during prefill, so it is the right half of the picture for pp and says nothing about
+  decode.
 - Corroborating oddity: **pp t/s rises monotonically with prompt size** (397 -> 512 -> 547).
   Attention work per token *grows* with context, so if attention were the bottleneck pp
   would fall. Rising means fixed per-ubatch costs dominate and are being amortised.
