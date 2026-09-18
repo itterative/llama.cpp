@@ -28,6 +28,7 @@ try that?".
 | E023 | 2026-09-17 | T1 | dev-rx9070-16g | does one pass + no divisions help more | yes but little: +1.3%/+2.1% then +0.1%/+1.2%; cumulative vs pre-E022 **tg +9.8% @40k, +26.0% @164k**, gates still bit-identical. Residual ~1.7 ms/step is the **store volume** (~3 MB of mapping at 164k, ~3 ns/store), so loop tuning is done; only reusing the arrays instead of rewriting them helps | done | [runs/E023-qsa-fast-path-one-pass.md](runs/E023-qsa-fast-path-one-pass.md) |
 | E024 | 2026-09-17 | T3 | analysis | where the per-QSA-layer GPU work goes | ~76 MB and ~33 graph nodes per QSA layer per step, of which ~50 MB and ~9 nodes is re-pooling the whole indexer cache; that is 2x dense attention and ~19x sparse attention after E020, and it is the half that scales with layer count (12x real). Not measured | open | [runs/E024-qsa-gpu-inventory.md](runs/E024-qsa-gpu-inventory.md) |
 | E025 | 2026-09-17 | T2 | bench-4x-r9700-32g | do the host fix and sparse FA show up on the real model | **A yes**: +4.9% tg at 131k, 2.34 ms/token saved, 20.1 ns/token of depth = 1x not 4x, so the fill is per step and per rank hypothesis is dead. **B null everywhere** - it did not engage (locally it was +23%/+58% pp). And 20.4 ms of a 50 ms step is depth-proportional while bytes explain ~1/9 of it | open | [runs/E025-bench-validation.md](runs/E025-bench-validation.md) |
+| E026 | 2026-09-18 | T1 | dev-rx9070-16g | what the user's rebase did to the dummy numbers | fingerprint moved +0.067% (their mmq retune, legitimate: dense and sparse both 0.046%), gate re-baselined; qsa-A (+9.8%/+26%) and qsa-B (+21%/+55% pp) intact, dense-vs-sparse still 5e-8. Their retune costs pp512 -11.2% here | done | [runs/E026-post-rebase-rebaseline.md](runs/E026-post-rebase-rebaseline.md) |
 
 ## Comparability breaks
 
@@ -192,6 +193,13 @@ measuring at all. Detail in the topic memories.
   interpreted - locally it gave +23%/+58% pp, so 'not running' is the working hypothesis.
 - **~20.4 ms of a 50 ms decode step at 131k is depth-proportional and bytes explain ~1/9 of it**
   (E025) - the QSA GPU path is latency/inefficiency-bound, which is the real target now.
+
+- **Gate values re-baselined at `a8b24dfdf` (E026)**: golden `263113.6984 +/- 3043.13362`; deep
+  corpus `-c 8192` dense `267035.3653` / sparse `267035.3524`. Older numbers belong to builds
+  before the user's mmq retune, which moved dequant numerics by ~0.05%.
+- **Their RDNA4 mmq retune costs ~11% of pp512 on the dummy** (E026, both arms; -4.8% at 164k)
+  with decode unchanged. Check against the bench rather than dismiss - but the dummy weights
+  pp toward MoE matmuls, which is exactly what was retuned.
 
 ## Status legend
 
