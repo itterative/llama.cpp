@@ -50,3 +50,27 @@ shift, which is exactly the part that must be looked at carefully rather than gu
 
 The other ~1/3 of the original depth slope is GPU-side O(n_kv) work (mask build, `set_rows`,
 `get_rows` expansion, `top_k`) and is untouched by any of this.
+
+## correction to how the transfer reads (added after the user's objection)
+
+This reads as if the fix scaled *better* on the dummy than a real model would, and it does not:
+**the host fill is once per decode step, not once per QSA layer**, even though QSA attention runs
+on 12 of 48 layers. `qsa_inps` is keyed by compression ratio and `res->add_input` is only reached
+in the branch that creates the first entry (`src/models/qwen4exp.cpp:576-596`), and registered
+inputs get exactly one `set_input` per graph eval (`src/llama-graph.cpp:1357-1359`). With one
+`indexer_compress_ratio: 4` for the whole model, all 12 layers share this input set and one upload.
+
+So the saving is an **absolute per-step** figure - ~0.8 ms at 40 k and ~2.1 ms at 164 k on this
+box's CPU - and it does not multiply by 12. Against a 5-8 ms local step those became +10% and
++26%; against the bench's ~35 ms step the same milliseconds are ~2-6%, and the percentage from
+this box must not be transplanted. Two things to keep straight:
+
+- **Host fill: per step, no layer leverage.** Neither attenuated nor amplified.
+- **QSA GPU work: per layer, 12x on the real model** (indexer matmuls, mask fill, `set_rows`,
+  `get_rows` expansion, `top_k`, plus the attention read). That is where the bench-side leverage
+  is, and it is the opposite direction from every other local measurement made on this harness.
+
+Caveat, since it was raised: the 4-layer dummy contains exactly one QSA layer, so local counts
+cannot distinguish per-step from per-QSA-layer. The claim above rests on the two code sites cited,
+not on measurement. An 8-layer build (2 QSA layers) or a 4-layer build with
+`full_attention_interval=2` would settle it by call count; neither has been run.
