@@ -62,6 +62,13 @@ weights) to fill. **Filled 2026-09-17.**
 Design reference: [plans/ple-prefetch.md](plans/ple-prefetch.md) - the n-gram table
 prefetch/cache options (warm page cache; VRAM row cache with an S3-FIFO/SIEVE-class policy;
 why the whole table cannot go on GPU), and what has to be measured before any of it is built.
+**Superseded in premise by E031**: direct per-row reads removed the fault path, so the row-cache
+options are now solutions to a problem that no longer exists. Read the newer file first.
+
+Architecture walkthrough: [plans/qsa-ple-in-prefill-and-decode.md](plans/qsa-ple-in-prefill-and-decode.md)
+- what QSA and the n-gram table actually execute in prefill versus decode, per-token byte budgets at
+this model's real shapes, why the sparse port is structurally prefill-only here, and what a smarter
+table cache could and could not buy. Written to decide priorities, not to record a run.
 
 ## Findings that are not experiments
 - **E019's ops baseline says nothing about the sparse path (E032):** the `256/256` sparse cases dispatch to
@@ -230,9 +237,9 @@ measuring at all. Detail in the topic memories.
   (predictable row set per ubatch -> `WILLNEED`) is back as the fix worth trying. Swap involvement
   is unproven: the 7 GiB figure is the swap size.
 
-  **Size corrected from the dump: the table is 47.7 GiB** (`51200245760` B, 43% of the 111.38 GiB
-  file), so the story is eviction pressure rather than "too big for RAM" - it would fit in the
-  62.7 GiB alone, but the file is 111 GiB and this is the largest thing competing for the cache.
+  **Size from the dump: the table is 51.2e9 elements = 35.2 GB = 32.8 GiB in Q5_0**, 29% of the file,
+  so the story is eviction pressure rather than "too big for RAM" - it would fit in the 62.7 GiB
+  alone, but the file is 111 GiB and this is the largest thing competing for the cache.
   Table ranges get `MADV_RANDOM` with no `MAP_POPULATE` and no `WILLNEED` (F1), so prefill faults
   per access. E017 showed the shape on the dummy (+6.5% pp, 0% tg from a small table); E008b
   (majflt/s in both phases) settles it, E030 checks the llama-bench amplification, and **H12 is

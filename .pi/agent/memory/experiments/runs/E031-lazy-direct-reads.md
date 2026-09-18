@@ -25,7 +25,7 @@ whereas every earlier gate arm used `-lm none`.
 
 ## Bench arm (planned)
 
-Their current command uses `-lzm auto`, which for the 47.7 GiB table already means lazy mmap reads,
+Their current command uses `-lzm auto`, which for the 32.8 GiB table already means lazy mmap reads,
 so `auto` vs `on-direct` is the apples-to-apples pair - the only difference is who issues the reads.
 Same for `-ot per_layer_token_embd=CPU`, which stays: the gather is host-side either way.
 
