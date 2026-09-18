@@ -30,7 +30,7 @@ try that?".
 | E025 | 2026-09-17 | T2 | bench-4x-r9700-32g | do the host fix and sparse FA show up on the real model | **A yes**: +4.9% tg at 131k, 2.34 ms/token saved, 20.1 ns/token of depth = 1x not 4x, so the fill is per step and per rank hypothesis is dead. **B null everywhere** - it did not engage (locally it was +23%/+58% pp). And 20.4 ms of a 50 ms step is depth-proportional while bytes explain ~1/9 of it | open | [runs/E025-bench-validation.md](runs/E025-bench-validation.md) |
 | E026 | 2026-09-18 | T1 | dev-rx9070-16g | what the user's rebase did to the dummy numbers | fingerprint moved +0.067% (their mmq retune, legitimate: dense and sparse both 0.046%), gate re-baselined; qsa-A (+9.8%/+26%) and qsa-B (+21%/+55% pp) intact, dense-vs-sparse still 5e-8. Their retune costs pp512 -11.2% here | done | [runs/E026-post-rebase-rebaseline.md](runs/E026-post-rebase-rebaseline.md) |
 | E027 | 2026-09-18 | T2 | bench-4x-r9700-32g | does sparse FA pay on the real model | **it engages and it does not pay**: probe prints 48 TRUE / 120 FALSE with `n_kv_max=2051`, the FALSE set being exactly the four depths under the 4102 gate, TRUE from 5120 - yet the same-build control sits inside +-0.34% on pp. So bench pp is not attention-read bound (H11 stall, four-way KV split). The +21.5% at 131k I first credited to it was their base drift (+4.5% tg at 4k) | done | [runs/E027-bench-sparse-engages.md](runs/E027-bench-sparse-engages.md) |
-| E031 | 2026-09-18 | T2 | dev-rx9070-16g (bench arm planned) | does PR 29030's direct-read gather pay here | **yes locally**: pp512 +22.3%, pp2048 +9.2% over `-lzm on`, golden PPL bit-identical, reader engages (rows of 110 B, 32 readers). Cherry-picked as `84b141ac6`. The bench is the real test, since its page cache cannot hold 111 GiB | running | [runs/E031-lazy-direct-reads.md](runs/E031-lazy-direct-reads.md) |
+| E031 | 2026-09-18 | T2 | bench-4x-r9700-32g + dev-rx9070-16g | does PR 29030's direct-read gather pay | **yes, and it is the first thing that moves bench prefill**: pp512 @131k 476.2 -> **653.2 (+37.2%)**, pp4096 +9.4%, pp8192 and tg flat. Dev box +22.3% pp512 with golden PPL bit-identical. H11 confirmed | done | [runs/E031-lazy-direct-reads.md](runs/E031-lazy-direct-reads.md) |
 
 ## Comparability breaks
 
@@ -232,11 +232,14 @@ measuring at all. Detail in the topic memories.
   the structural fix: split across the four cards at ~12 GiB each against ~10 GiB free, which
   removes the streaming instead of batching it.**
 
-- **H11 has a candidate fix from upstream rather than from us (E031):** PR 29030 adds `--lazy-mode
-  on-direct`, which gathers an ubatch's PLE rows with sorted parallel `pread`s instead of
-  demand-faulting the mmap one page per ~110 B row. Cherry-picked as `84b141ac6`; +22.3% pp512 and
-  +9.2% pp2048 on the dummy with the golden PPL unchanged. If it pays on the bench, H12 stops being
-  the fix for the stall and stays only the fix for the streaming itself.
+- **H11 is confirmed and largely fixed by upstream PR 29030 (E031):** `--lazy-mode on-direct`
+  gathers an ubatch's PLE rows with sorted parallel `pread`s instead of demand-faulting the mmap one
+  page per ~110 B row. Bench pp512 @131k goes 476.2 -> 653.2 (+37.2%), pp4096 +9.4%, pp8192 and tg
+  flat, so prefill was fault-bound and long prompts are now past the crossover into compute-bound.
+  The negative on tg is informative too: a decode step only touches 16 rows per PLE layer, so the
+  E011 fixed host cost is something else and stays in the queue.
+- **`-lm none` does not disable lazy reads (E031):** the lazy ranges are mapped for the table anyway,
+  which is how a 111 GiB model loads on a 62.7 GiB box. Do not treat `lm` and `lzm` as one axis.
 
 ## Status legend
 
