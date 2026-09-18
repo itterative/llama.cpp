@@ -42,9 +42,13 @@ static void ggml_cuda_flash_attn_ext_rtile_case(ggml_backend_cuda_context & ctx,
     constexpr int nbatch_fa = 32;
     constexpr size_t nbytes_shared = 0; // all state is static __shared__ inside the kernel
 
-    fattn_kernel_t fattn_kernel = flash_attn_rtile<D, ncols2, type_KV>;
+    // the hint is only a hint: launch_fattn sizes the grid off n_kv_max when it is set
+    const bool use_sparse = ggml_get_op_params_i32(dst, 4) > 0;
+
+    fattn_kernel_t fattn_kernel = use_sparse ? flash_attn_rtile<D, ncols2, type_KV, true>
+                                             : flash_attn_rtile<D, ncols2, type_KV, false>;
     launch_fattn<D, 1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, 32,
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, use_sparse, 32,
          rtile_min_parallel_blocks(dst, ncols2));
 }
 

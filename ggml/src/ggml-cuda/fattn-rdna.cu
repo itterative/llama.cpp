@@ -38,8 +38,18 @@ static bool ggml_cuda_fattn_rdna_can_use_rtile(const fattn_props & props) {
         return false;
     }
 
-    // the kernel walks a contiguous KV range, so it must not take the op while a sparse selection is in effect
-    return ggml_get_op_params_i32(props.dst, 4) == 0;
+    const int32_t n_kv_max = ggml_get_op_params_i32(props.dst, 4);
+    if (n_kv_max == 0) {
+        return true; // dense: walk the cache
+    }
+
+    // sparse: the index rows are read out of the mask, so its layout must be what the
+    //     compaction kernel writes, and the selection only pays past a few times its own width
+    const ggml_tensor * mask = props.dst->src[3];
+    const int64_t depth_min = 2LL*n_kv_max > 4096 ? 2LL*n_kv_max : 4096;
+
+    return mask && mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+           K->ne[1] >= depth_min;
 }
 
 // launch_fattn's use_sparse must be derived from the op hint: passing it true for a node with

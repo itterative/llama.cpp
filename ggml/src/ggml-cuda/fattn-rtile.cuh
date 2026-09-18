@@ -48,9 +48,21 @@ static constexpr __host__ __device__ int rtile_nwarps_v(const int ncols2) {
 // same accesses, dequant VALU free (kvtype law 1). Global loads issue as
 // register bursts before the LDS stores, and the +4 half2 row pad keeps
 // lane-owns-row b128 reads at the 4-phase floor (528 B row stride).
+// sparse staging: the tile's rows come from an index list instead of a contiguous range.
+// A -1 entry (padded past the selection) or a row past the end of a short tile reads row 0,
+// which is safe to touch and gets -INF from the mask, so it cannot change the result.
+static __device__ __forceinline__ int rtile_row(const int * const __restrict__ rows, const int nvalid, const int row) {
+    if (rows == nullptr) {
+        return row;
+    }
+    const int r = row < nvalid ? rows[row] : -1;
+    return r < 0 ? 0 : r;
+}
+
 template<int D, int nbatch_fa, int nthreads, ggml_type type_KV>
 static __device__ __forceinline__ void rtile_stage_tile(
-        const char * const __restrict__ src, half2 * const __restrict__ dst, const int64_t stride_bytes) {
+        const char * const __restrict__ src, half2 * const __restrict__ dst, const int64_t stride_bytes,
+        const int * const __restrict__ rows, const int nvalid) {
     constexpr int PAD_H2 = 4;
     const int tid = threadIdx.y*warpSize + threadIdx.x;
 
@@ -70,7 +82,7 @@ static __device__ __forceinline__ void rtile_stage_tile(
             for (int it = 0; it < BURST; ++it) {
                 const int u = tid + (g*BURST + it)*nthreads;
                 const int row = u / CPR, chunk = u % CPR;
-                ggml_cuda_memcpy_1<16>(buf[it], src_h2 + (int64_t) row*stride_h2 + chunk*4);
+                ggml_cuda_memcpy_1<16>(buf[it], src_h2 + (int64_t) rtile_row(rows, nvalid, row)*stride_h2 + chunk*4);
             }
 #pragma unroll
             for (int it = 0; it < BURST; ++it) {
@@ -95,7 +107,7 @@ static __device__ __forceinline__ void rtile_stage_tile(
         for (int it = 0; it < NW; ++it) {
             const int u = tid + it*nthreads;
             const int row = u / NFR, frag = u % NFR;
-            const char * blk = src + (int64_t) row*stride_bytes + (frag/(QK8_0/8))*sizeof(block_q8_0);
+            const char * blk = src + (int64_t) rtile_row(rows, nvalid, row)*stride_bytes + (frag/(QK8_0/8))*sizeof(block_q8_0);
             ggml_cuda_memcpy_1<2>(&d_raw[it], blk);
             ggml_cuda_memcpy_1<8, 2>(&qs_raw[it], blk + sizeof(half) + (frag%(QK8_0/8))*8);
         }
@@ -129,7 +141,7 @@ static __device__ __forceinline__ void rtile_stage_tile(
         for (int it = 0; it < NW; ++it) {
             const int u = tid + it*nthreads;
             const int row = u / NFR, frag = u % NFR;
-            const char * blk = src + (int64_t) row*stride_bytes + (frag/(QK4_0/8))*sizeof(block_q4_0);
+            const char * blk = src + (int64_t) rtile_row(rows, nvalid, row)*stride_bytes + (frag/(QK4_0/8))*sizeof(block_q4_0);
             ggml_cuda_memcpy_1<2>(&d_raw[it], blk);
             ggml_cuda_memcpy_1<8, 2>(&qs_raw[it], blk + sizeof(half) + (frag & 1)*8);
         }
@@ -164,7 +176,7 @@ static __device__ __forceinline__ void rtile_stage_tile(
 template<int D, int nbatch_fa, int nthreads, ggml_type type_KV>
 static __device__ __forceinline__ void rtile_stage_k_quant(
         const char * const __restrict__ src, int * const __restrict__ K_qs, half * const __restrict__ K_ds,
-        const int64_t stride_bytes) {
+        const int64_t stride_bytes, const int * const __restrict__ rows, const int nvalid) {
     static_assert(type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0, "bad K type");
     static_assert(D % QK8_0 == 0, "bad quant row split"); // QK4_0 == QK8_0 == 32
     constexpr int NFR = D/8;                 // fragments per row
@@ -180,7 +192,7 @@ static __device__ __forceinline__ void rtile_stage_k_quant(
     for (int it = 0; it < NW; ++it) {
         const int u = tid + it*nthreads;
         const int row = u / NFR, frag = u % NFR;
-        const char * blk = src + (int64_t) row*stride_bytes + (frag/4)*BLK;
+        const char * blk = src + (int64_t) rtile_row(rows, nvalid, row)*stride_bytes + (frag/4)*BLK;
         ggml_cuda_memcpy_1<2>(&d_raw[it], blk);
         if constexpr (type_KV == GGML_TYPE_Q8_0) {
             ggml_cuda_memcpy_1<8, 2>(&qs_raw[it], blk + sizeof(half) + (frag%4)*8);
@@ -205,7 +217,7 @@ static __device__ __forceinline__ void rtile_stage_k_quant(
     }
 }
 
-template<int D, int ncols2, ggml_type type_KV>
+template<int D, int ncols2, ggml_type type_KV, bool use_sparse>
 __launch_bounds__(rtile_nwarps_v(ncols2)*32)
 static __global__ void flash_attn_rtile(
         const char * Q_ptr,
@@ -247,7 +259,9 @@ static __global__ void flash_attn_rtile(
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
-    const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    // one pointer argument, two meanings: lengths when dense, index rows when sparse
+    const int  * GGML_CUDA_RESTRICT KV_max   = use_sparse ? nullptr : KV_max_ptr;
+    const int  * GGML_CUDA_RESTRICT idx_all  = use_sparse ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
@@ -262,6 +276,10 @@ static __global__ void flash_attn_rtile(
 
     const int64_t stride_K = nb11; // byte strides; rows are f16 or q8_0
     const int64_t stride_V = nb21;
+
+    // launch_fattn passes n_kv_max in ne11 when the op is sparse, and one int32 row of
+    // gathered indices per (sequence, query) tile in idx_all
+    const int * idx_row = use_sparse ? idx_all + (int64_t((sequence % ne33)*ne31 + blockIdx.x) * ne11) : nullptr;
 
     constexpr float L2E = GGML_FATTN_RTILE_EXP2 ? 1.44269504088896340736f : 1.0f;
     constexpr float KQ_MAX_OFF = FATTN_KQ_MAX_OFFSET*L2E;
@@ -377,6 +395,9 @@ static __global__ void flash_attn_rtile(
                                    type_KV == GGML_TYPE_Q8_0 ? (Dh/QK8_0)*int64_t(sizeof(block_q8_0))
                                                              : (Dh/QK4_0)*int64_t(sizeof(block_q4_0));
     for (int k0 = blockIdx.y*nbatch_fa; k0 < k_VKQ_max; k0 += gridDim.y*nbatch_fa) {
+        // in the sparse case k0 counts selected entries, not KV rows, and the last tile is short
+        const int  nvalid = use_sparse ? min(nbatch_fa, k_VKQ_max - k0) : nbatch_fa;
+        const int * rows  = use_sparse ? idx_row + k0 : nullptr;
         // K in NSUB sub-chunks of Dh elements; KQ_acc accumulates across
         // them. NSUB == 1 at D=256: the sequence below is the original one.
         float KQ_acc[cpw] = {0.0f};
@@ -403,9 +424,9 @@ static __global__ void flash_attn_rtile(
                 }
             }
             if constexpr (type_KV == GGML_TYPE_F16) {
-                rtile_stage_tile<Dh, nbatch_fa, nwarps*32, type_KV>(K_d + (int64_t) k0*stride_K + h*half_bytes, KV_tmp, stride_K);
+                rtile_stage_tile<Dh, nbatch_fa, nwarps*32, type_KV>(K_d + h*half_bytes + (use_sparse ? 0 : (int64_t) k0*stride_K), KV_tmp, stride_K, rows, nvalid);
             } else {
-                rtile_stage_k_quant<Dh, nbatch_fa, nwarps*32, type_KV>(K_d + (int64_t) k0*stride_K + h*half_bytes, K_qs, K_ds, stride_K);
+                rtile_stage_k_quant<Dh, nbatch_fa, nwarps*32, type_KV>(K_d + h*half_bytes + (use_sparse ? 0 : (int64_t) k0*stride_K), K_qs, K_ds, stride_K, rows, nvalid);
             }
             __syncthreads();
 
@@ -469,7 +490,13 @@ static __global__ void flash_attn_rtile(
         float KQ_max_new[cpw];
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
-            KQ_acc[jc0] += maskh ? __half2float(maskh[k0 + threadIdx.x])*L2E : 0.0f;
+            if constexpr (use_sparse) {
+                // the selection is per token, so every Q column in the tile shares one index row
+                const int idx = threadIdx.x < nvalid ? rows[threadIdx.x] : -1;
+                KQ_acc[jc0] += threadIdx.x < nvalid && idx >= 0 ? __half2float(maskh[idx])*L2E : -INFINITY;
+            } else {
+                KQ_acc[jc0] += maskh ? __half2float(maskh[k0 + threadIdx.x])*L2E : 0.0f;
+            }
             KQ_max_new[jc0] = fmaxf(KQ_max[jc0], KQ_acc[jc0] + KQ_MAX_OFF);
             KQ_max_new[jc0] = warp_reduce_max<32>(KQ_max_new[jc0]);
         }
@@ -494,7 +521,7 @@ static __global__ void flash_attn_rtile(
 
 #pragma unroll
         for (int h = 0; h < NSUB; ++h) {
-            rtile_stage_tile<Dh, nbatch_fa, nwarps*32, type_KV>(V_d + (int64_t) k0*stride_V + h*half_bytes, KV_tmp, stride_V);
+            rtile_stage_tile<Dh, nbatch_fa, nwarps*32, type_KV>(V_d + h*half_bytes + (use_sparse ? 0 : (int64_t) k0*stride_V), KV_tmp, stride_V, rows, nvalid);
             __syncthreads();
 
             // VKQ accumulate: lane owns d-slice threadIdx.x*2*DL2h .. +2*DL2h-1
