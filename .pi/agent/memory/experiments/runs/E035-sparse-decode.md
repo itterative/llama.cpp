@@ -58,6 +58,37 @@ Two ways this silently measures zero:
 `tools/rtile-fa-probe.patch` prints the shapes of the ops that took the sparse arm, once per kernel
 instantiation. Run it before spending time on the perf number.
 
+## Addendum - the bench saw nothing, and the gate is the first suspect
+
+`results/user/results-sparse-decode.log`, build `d77fb8d53` (11083), both flags, `-sm tensor`, tg only:
+
+| depth | this run | E027c3 sparse+vec | E027c3 dense |
+|---|---|---|---|
+| 4096   | 34.79 +- 1.73 | 35.09 | 36.13 |
+| 16384  | 33.23 +- 1.64 | 33.16 | 34.00 |
+| 40960  | 30.20 +- 1.23 | 30.17 | 30.97 |
+| 131072 | 22.24 +- 0.69 | 21.63 | 21.99 |
+
+So rtile moved nothing except 131k by +2.8%, which is inside its own error bar. Landed exactly on the
+sparse+vec arm, i.e. the same number you get if the kernel is never selected.
+
+The dev box proves the mechanism works: the gate probe prints
+`q=[256,1,24] k=[256,4352,2] gqa=12 nkv=4352 n_kv_max=2051 -> TAKE` and tg pays +4.2%/+10.6% at
+40k/164k. What is unknown is the **per-device** `gqa` under `-sm tensor`, and rtile can only express
+even ratios: the dispatch splits q heads into `ncols2` in {16,8,4,2} groups sharing one staged KV row,
+so a ratio of 3 would silently mis-group them. 24 q heads and 2 KV heads over 4 cards is either 6 q
+per card with 1 KV head (ratio 6, fine) or 6 q with both KV heads replicated (ratio 3, skipped).
+
+Two ways to settle it, in ascending cost:
+- run the same matrix with `-sm layer`, where each card holds whole layers and the ratio stays 12. If
+  the win appears there, tensor split's per-layer collectives were hiding it *and* the gate was the
+  blocker on the tensor arm;
+- `tools/rtile-gate-probe.patch`, which prints the shapes and TAKE/skip once per process regardless of
+  the outcome. Needs `-v`, since llama-bench swallows ggml logs.
+
+`tools/rtile-fa-probe.patch` (the one that prints only when the sparse arm is taken) is superseded by
+the gate probe for this question.
+
 ## Still open
 
 - whether to keep the kernel at all: dense rtile is a wash versus vec on RDNA4, so its stated purpose -

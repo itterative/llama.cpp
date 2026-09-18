@@ -1,0 +1,35 @@
+# Gate probe for fattn-rtile. Prints once per process the exact shapes the selection
+# looks at, and TAKE or skip. Apply, rebuild, and run llama-bench with -v (it swallows
+# ggml logs otherwise), -p 0 so only decode ops are built.
+#
+# Read it per device: 4 devices means 4 lines, one per ggml_cuda_get_best_fattn_kernel_rdna
+# caller context, and the interesting field is gqa. The gate requires gqa >= 2 and even.
+#   gqa=6  -> TAKE   (tensor split gave each card 1 KV head)
+#   gqa=3  -> skip   (each card kept both KV heads; odd gqa is not expressible in rtile's
+#                     ncols2 in {16,8,4,2}, so sparse decode cannot be measured this way)
+# n_kv_max=0 means Q4EXP_SPARSE_FA did not reach the op, i.e. the model-side gate is off.
+--- a/ggml/src/ggml-cuda/fattn-rdna.cu
++++ b/ggml/src/ggml-cuda/fattn-rdna.cu
+@@ -61,6 +61,22 @@
+ }
+ 
+ best_fattn_kernel ggml_cuda_get_best_fattn_kernel_rdna(const fattn_props & props) {
++    // one line per process: the shapes the gate looks at, and whether it passed
++    {
++        static bool warned = false;
++        const ggml_tensor * Q = props.dst->src[0];
++        const ggml_tensor * K = props.dst->src[1];
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("rtile gate: enabled=%d q=[%d,%d,%d] k=[%d,%d,%d] type_k=%d gqa=%d nkv=%d n_kv_max=%d -> %s\n",
++                ggml_cuda_fattn_rdna_rtile_enabled(),
++                (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2],
++                (int) K->ne[0], (int) K->ne[1], (int) K->ne[2], (int) K->type,
++                props.gqa_ratio, (int) K->ne[1], ggml_get_op_params_i32(props.dst, 4),
++                ggml_cuda_fattn_rdna_can_use_rtile(props) ? "TAKE" : "skip");
++        }
++    }
++
+     if (ggml_cuda_fattn_rdna_rtile_enabled() && ggml_cuda_fattn_rdna_can_use_rtile(props)) {
+         return BEST_FATTN_KERNEL_RDNA_RTILE;
+     }
