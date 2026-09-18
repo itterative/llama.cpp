@@ -28,8 +28,11 @@ of avoided KV read, whichever kernel does the avoiding. It also retires my +20-3
 sparse decode on that box; the arithmetic was right about the bytes and wrong about which bytes were
 on the critical path.
 
-The chain's cost does not look bandwidth-bound: 84 MB of gathered keys in 2.78 ms is 30 GB/s, and there
-are ~33 nodes per layer per step, so ~85 us each. Small dependent kernels, not a big read.
+The chain's cost is not bandwidth-bound either, and less so than it first looked: the cached indexer
+keys are **f16, not f32**, because the indexer cache is built with the same `type_k, type_v` as the
+main one (`src/llama-memory-hybrid-idx.cpp:63`), so 128 dims is 256 B per token, and the whole-cache
+gather at 164k is 42 MB, not 84. 42 MB in 2.78 ms is 15 GB/s with ~33 nodes per layer per step at
+~85 us each. Small dependent kernels, not a read.
 
 ## Why the chain is bigger than it needs to be
 
@@ -62,4 +65,9 @@ Filed as backlog **H13** (select at block level, then expand), ahead of H9.
   is replicated rather than split there, and that needs checking in the fork;
 - what fraction of 2.78 ms is `ggml_top_k` alone - the block-level change answers it implicitly;
 - whether `no_indexer` on a real checkpoint degrades quality (expected: yes, badly - it is the design,
-  and the dummy cannot say).
+  and the dummy cannot say);
+- the score path is f32 while the cache is f16. At decode that is 655 KB per layer per step, so dtype
+  is not a lever there at all; at prefill the expanded array is `n_kv x n_tps` f32 (537 MB per layer
+  per ubatch at 131k x 1024), so it is a lever - but H13 shrinks that array 4x structurally, which
+  beats a 2x cast, and an f16 selection would change tie-breaking. Re-measure after H13 before
+  touching dtype, and check that `ggml_top_k` even has an f16 backend instantiation.
