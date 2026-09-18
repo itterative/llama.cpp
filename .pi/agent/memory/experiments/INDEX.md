@@ -213,7 +213,13 @@ measuring at all. Detail in the topic memories.
   counts resident kernels, so a spin-waiting AllReduce reads as 100% busy. Needs the sampling
   method pinned down before it can be used as evidence of anything.
 
-- **H11 is now most likely PLE n-gram streaming, not a kernel problem**: ~30-36 GB of Q5 table
+- **H11 screenshots confirm waiting, not work**: four cards at 26% util, ~70 W each, load average
+  ~1.2, VRAM 22/32 GiB per card. Disk is busy at ~66 MB/s of **reads** - which at 4 KiB pages is
+  ~16k accesses/s, i.e. IOPS/latency-bound random single-page reads from the PLE table, not a
+  bandwidth limit. That is what `MADV_RANDOM` does to a scattered gather, and it is why F1
+  (predictable row set per ubatch -> `WILLNEED`) is back as the fix worth trying. Swap involvement
+  is unproven: the 7 GiB figure is the swap size.
+
   held in system RAM on a 32 GB box cannot be resident, and the table ranges get `MADV_RANDOM`
   with no `MAP_POPULATE` and no `WILLNEED` (F1), so prefill page-faults from SSD and starves the
   cards while decode stays warm. E017 showed this shape on the dummy (+6.5% pp, 0% tg from a
