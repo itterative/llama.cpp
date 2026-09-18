@@ -1,0 +1,24 @@
+# Cost probe: Q4EXP_NO_INDEXER=1 removes the QSA scoring chain from every full-attention layer.
+
+What disappears per step: the full-cache indexer gather, the r-way pooling, the block scores, the
+expansion of block scores to cells (f32, n_kv x n_tps), the ggml_top_k over it, and the mask rebuild.
+What stays: the attention itself (dense causal), so the KV read is *larger* than with the selection.
+
+Read it as the ceiling on H9 plus the QSA tax, not as a config to run: the output is wrong. Compare
+against the same command with Q4EXP_SPARSE_FA=1 GGML_FATTN_RDNA_RTILE=1 (selection in use) and
+against neither (dense + full cache), which brackets the context-proportional cost three ways.
+
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -791,7 +791,10 @@
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
+     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
+-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
++    // Q4EXP_NO_INDEXER=1 drops the whole QSA scoring chain for measurement: attention becomes
++    //     dense-causal and the results are wrong on purpose, only the per-step cost is comparable
++    static const bool no_indexer = getenv("Q4EXP_NO_INDEXER") != nullptr;
++    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0 && !no_indexer;
+ 
+     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+ 
