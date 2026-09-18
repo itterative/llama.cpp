@@ -213,6 +213,13 @@ measuring at all. Detail in the topic memories.
   counts resident kernels, so a spin-waiting AllReduce reads as 100% busy. Needs the sampling
   method pinned down before it can be used as evidence of anything.
 
+- **H11 is now most likely PLE n-gram streaming, not a kernel problem**: ~30-36 GB of Q5 table
+  held in system RAM on a 32 GB box cannot be resident, and the table ranges get `MADV_RANDOM`
+  with no `MAP_POPULATE` and no `WILLNEED` (F1), so prefill page-faults from SSD and starves the
+  cards while decode stays warm. E017 showed this shape on the dummy (+6.5% pp, 0% tg from a
+  small table). E008b measures majflt/s in both phases and settles it; E030 checks whether
+  llama-bench's random fill amplifies it.
+
 ## Status legend
 
 `planned` (id reserved, nothing run) | `running` | `done` | `blocked` (external
