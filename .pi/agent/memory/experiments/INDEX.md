@@ -31,6 +31,7 @@ try that?".
 | E026 | 2026-09-18 | T1 | dev-rx9070-16g | what the user's rebase did to the dummy numbers | fingerprint moved +0.067% (their mmq retune, legitimate: dense and sparse both 0.046%), gate re-baselined; qsa-A (+9.8%/+26%) and qsa-B (+21%/+55% pp) intact, dense-vs-sparse still 5e-8. Their retune costs pp512 -11.2% here | done | [runs/E026-post-rebase-rebaseline.md](runs/E026-post-rebase-rebaseline.md) |
 | E027 | 2026-09-18 | T2 | bench-4x-r9700-32g | does sparse FA pay on the real model | **it engages and it does not pay**: probe prints 48 TRUE / 120 FALSE with `n_kv_max=2051`, the FALSE set being exactly the four depths under the 4102 gate, TRUE from 5120 - yet the same-build control sits inside +-0.34% on pp. So bench pp is not attention-read bound (H11 stall, four-way KV split). The +21.5% at 131k I first credited to it was their base drift (+4.5% tg at 4k) | done | [runs/E027-bench-sparse-engages.md](runs/E027-bench-sparse-engages.md) |
 | E031 | 2026-09-18 | T2 | bench-4x-r9700-32g + dev-rx9070-16g | does PR 29030's direct-read gather pay | **yes, and it is the first thing that moves bench prefill**: pp512 @131k 476.2 -> **653.2 (+37.2%)**, pp4096 +9.4%, pp8192 and tg flat. Dev box +22.3% pp512 with golden PPL bit-identical. H11 confirmed | done | [runs/E031-lazy-direct-reads.md](runs/E031-lazy-direct-reads.md) |
+| E032 | 2026-09-18 | T0 | analysis (reviewer run) | is there an unbounded index in the sparse port | **not given the gate**, which moves the suspicion to the unclamped gather index, the zero-slack LDS in the new 256/256/1/16 instantiation, and an unenforced 16B alignment precondition. Found instead: my `static n_kv_max` latch (fixed, `1d724aca0`), and that this instantiation has **zero** coverage in test-backend-ops, so E019 never validated it | done | [runs/E032-audit-sparse-bounds.md](runs/E032-audit-sparse-bounds.md) |
 
 ## Comparability breaks
 
@@ -62,6 +63,11 @@ prefetch/cache options (warm page cache; VRAM row cache with an S3-FIFO/SIEVE-cl
 why the whole table cannot go on GPU), and what has to be measured before any of it is built.
 
 ## Findings that are not experiments
+- **E019's ops baseline says nothing about the sparse path (E032):** the `256/256` sparse cases dispatch to
+  `ncols2=8` on NVIDIA or to VEC at `nb=1`, so the `(256,256,1,16)` instantiation the RDNA4 port had
+  to add is unreachable on every NVIDIA path in the tree and untested everywhere. Gate-probe output
+  is the only proof of engagement, and 12 < 16 (`gqa_ratio < ncols2`) has never run anywhere else.
+
 
 Things established while setting up, recorded here because they change what is worth
 measuring at all. Detail in the topic memories.
