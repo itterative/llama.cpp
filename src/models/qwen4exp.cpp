@@ -765,7 +765,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/27970
     // Q4EXP_SPARSE_FA selects the sparse path; unset keeps the dense one
-    static const int64_t n_kv_max = std::getenv("Q4EXP_SPARSE_FA") ? top_k->ne[0] : 0;
+    // ask per build: a draft graph must not latch n_kv_max for the target layers
+    static const bool use_sparse_fa = std::getenv("Q4EXP_SPARSE_FA") != nullptr;
+    const int64_t n_kv_max = use_sparse_fa ? top_k->ne[0] : 0;
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
