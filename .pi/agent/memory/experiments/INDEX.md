@@ -23,6 +23,7 @@ try that?".
 | E018 | 2026-09-17 | T1 | dev-rx9070-16g | a zero-filled dummy cannot detect a model-level bug | **yes**: seeded pattern fill + `llama-perplexity` fingerprint, `PPL = 262938.7619 +/- 3039.07`, bit-stable across runs, and perf-neutral vs zeros (181.89 vs 182.40, -0.28%); local noise floor measured at ~1% so only >2% deltas count | done | [runs/E018-correctness-gate.md](runs/E018-correctness-gate.md) |
 | E019 | 2026-09-17 | T1 | dev-rx9070-16g | the op-level gate needs a baseline on the current stack | **yes**: 5641 cases, 5633 OK / 7 FAIL, all FAILs pre-existing `FLASH_ATTN_EXT hsk=192,hsv=128`; our 256/256 shape is 142/142. Capture works locally now (9430 warmups); `-j 8` aborts, use `-j 1` | done | [runs/E019-ops-baseline.md](runs/E019-ops-baseline.md) |
 | E020 | 2026-09-17 | T1 | dev-rx9070-16g | can sparse FA be made to run on RDNA4 | **yes**: pp512 +23.3% @40k and +58.5% @164k, tg flat, numerics match dense to 6e-7. Six blockers, all mapped; RDNA needs the 1x16 tiling (no device code below 16 tiles) and the generator pruned it. Also closes H4b's kernel question | done | [runs/E020-sparse-fa-rdna4.md](runs/E020-sparse-fa-rdna4.md) |
+| E021 | 2026-09-17 | T1 | dev-rx9070-16g | what actually owns the decode depth slope | **the host-side QSA input scan**: O(n_kv) at 23 ns/cell, 695 us/step at 30k = 13% of the step and ~2/3 of the depth delta. Matches upstream's own TODO. Indexer block keys are not cached (pooling precedes norm/rope), and the mapping is append-only, so it is fixable without kernel work and does not scale with layer count | done | [runs/E021-qsa-host-scan.md](runs/E021-qsa-host-scan.md) |
 
 ## Comparability breaks
 
@@ -159,6 +160,11 @@ measuring at all. Detail in the topic memories.
   +23% pp at 40k / +58% at 164k, and matches dense numerics to 6e-7. Decode does not move.
   The E018 golden corpus is too short to reach the depth gate - use `tools/sparse-corpus.md`
   with `-c 8192` for any sparse-path check.
+
+- **The decode depth slope is mostly host-side** (E021): `set_input_qsa` scans all n_kv cells
+  per step (~23 ns/cell, 13% of a 30k step). This is per-step, NOT per-layer, so unlike every
+  other local number it is not 1/12 attenuated by the dummy harness - a fix here is directly
+  meaningful on this box and the same absolute cost on the bench.
 
 ## Status legend
 
