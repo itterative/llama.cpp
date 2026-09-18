@@ -179,6 +179,10 @@ measuring at all. Detail in the topic memories.
 - **QSA host scan cumulative (E022+E023): tg +9.8% at 40k, +26.0% at 164k**, results bit-identical.
   The remaining ~1.7 ms/step in that function is the cost of *writing* ~3 MB of mapping data
   each step - loop shape and divisions are no longer the limit (E023).
+- **That fill is once per step, NOT once per QSA layer** (inputs are shared by compression ratio),
+  so the saving is an absolute ~0.8-2.1 ms: ~2-6% of the bench's 35 ms step, not +26%. The QSA
+  *GPU* work is per layer and therefore 12x on the real model - the bench-relevant target, and the
+  opposite direction from every other local number here. Neither is measurable on a 4-layer dummy.
 
 ## Status legend
 

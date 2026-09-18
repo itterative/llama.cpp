@@ -75,3 +75,9 @@ predicted at 164 k leaves ~12 ns/cell. Two ways down further:
 
 And ~1/3 of the original depth slope is still GPU-side O(n_kv) work (mask fill, `set_rows`, the
 `get_rows` expansion, `top_k`), which this change does not touch.
+
+Note added afterwards, with the detail in E023: "per step, not per layer" comes from `qsa_inps`
+being keyed by ratio plus one `set_input` per registered input per graph eval, and a 4-layer dummy
+with a single QSA layer cannot verify it. The GPU half of that sentence *is* per layer, so it is 12x
+on the real model, while the host saving here is an absolute per-step figure - the percentages in
+this record do not read across to the bench in either direction.
