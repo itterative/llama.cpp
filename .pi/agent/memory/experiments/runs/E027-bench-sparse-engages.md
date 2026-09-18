@@ -109,3 +109,29 @@ condition rejects on the real model.
 What still stands from this record: qsa-A's own effect (+4.85% tg at 131k against a build differing
 only in a non-conflicting file), and that the bench's fixed per-step cost has moved - the +4.5% tg at
 4 k depth in the base drift column means E011-era percentages need re-reading against a new baseline.
+
+
+# CORRECTION 2 - the gate does engage on the bench, and it still changed nothing
+
+Probe run (`Q4EXP_FA_DEBUG=1 Q4EXP_SPARSE_FA=1`, `-d 131072`, prefill only, interrupted early),
+`results/user/results-sparse-gate.log`: 168 lines, **48 TRUE / 120 FALSE**, `n_kv_max=2051` on every
+line, so the model-side hunk is present in their build after all.
+
+The FALSE lines are exactly the four depths below the gate - `K=256,1024 / 2048 / 3072 / 4096` - and
+4096 fails because the threshold is `max(4096, 2*2051) = 4102`, which confirms the arithmetic on the
+real model rather than only on the dummy. TRUE starts at `K=256,5120` with
+`mask=5120,1024,1,1 Q=256,1024,12 bias=0 cap=0`, i.e. every other condition holds on the real file.
+
+So the conclusion in the correction above is itself wrong in one respect: sparse FA **was** measured
+on the bench and **did nothing** (+-0.34% pp in the same-build control). It is not a merge casualty.
+
+That is the interesting result. On the dev box the same gate gives +21% pp at 40k and +55% at 164k by
+removing ~95% of the attention KV read. On the bench it engages at the same depth and the throughput
+does not move, which means prompt processing there is not limited by attention reads. Two candidates
+that fit: prefill is stalled on the n-gram/SSD path (H11, 26% GPU util with load average ~1.2), in
+which case a GPU-side saving converts into more idle time rather than tokens per second; and under
+`-sm tensor` the KV read is divided across four cards, so attention is a smaller share of pp there
+than it is on a single card. Both predict the same thing: fix the stall first, then re-measure B.
+
+Note for anyone re-reading the log: the gate is evaluated at graph build time, so 48 TRUE lines is
+4 builds x 12 QSA layers and says nothing about how often sparse ran per step.
