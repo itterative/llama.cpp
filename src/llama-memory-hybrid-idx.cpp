@@ -304,9 +304,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
     // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
     //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
-    std::vector<int32_t>  blk_of(n_kv);
-    std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
+    std::vector<int32_t>  blk_of;
+    std::vector<int32_t>  cell_grp;
+    std::vector<int32_t>  grp_head;
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -355,9 +355,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         auto group_cells = [&]() {
             // -1 means no usable block: an incomplete or short group cannot be pooled
-            std::fill(blk_of.begin(),   blk_of.end(),   -1);
-            std::fill(cell_grp.begin(), cell_grp.end(), -1);
-            std::fill(grp_head.begin(), grp_head.end(), -1);
+            blk_of.assign(n_kv, -1);
+            cell_grp.assign(n_kv, -1);
+            grp_head.assign(n_blocks, -1);
 
             grp_next .clear();
             grp_first.clear();
@@ -415,101 +415,193 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         };
 
-        group_cells();
-
-        // mrope repeats one position across an image, so rank cells instead of using the position
-        if (dup && ubatch->is_pos_2d() && one_seq) {
-            order.clear();
-            order.reserve(n_kv);
-
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (!cells.is_empty(j)) {
-                    order.push_back((int32_t) j);
-                }
-            }
-
-            // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
-                const llama_pos pa = cells.pos_get(a);
-                const llama_pos pb = cells.pos_get(b);
-
-                if (pa != pb) {
-                    return pa < pb;
-                }
-
-                const auto & ea = cells.ext_get(a);
-
-                return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
-            });
-
-            rank.assign(n_kv, -1);
-
-            for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
-                rank[order[k]] = (int32_t) k;
-            }
-
-            ranked = true;
-
-            group_cells();
-        }
-
-        GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
-
         int32_t n_bid = 0;
 
-        for (int64_t pb = 0; pb < n_blocks; ++pb) {
-            for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
-                if (grp_slots[g] != slots_full) {
+        // the usual state is a single sequence whose used cells are one contiguous run of
+        //     positions, where the block mapping is arithmetic - verified in a single pass, this
+        //     skips the group machinery and the second walk over the cells
+        auto try_contiguous = [&](void) -> bool {
+            // a run with one cell per position cannot repeat a slot bit, so the ranked (mrope
+            //     duplicate) branch below is unreachable whenever this one applies
+            if (!blk_bias || !one_seq) {
+                return false;
+            }
+
+            int64_t   j0 = -1, j1 = -1;
+            llama_pos p0 = 0;
+            bool      hole = false;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    hole |= j0 >= 0;
                     continue;
                 }
 
-                grp_bid[g] = n_bid++;
+                if (hole) {
+                    return false;
+                }
 
-                bid_idx  .push_back((int32_t) (pb*r));
-                bid_cell .push_back(grp_first[g]);
-                bid_slot0.push_back(grp_slot0[g]);
+                const llama_pos p = cells.pos_get(j);
+
+                if (j0 < 0) {
+                    j0 = j;
+                    p0 = p;
+                } else if (p != p0 + (j - j0)) {
+                    return false;
+                }
+
+                j1 = j;
             }
+
+            if (j0 < 0 || p0 < 0) {
+                return false;
+            }
+
+            const llama_pos p1 = p0 + (j1 - j0);
+
+            if (p1/r >= n_blocks) {
+                return false;
+            }
+
+            // a bucket is pooled only when all r of its positions fall inside the run
+            const int64_t b_lo = (p0 + r - 1)/r;
+            const int64_t b_hi = p1 >= r - 1 ? (p1 - r + 1)/r : -1;
+
+            n_bid = b_hi >= b_lo ? (int32_t) (b_hi - b_lo + 1) : 0;
+
+            bid_idx .reserve(n_bid);
+            bid_cell.reserve(n_bid);
+
+            for (int64_t b = b_lo; b <= b_hi; ++b) {
+                const int32_t idx = (int32_t) (b*r);
+
+                bid_idx .push_back(idx);
+                bid_cell.push_back((int32_t) (j0 + (idx - p0)));
+
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + (b - b_lo)] = idx;
+                }
+            }
+
+            const int32_t dead = n_bid < n_blocks ? n_bid : n_blocks - 1;
+
+            std::fill(cur_cell_blk, cur_cell_blk + n_kv, dead);
+
+            for (int64_t j = j0; j <= j1; ++j) {
+                const llama_pos p = p0 + (j - j0);
+                const int64_t   b = p/r;
+
+                if (b < b_lo || b > b_hi) {
+                    continue;
+                }
+
+                cur_blk_cells[(b - b_lo)*r + (p%r)] = (int32_t) j;
+                cur_cell_blk[j] = (int32_t) (b - b_lo);
+            }
+
+            return true;
+        };
+
+        if (!try_contiguous()) {
+            group_cells();
+
+            // mrope repeats one position across an image, so rank cells instead of using the position
+            if (dup && ubatch->is_pos_2d() && one_seq) {
+                order.clear();
+                order.reserve(n_kv);
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    if (!cells.is_empty(j)) {
+                        order.push_back((int32_t) j);
+                    }
+                }
+
+                // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
+                std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
+                    const llama_pos pa = cells.pos_get(a);
+                    const llama_pos pb = cells.pos_get(b);
+
+                    if (pa != pb) {
+                        return pa < pb;
+                    }
+
+                    const auto & ea = cells.ext_get(a);
+
+                    return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
+                });
+
+                rank.assign(n_kv, -1);
+
+                for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
+                    rank[order[k]] = (int32_t) k;
+                }
+
+                ranked = true;
+
+                group_cells();
+            }
+
+            GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+
+
+            for (int64_t pb = 0; pb < n_blocks; ++pb) {
+                for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
+                    if (grp_slots[g] != slots_full) {
+                        continue;
+                    }
+
+                    grp_bid[g] = n_bid++;
+
+                    bid_idx  .push_back((int32_t) (pb*r));
+                    bid_cell .push_back(grp_first[g]);
+                    bid_slot0.push_back(grp_slot0[g]);
+                }
+            }
+
+            GGML_ASSERT(n_bid <= n_blocks);
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
+
+                if (ranked) {
+                    const int32_t   c = bid_slot0[b];
+                    const llama_pos p = cells.pos_get(c);
+                    const auto &    e = cells.ext_get(c);
+
+                    sec_pos[0] = p;
+                    sec_pos[1] = e.y;
+                    sec_pos[2] = e.x;
+                    sec_pos[3] = p;
+                }
+
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
+                }
+            }
+
+            // unpooled cells all point at one spare block. a spare block exists only when some
+            // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
+            const bool     have_dead_g = n_bid < n_blocks;
+            const int32_t  dead_bid_g  = have_dead_g ? n_bid : n_blocks - 1;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int32_t g = cell_grp[j];
+
+                blk_of[j] = g < 0 ? -1 : grp_bid[g];
+
+                if (blk_of[j] >= 0) {
+                    const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                    cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+                }
+
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid_g : blk_of[j];
+            }
+
         }
 
-        GGML_ASSERT(n_bid <= n_blocks);
-
-        for (int32_t b = 0; b < n_bid; ++b) {
-            int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
-
-            if (ranked) {
-                const int32_t   c = bid_slot0[b];
-                const llama_pos p = cells.pos_get(c);
-                const auto &    e = cells.ext_get(c);
-
-                sec_pos[0] = p;
-                sec_pos[1] = e.y;
-                sec_pos[2] = e.x;
-                sec_pos[3] = p;
-            }
-
-            for (int64_t sec = 0; sec < 4; ++sec) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
-            }
-        }
-
-        // unpooled cells all point at one spare block. a spare block exists only when some
-        // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
-        const bool     have_dead = n_bid < n_blocks;
-        const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
-
-        for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t g = cell_grp[j];
-
-            blk_of[j] = g < 0 ? -1 : grp_bid[g];
-
-            if (blk_of[j] >= 0) {
-                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
-
-                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
-            }
-
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
-        }
+        const bool    have_dead = n_bid < n_blocks;
+        const int32_t dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
