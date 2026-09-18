@@ -69,3 +69,43 @@ work from my change for both pp and tg, and it is the number worth having.
 If `92a47455f` without the flag already gives ~+6% tg, then the bench's fixed per-step cost has
 moved since the 28 ms measurement, and every E011-era percentage on this branch should be re-read
 against a fresh baseline. That is a bigger deal than the sparse result.
+
+
+# CORRECTION - the control refutes this record's headline (same day)
+
+The user redid qsa-A at the new base, which is the control this record said was missing. Same build
+`92a47455f` (11062), flag off versus flag set:
+
+| test | flag off | flag on | delta |
+|---|---|---|---|
+| pp512 @ d4096   | 408.96 | 408.47 | -0.12% |
+| pp512 @ d40960  | 481.37 | 481.91 | +0.11% |
+| pp512 @ d131072 | 476.17 | 476.54 | +0.08% |
+| pp8192 @ d131072| 850.87 | 847.95 | -0.34% |
+| tg128 @ d4096   | 34.73  | 35.30  | +1.64% |
+| tg128 @ d131072 | 21.31  | 21.50  | +0.89% |
+
+**Sparse FA does nothing measurable on the bench.** Every pp row is inside +-0.34%, and the tg rows
+are inside their own noise and are not something the sparse path can even affect (decode does not
+reach `mma_f16`). The +21.5% at 131k that this record attributed to sparse is in the *base drift*
+column instead: qsa-A at 11011 versus the same code at 11062 gives +21.5% pp512@131k, +10-13%
+pp4096/8192@131k, +2-4.5% at the shallower depths and **+4.5% tg at 4096**, where there is no depth
+effect at all. So the whole of it was the user's landing commits, not my change.
+
+Two candidate readings of that base drift, and the probe decides between them:
+
+1. Their p2p allreduce and mmq retune simply made everything faster, with the long-context pp rows
+   gaining most for reasons of their own.
+2. **Their fork already engages sparse attention**, in which case 11062-with-flag-off and
+   11062-with-flag-on are the same computation, which is exactly what the +-0.3% control shows. This
+   would also explain why the gain is depth-shaped.
+
+`tools/qsa-fa-probe.patch` (verified against this tree, `Q4EXP_FA_DEBUG=1`) prints the gate verdict
+and every input it tested per FA op build. One short run with the flag **off** answers it: if the
+gate prints TRUE without the env, their fork is doing sparse already and my ggml change is
+redundant there; if it prints FALSE, the printed `n_kv_max`, `mask` and `K` shapes say which
+condition rejects on the real model.
+
+What still stands from this record: qsa-A's own effect (+4.85% tg at 131k against a build differing
+only in a non-conflicting file), and that the bench's fixed per-step cost has moved - the +4.5% tg at
+4 k depth in the base drift column means E011-era percentages need re-reading against a new baseline.

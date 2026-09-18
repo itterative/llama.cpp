@@ -10,6 +10,7 @@ evidence. User-supplied facts marked (user); everything else still to confirm.
 | cards | 4x **AMD Radeon AI PRO R9700**, **32 GB** each (user) |
 | gfx target | **gfx1201** (user-confirmed), RDNA4 / Navi 48 XT class |
 | total VRAM | 128 GB |
+| **system RAM** | **62.7 GiB total** (screenshot 2026-09-18 19:21, `gtop` mem panel; 7.70 GiB used, 12%) - the "32g" in this profile's name is **not** RAM, and the earlier reasoning that a 30-36 GB PLE table cannot fit in RAM was wrong |
 | role | T2: real `qwen4exp` end-to-end, multi-GPU |
 | reachability | separate machine, not reachable from this session; user runs commands by hand |
 

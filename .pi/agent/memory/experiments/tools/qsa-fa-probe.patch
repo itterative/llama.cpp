@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index a94d7924b..57ded1f50 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -134,10 +134,23 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
+     // the AMD WMMA path has no device code for DKQ > 256 or for tilings below 16 tiles,
+     //     so only head sizes with a valid sparse instantiation may take it
+     const bool sparse_arch_ok = turing_mma_available(cc) || (amd_wmma_available(cc) && K->ne[0] <= 256);
+-    return sparse_arch_ok &&
++    const bool gate = sparse_arch_ok &&
+         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
++
++    // Q4EXP_FA_DEBUG=1: which side the gate fell on, and what it saw
++    static const bool fa_gate_debug = std::getenv("Q4EXP_FA_DEBUG") != nullptr;
++    if (fa_gate_debug) {
++        GGML_LOG_WARN("FA sparse gate %s: cc=%d n_kv_max=%d mask=%d,%d,%d,%d K=%d,%d Q=%d,%d,%d bias=%g cap=%g\n",
++            gate ? "TRUE" : "FALSE", cc, n_kv_max,
++            mask ? (int) mask->ne[0] : -1, mask ? (int) mask->ne[1] : -1,
++            mask ? (int) mask->ne[2] : -1, mask ? (int) mask->ne[3] : -1,
++            (int) K->ne[0], (int) K->ne[1], (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2],
++            max_bias, logit_softcap);
++    }
++
++    return gate;
+ #endif // !defined(GGML_USE_MUSA)
+ }
+ 
