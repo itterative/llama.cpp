@@ -63,6 +63,10 @@ anything - it defines the tiers, the naming, and the rules.
 5. Local GPU is `gfx1201`, RX 9070, 56 CU, 16304 MiB, `VMM: no`, wave 32, and it drives
    the display - it is not a quiet measurement device.
 
+4. **A HIP device exception dumps `gpucore.<pid>` (~7.3 GB each on this card) into the CWD**, i.e.
+   the repo root when tools are run from there. Two crashes were 14.6 GB before anyone looked
+   (E020). Check `df` and `ls gpucore.*` after any `HSA_STATUS_ERROR_EXCEPTION`.
+
 ## Status (as of 2026-09-17, refreshed after E018)
 
 Scaffolding built: PROTOCOL, INDEX, E001 (harness viability, `blocked` by the traps
@@ -151,6 +155,19 @@ Three rules that come from E017/E018 and must not be re-derived:
 - **Decode does not care about table volume** (182.1 / 182.7 / 182.4 at 35 / 3.7 / 5.5 GB) but
   **pp4096 gained 6.5% from the small table**, which is the first positive evidence for F1 (lazy
   ranges are never prefetched, get `MADV_RANDOM`, `MAP_POPULATE` deliberately skipped).
+
+## First code change on this branch (E020: `abd3473a8`, `b364ff44e`)
+
+Sparse flash attention runs on RDNA4. `Q4EXP_SPARSE_FA=1` engages above 4102 KV and gives
+**pp512 +23.3% at d40960, +58.5% at d163840**, numerically equal to dense-with-mask within
+6e-7, with **tg unchanged**. Six blockers had to clear; the ones the code survey missed are in
+`experiments/runs/E020-sparse-fa-rdna4.md` (HIP's 64-bit `__ballot_sync`, `may_use_sparse`
+whitelisting only DKQ 512/576, and RDNA having no FA device code below 16 tiles, which forces
+the 1x16 tiling and a generator change). Open by choice, not oversight: NVIDIA is untested
+here, the new instantiation costs CUDA build time and code size, the env default is off, and
+the E018 golden corpus (3428 tokens) can never reach the depth gate - use
+`tools/sparse-corpus.md` with `-c 8192` for any sparse-path check. H4a stays live: sparse
+scans the mask, it does not stop the model from rebuilding it.
 
 Immediate next steps: **B4 - the fork diff** (MMQ fixes, custom AllReduce, and the user's own
 `sm tensor` enablement, which the upstream guard blames on `test-llama-archs` - our harness is now

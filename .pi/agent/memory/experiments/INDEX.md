@@ -22,6 +22,7 @@ try that?".
 | E017 | 2026-09-17 | T1 | dev-rx9070-16g | a shape-faithful dummy can be generated and run locally | **yes**: 4 real layers + real types, 5.47 ms/step of which ~4.5 ms is per-step host work; decode is flat across a 10x table volume range (182.1/182.7/182.4) while pp4096 gains 6.5% from a small table; shipped as models/q4exp-4l.gguf with a 5.5 GB table | done | [runs/E017-dummy-harness.md](runs/E017-dummy-harness.md) |
 | E018 | 2026-09-17 | T1 | dev-rx9070-16g | a zero-filled dummy cannot detect a model-level bug | **yes**: seeded pattern fill + `llama-perplexity` fingerprint, `PPL = 262938.7619 +/- 3039.07`, bit-stable across runs, and perf-neutral vs zeros (181.89 vs 182.40, -0.28%); local noise floor measured at ~1% so only >2% deltas count | done | [runs/E018-correctness-gate.md](runs/E018-correctness-gate.md) |
 | E019 | 2026-09-17 | T1 | dev-rx9070-16g | the op-level gate needs a baseline on the current stack | **yes**: 5641 cases, 5633 OK / 7 FAIL, all FAILs pre-existing `FLASH_ATTN_EXT hsk=192,hsv=128`; our 256/256 shape is 142/142. Capture works locally now (9430 warmups); `-j 8` aborts, use `-j 1` | done | [runs/E019-ops-baseline.md](runs/E019-ops-baseline.md) |
+| E020 | 2026-09-17 | T1 | dev-rx9070-16g | can sparse FA be made to run on RDNA4 | **yes**: pp512 +23.3% @40k and +58.5% @164k, tg flat, numerics match dense to 6e-7. Six blockers, all mapped; RDNA needs the 1x16 tiling (no device code below 16 tiles) and the generator pruned it. Also closes H4b's kernel question | done | [runs/E020-sparse-fa-rdna4.md](runs/E020-sparse-fa-rdna4.md) |
 
 ## Comparability breaks
 
@@ -153,6 +154,11 @@ measuring at all. Detail in the topic memories.
 - **The op-level baseline on ROCm 7.1.1 is 5633 OK / 7 FAIL** (E019), the FAILs all being the
   known `FLASH_ATTN_EXT hsk=192,hsv=128` family. New failures are judged against 7, not the
   6 in the older note. `test-backend-ops -j >1` aborts on HIP capture errors - run `-j 1`.
+
+- **Sparse FA works on RDNA4 (E020)**: `Q4EXP_SPARSE_FA=1` engages above 4102 KV, gives
+  +23% pp at 40k / +58% at 164k, and matches dense numerics to 6e-7. Decode does not move.
+  The E018 golden corpus is too short to reach the depth gate - use `tools/sparse-corpus.md`
+  with `-c 8192` for any sparse-path check.
 
 ## Status legend
 
