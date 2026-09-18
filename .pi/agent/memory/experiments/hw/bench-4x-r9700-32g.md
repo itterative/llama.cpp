@@ -34,7 +34,7 @@ it as a baseline partner is not.
 | context | full context (config says 262,144) |
 
 Matches the arithmetic: non-PLE is ~129 B params, which at Q4_K_M is ~72-80 GB; the PLE
-table is ~51 B params; the real file measures it at **47.7 GiB** (`51200245760` B, `160 x 320001536` Q5_0, from `results/user/gguf-dump.log`), i.e. 43% of the 111.38 GiB model in one tensor - an earlier note here said 30-36 GB and that was wrong.
+table is 51.2 B params = **35.2e9 bytes = 32.8 GiB** in Q5_0, i.e. 29% of the 111.38 GiB model in one tensor. Shape `160, 320001536` from `results/user/gguf-dump.log`, where the first column is `n_elements`, not bytes - a note here briefly claimed 47.7 GiB / 43% after reading it as bytes, and that was wrong. Row = 160 weights = 110 bytes; 16 rows per token = 1760 bytes.
 
 128 GB of VRAM against ~80 GB of weights leaves real headroom for KV and recurrent state -
 so on this box the question is not "does it fit" but "what is the bottleneck". That is a
