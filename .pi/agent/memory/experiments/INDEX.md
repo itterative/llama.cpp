@@ -24,6 +24,7 @@ try that?".
 | E019 | 2026-09-17 | T1 | dev-rx9070-16g | the op-level gate needs a baseline on the current stack | **yes**: 5641 cases, 5633 OK / 7 FAIL, all FAILs pre-existing `FLASH_ATTN_EXT hsk=192,hsv=128`; our 256/256 shape is 142/142. Capture works locally now (9430 warmups); `-j 8` aborts, use `-j 1` | done | [runs/E019-ops-baseline.md](runs/E019-ops-baseline.md) |
 | E020 | 2026-09-17 | T1 | dev-rx9070-16g | can sparse FA be made to run on RDNA4 | **yes**: pp512 +23.3% @40k and +58.5% @164k, tg flat, numerics match dense to 6e-7. Six blockers, all mapped; RDNA needs the 1x16 tiling (no device code below 16 tiles) and the generator pruned it. Also closes H4b's kernel question | done | [runs/E020-sparse-fa-rdna4.md](runs/E020-sparse-fa-rdna4.md) |
 | E021 | 2026-09-17 | T1 | dev-rx9070-16g | what actually owns the decode depth slope | **the host-side QSA input scan**: O(n_kv) at 23 ns/cell, 695 us/step at 30k = 13% of the step and ~2/3 of the depth delta. Matches upstream's own TODO. Indexer block keys are not cached (pooling precedes norm/rope), and the mapping is append-only, so it is fixable without kernel work and does not scale with layer count | done | [runs/E021-qsa-host-scan.md](runs/E021-qsa-host-scan.md) |
+| E022 | 2026-09-17 | T1 | dev-rx9070-16g | can the O(n_kv) host scan be avoided | **yes**: contiguous-run fast path, tg +8.3% @40k and +22.0% @164k, pp unchanged, all four correctness arms bit-identical. First local change that moves decode. Also found: the `-np 2` gate arm is not reproducible (~1e-7) | done | [runs/E022-qsa-fast-path.md](runs/E022-qsa-fast-path.md) |
 
 ## Comparability breaks
 
@@ -165,6 +166,14 @@ measuring at all. Detail in the topic memories.
   per step (~23 ns/cell, 13% of a 30k step). This is per-step, NOT per-layer, so unlike every
   other local number it is not 1/12 attenuated by the dummy harness - a fix here is directly
   meaningful on this box and the same absolute cost on the bench.
+
+- **Decode moved for the first time (E022)**: `set_input_qsa` now has a verified contiguous-run
+  fast path, tg +8.3% at 40k / +22.0% at 164k, pp unchanged, results bit-identical. It is
+  host-side and per-step, so the bench box should see the same absolute saving.
+  Remaining: one-pass version (~2x again), memoization (near O(1)), and the ~1/3 of the slope
+  that is GPU-side O(n_kv) mask/top-k work.
+- **`llama-perplexity -np > 1` is not bit-reproducible** (~1e-7 spread, shared cache ordering).
+  Use `-np 1` arms for exact-match claims (E022).
 
 ## Status legend
 
