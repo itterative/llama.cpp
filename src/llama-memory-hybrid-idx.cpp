@@ -427,76 +427,61 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 return false;
             }
 
-            int64_t   j0 = -1, j1 = -1;
-            llama_pos p0 = 0;
-            bool      hole = false;
+            const int64_t j0 = cells.used_min();
+            const int64_t j1 = cells.used_max_p1();
+            const int64_t nu = cells.get_used();
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (cells.is_empty(j)) {
-                    hole |= j0 >= 0;
-                    continue;
-                }
-
-                if (hole) {
-                    return false;
-                }
-
-                const llama_pos p = cells.pos_get(j);
-
-                if (j0 < 0) {
-                    j0 = j;
-                    p0 = p;
-                } else if (p != p0 + (j - j0)) {
-                    return false;
-                }
-
-                j1 = j;
-            }
-
-            if (j0 < 0 || p0 < 0) {
+            if (nu == 0 || j1 - j0 != nu) {
                 return false;
             }
 
-            const llama_pos p1 = p0 + (j1 - j0);
+            const llama_pos p0 = cells.pos_get(j0);
+            const llama_pos p1 = cells.pos_get(j1 - 1);
 
-            if (p1/r >= n_blocks) {
+            if (p0 < 0 || p1 != p0 + (j1 - 1 - j0) || p1/r >= n_blocks) {
                 return false;
             }
 
-            // a bucket is pooled only when all r of its positions fall inside the run
+            // a bucket is pooled only when all r of its positions are inside the run
             const int64_t b_lo = (p0 + r - 1)/r;
             const int64_t b_hi = p1 >= r - 1 ? (p1 - r + 1)/r : -1;
 
             n_bid = b_hi >= b_lo ? (int32_t) (b_hi - b_lo + 1) : 0;
 
-            bid_idx .reserve(n_bid);
-            bid_cell.reserve(n_bid);
+            const int32_t dead = n_bid < n_blocks ? n_bid : n_blocks - 1;
 
-            for (int64_t b = b_lo; b <= b_hi; ++b) {
-                const int32_t idx = (int32_t) (b*r);
+            std::fill(cur_cell_blk, cur_cell_blk + n_kv, dead);
+
+            // one pass: verify the run is dense and write the cell mapping as it goes. positions
+            //     step by one, so the bucket and slot advance instead of being divided out
+            int64_t b    = p0/r;
+            int32_t slot = (int32_t) (p0%r);
+
+            for (int64_t j = j0; j < j1; ++j) {
+                if (cells.pos_get(j) != p0 + (j - j0)) {
+                    return false;
+                }
+
+                if (b >= b_lo && b <= b_hi) {  // otherwise the cell is in the incomplete head or
+                    cur_blk_cells[(b - b_lo)*r + slot] = (int32_t) j;
+                    cur_cell_blk[j] = (int32_t) (b - b_lo);   // tail bucket and uses the spare one
+                }
+
+                if (++slot == r) {
+                    slot = 0;
+                    b++;
+                }
+            }
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                const int32_t idx = (int32_t) ((b_lo + b)*r);
 
                 bid_idx .push_back(idx);
                 bid_cell.push_back((int32_t) (j0 + (idx - p0)));
 
                 for (int64_t sec = 0; sec < 4; ++sec) {
-                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + (b - b_lo)] = idx;
+                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = idx;
                 }
-            }
-
-            const int32_t dead = n_bid < n_blocks ? n_bid : n_blocks - 1;
-
-            std::fill(cur_cell_blk, cur_cell_blk + n_kv, dead);
-
-            for (int64_t j = j0; j <= j1; ++j) {
-                const llama_pos p = p0 + (j - j0);
-                const int64_t   b = p/r;
-
-                if (b < b_lo || b > b_hi) {
-                    continue;
-                }
-
-                cur_blk_cells[(b - b_lo)*r + (p%r)] = (int32_t) j;
-                cur_cell_blk[j] = (int32_t) (b - b_lo);
             }
 
             return true;
