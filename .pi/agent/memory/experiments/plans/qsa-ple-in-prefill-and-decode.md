@@ -120,16 +120,18 @@ Kernel routing at this shape, `head_dim 256`, `gqa_ratio 12`, `Q->ne[1]` = token
 | phase | Q->ne[1] | test in `best_fattn_kernel` | kernel family | sparse available |
 |---|---|---|---|---|
 | prefill | 1024 | `Q->ne[1] * 4 > 16` true | `mma_f16` **(256,256,1,16)** | **yes** |
-| decode | 1 | `1 * 4 > 16` false | tile / vec | **no such code exists** |
+| decode | 1 | `1 * 4 > 16` false | tile / vec | not upstream; **this branch added it**, see E035 |
 
 The sparse path lives only inside `mma_f16` (`fattn.cu:238-246` dispatch, `fattn-common.cuh:1095-1102`
 for the compaction and index launch, both reached from the mma launcher only) **[M by code read +
 E032 audit]**. So:
 
 - prefill gets the win **[M: +23%/+58% dev, +26..+45% bench at 131k]**;
-- decode gets no win, structurally, not as a tuning matter. Getting the report's 4.9x in decode would
-  mean writing a sparse variant of the vec/tile FA kernels, which does not exist in this backend for
-  any model. That is a much bigger change than anything else on the backlog.
+- decode got no win, structurally, not as a tuning matter: getting the report's 4.9x needed a sparse
+  variant of the vec/tile kernels, which does not exist upstream for any model. E035 did it here by
+  teaching `fattn-rtile`, an RDNA-only decode kernel, to walk the index list that `launch_fattn`
+  already builds - so the kernel work was one loop and one staging helper, not a new family. Measured
+  +4.2% at 40k and +10.6% at 164k on the dummy.
 
 The measured decode deltas are -1.6% to -2.9%, all four depths negative, each within about one sigma,
 with the dense arm running first. There is no mechanism in the graph: `n_kv_max` is an op parameter
@@ -204,9 +206,12 @@ byte table only tells us which stalls are worth removing.
    work the reference implementation does not do per step. Byte-wise comparable to the whole KV read,
    and unlike sparse decode it needs no kernels - one cached tensor plus the invalidation problem that
    `seq_add`/`seq_div` rewrite positions. Prerequisite is still E025 (size the per-layer prize in ms).
-3. **Sparse decode.** The architecture's 4.9x, and the only way to reclaim 3.1 GB/token at 131k. Needs
-   a sparse variant of the vec/tile FA kernels. Not a tuning task; would be the largest change in this
-   branch by a wide margin, and I would want it discussed upstream before anyone here built it.
+3. **Sparse decode: done on this branch (E035), pending the bench number.** It was the only way to
+   reclaim 3.1 GB/token at 131k, and it turned out to be cheap because `launch_fattn` already sizes the
+   grid, allocates the index buffer and pads with -1 for a sparse op - the kernel just had to stop
+   treating `KV_max_ptr` as lengths. Predicted +20-30% `tg` at 131k on the bench from the dummy's
+   depth response; the sparse variant of the *vec* kernel would give the same to every other backend
+   and model, and that is the version worth discussing upstream.
 4. **The PLE table: stop.** 1760 bytes per token. Everything in section 5 is now a rounding error, and
    E031 already banked the one real win available there.
 5. **H10 (mmq for MoE shapes) is theirs**, and it is now measurable on its own merits: until E031 the

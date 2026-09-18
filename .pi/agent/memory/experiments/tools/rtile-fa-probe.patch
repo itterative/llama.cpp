@@ -1,0 +1,27 @@
+# Probe for the rtile sparse-decode arm: prints once per kernel instantiation, showing the
+# op shapes that took the sparse path. Apply, rebuild, run llama-bench with -v (it
+# swallows ggml logs otherwise). Expected line for qwen4exp decode:
+#   rtile-sparse: D=256 ncols2=4 n_kv_max=2051 nkv=<padded cache rows> nkvheads=1 nheads=6 ...
+# If nothing prints while GGML_FATTN_RDNA_RTILE=1 and Q4EXP_SPARSE_FA=1, the selection
+# gate rejected the op: read nkvheads/nheads off a dense run and check gqa parity.
+--- a/ggml/src/ggml-cuda/fattn-rtile.cu
++++ b/ggml/src/ggml-cuda/fattn-rtile.cu
+@@ -44,6 +44,18 @@
+ 
+     // the hint is only a hint: launch_fattn sizes the grid off n_kv_max when it is set
+     const bool use_sparse = ggml_get_op_params_i32(dst, 4) > 0;
++    // one line per template instantiation, to prove which ops take the sparse arm
++    if (use_sparse) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("rtile-sparse: D=%d ncols2=%d n_kv_max=%d nkv=%d nkvheads=%d nheads=%d mask=[%d,%d,%d,%d]\n",
++                D, ncols2, ggml_get_op_params_i32(dst, 4), (int) dst->src[1]->ne[1], (int) dst->src[1]->ne[2],
++                (int) dst->src[0]->ne[2], (int) dst->src[3]->ne[0], (int) dst->src[3]->ne[1],
++                (int) dst->src[3]->ne[2], (int) dst->src[3]->ne[3]);
++        }
++    }
++
+ 
+     fattn_kernel_t fattn_kernel = use_sparse ? flash_attn_rtile<D, ncols2, type_KV, true>
+                                              : flash_attn_rtile<D, ncols2, type_KV, false>;
