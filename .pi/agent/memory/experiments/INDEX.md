@@ -208,6 +208,11 @@ measuring at all. Detail in the topic memories.
   **Needed: the same build twice, flag unset then set.** The +6% tg there is theirs (p2p allreduce /
   mmq landing), not sparse - decode never reaches mma_f16 and the gain shows below the gate too.
 
+- **Open contradiction (H11): prefill at 20-30% GPU util, decode near 100%, on the bench, both pre-**
+  **and post-rebase** (user report) versus E005's 9% during decode on the same box. Utilisation
+  counts resident kernels, so a spin-waiting AllReduce reads as 100% busy. Needs the sampling
+  method pinned down before it can be used as evidence of anything.
+
 ## Status legend
 
 `planned` (id reserved, nothing run) | `running` | `done` | `blocked` (external
