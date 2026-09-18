@@ -53,6 +53,8 @@ remaining per-layer gather and pooling still justify H9's cache. Sparse decode s
 pays on a single card and is invisible behind the chain on four - and the vec-kernel port is not worth
 ~150 lines plus a doubled instantiation set while the chain is the largest term.
 
+Filed as backlog **H13** (select at block level, then expand), ahead of H9.
+
 ## Open
 
 - whether the 2.78 ms scales linearly with layers on the real model, and how tensor split places the
