@@ -56,7 +56,27 @@ remaining per-layer gather and pooling still justify H9's cache. Sparse decode s
 pays on a single card and is invisible behind the chain on four - and the vec-kernel port is not worth
 ~150 lines plus a doubled instantiation set while the chain is the largest term.
 
-Filed as backlog **H13** (select at block level, then expand), ahead of H9.
+## Follow-up - the split is not where H13 acts
+
+Checked before writing H13, with `test-backend-ops perf -o TOP_K`:
+
+```
+TOP_K(type=f32,ne=[4096,1,1,1],k=16):    88.63 us/run    16 kB/run
+TOP_K(type=f32,ne=[16384,1,1,1],k=16):   91.74 us/run    64 kB/run
+```
+
+~88 us regardless of input size, i.e. a fixed cost, not a scan. At decode the cell arrays H13 shrinks
+are `n_kv` f32 = 655 KB at 164k, and the whole expand-copy-add-top-k chain is ~5 MB, which at the same
+implied rate is ~0.04 ms plus 88 us of top_k. The 2.78 ms is the indexer gather and the r-way pooling -
+~350 MB of copies per layer per step - so it is H9's territory and H13 is demoted to a prefill cleanup.
+
+Second finding: H13 is not semantics-preserving. `src/llama-memory-hybrid-idx.cpp:635` force-includes
+the tail by scoring tail blocks at `+1e9` rather than by always adding them, and the width is
+`2048 + r - 1 = 2051`, which is not a multiple of `r`. So the current cell-level selection can keep
+part of a block, while block-level selection cannot. Any change here needs its own quality check, not
+the bit-identical test originally written in H13.
+
+ (select at block level, then expand), ahead of H9.
 
 ## Open
 
