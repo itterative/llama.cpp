@@ -135,3 +135,32 @@ than it is on a single card. Both predict the same thing: fix the stall first, t
 
 Note for anyone re-reading the log: the gate is evaluated at graph build time, so 48 TRUE lines is
 4 builds x 12 QSA layers and says nothing about how often sparse ran per step.
+
+
+# CORRECTION 3 - the null was a masked interaction, not a property of sparse FA
+
+Measured on build `84b141ac6` (11071) with `-lzm on-direct`, dense vs `Q4EXP_SPARSE_FA=1`, same
+command otherwise, `results/user/results-lzm-on-direct.log`:
+
+| test | dense | sparse | delta |
+|---|---|---|---|
+| pp4096 @ d4096 | 2219.07 | 2137.98 | -3.7% |
+| pp4096 / pp8192 @ d16384 | 1910.61 / 1903.42 | 1968.42 / 2009.07 | +3.0% / +5.6% |
+| pp512 / pp4096 / pp8192 @ d40960 | 1102.96 / 1490.70 / 1484.10 | 1239.87 / 1720.49 / 1748.38 | **+12.4% / +15.4% / +17.8%** |
+| pp512 / pp4096 / pp8192 @ d131072 | 692.78 / 847.03 / 845.61 | 870.23 / 1204.92 / 1227.19 | **+25.6% / +42.3% / +45.1%** |
+| tg128, all depths | - | - | flat (-1.6% to -2.9%) |
+
+The gain grows with depth exactly as the dev box predicted, and the arms differ by one environment
+variable, so the effect is self-attributing - no gate probe needed to believe it.
+
+What E027 actually showed was this: on 11062 with `-lzm auto`, prefill was so dominated by PLE demand
+faults that removing 95% of the attention KV read changed nothing measurable, and the control was
+therefore blind. The correction above ("it engages and it does not pay") is retracted; it engages and
+it pays, once the thing in front of it is fixed. Sequence at pp4096 @ 131k: 759.35 dense+auto ->
+847.03 dense+on-direct -> 1204.92 sparse+on-direct, so +12% then +42%, +59% together.
+
+Methodology note, because it nearly bit here twice: at the shallow depths the sparse arm is *not* a
+free control. n_ctx is depth plus prompt, so pp4096 @ d4096 runs with a KV that crosses 4102 partway
+through, and even pp512 @ d4096 ends at 4608. And the bench's cross-run drift is larger than the
+within-arm stddev suggests - pp4096 @ d4096 differs by 3.7% between arms whose error bars are 0.07%.
+Treat roughly 4% on the bench as the floor for single-arm comparisons unless the arms are interleaved.
