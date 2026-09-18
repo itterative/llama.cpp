@@ -222,11 +222,14 @@ measuring at all. Detail in the topic memories.
   (predictable row set per ubatch -> `WILLNEED`) is back as the fix worth trying. Swap involvement
   is unproven: the 7 GiB figure is the swap size.
 
-  held in system RAM on a 32 GB box cannot be resident, and the table ranges get `MADV_RANDOM`
-  with no `MAP_POPULATE` and no `WILLNEED` (F1), so prefill page-faults from SSD and starves the
-  cards while decode stays warm. E017 showed this shape on the dummy (+6.5% pp, 0% tg from a
-  small table). E008b measures majflt/s in both phases and settles it; E030 checks whether
-  llama-bench's random fill amplifies it.
+  **Size corrected from the dump: the table is 47.7 GiB** (`51200245760` B, 43% of the 111.38 GiB
+  file), so the story is eviction pressure rather than "too big for RAM" - it would fit in the
+  62.7 GiB alone, but the file is 111 GiB and this is the largest thing competing for the cache.
+  Table ranges get `MADV_RANDOM` with no `MAP_POPULATE` and no `WILLNEED` (F1), so prefill faults
+  per access. E017 showed the shape on the dummy (+6.5% pp, 0% tg from a small table); E008b
+  (majflt/s in both phases) settles it, E030 checks the llama-bench amplification, and **H12 is
+  the structural fix: split across the four cards at ~12 GiB each against ~10 GiB free, which
+  removes the streaming instead of batching it.**
 
 ## Status legend
 
