@@ -25,6 +25,7 @@ try that?".
 | E020 | 2026-09-17 | T1 | dev-rx9070-16g | can sparse FA be made to run on RDNA4 | **yes**: pp512 +23.3% @40k and +58.5% @164k, tg flat, numerics match dense to 6e-7. Six blockers, all mapped; RDNA needs the 1x16 tiling (no device code below 16 tiles) and the generator pruned it. Also closes H4b's kernel question | done | [runs/E020-sparse-fa-rdna4.md](runs/E020-sparse-fa-rdna4.md) |
 | E021 | 2026-09-17 | T1 | dev-rx9070-16g | what actually owns the decode depth slope | **the host-side QSA input scan**: O(n_kv) at 23 ns/cell, 695 us/step at 30k = 13% of the step and ~2/3 of the depth delta. Matches upstream's own TODO. Indexer block keys are not cached (pooling precedes norm/rope), and the mapping is append-only, so it is fixable without kernel work and does not scale with layer count | done | [runs/E021-qsa-host-scan.md](runs/E021-qsa-host-scan.md) |
 | E022 | 2026-09-17 | T1 | dev-rx9070-16g | can the O(n_kv) host scan be avoided | **yes**: contiguous-run fast path, tg +8.3% @40k and +22.0% @164k, pp unchanged, all four correctness arms bit-identical. First local change that moves decode. Also found: the `-np 2` gate arm is not reproducible (~1e-7) | done | [runs/E022-qsa-fast-path.md](runs/E022-qsa-fast-path.md) |
+| E023 | 2026-09-17 | T1 | dev-rx9070-16g | does one pass + no divisions help more | yes but little: +1.3%/+2.1% then +0.1%/+1.2%; cumulative vs pre-E022 **tg +9.8% @40k, +26.0% @164k**, gates still bit-identical. Residual ~1.7 ms/step is the **store volume** (~3 MB of mapping at 164k, ~3 ns/store), so loop tuning is done; only reusing the arrays instead of rewriting them helps | done | [runs/E023-qsa-fast-path-one-pass.md](runs/E023-qsa-fast-path-one-pass.md) |
 
 ## Comparability breaks
 
@@ -174,6 +175,10 @@ measuring at all. Detail in the topic memories.
   that is GPU-side O(n_kv) mask/top-k work.
 - **`llama-perplexity -np > 1` is not bit-reproducible** (~1e-7 spread, shared cache ordering).
   Use `-np 1` arms for exact-match claims (E022).
+
+- **QSA host scan cumulative (E022+E023): tg +9.8% at 40k, +26.0% at 164k**, results bit-identical.
+  The remaining ~1.7 ms/step in that function is the cost of *writing* ~3 MB of mapping data
+  each step - loop shape and divisions are no longer the limit (E023).
 
 ## Status legend
 
