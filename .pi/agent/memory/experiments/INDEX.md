@@ -29,9 +29,10 @@ try that?".
 | E024 | 2026-09-17 | T3 | analysis | where the per-QSA-layer GPU work goes | ~76 MB and ~33 graph nodes per QSA layer per step, of which ~50 MB and ~9 nodes is re-pooling the whole indexer cache; that is 2x dense attention and ~19x sparse attention after E020, and it is the half that scales with layer count (12x real). Not measured | open | [runs/E024-qsa-gpu-inventory.md](runs/E024-qsa-gpu-inventory.md) |
 | E025 | 2026-09-17 | T2 | bench-4x-r9700-32g | do the host fix and sparse FA show up on the real model | **A yes**: +4.9% tg at 131k, 2.34 ms/token saved, 20.1 ns/token of depth = 1x not 4x, so the fill is per step and per rank hypothesis is dead. **B null everywhere** - it did not engage (locally it was +23%/+58% pp). And 20.4 ms of a 50 ms step is depth-proportional while bytes explain ~1/9 of it | open | [runs/E025-bench-validation.md](runs/E025-bench-validation.md) |
 | E026 | 2026-09-18 | T1 | dev-rx9070-16g | what the user's rebase did to the dummy numbers | fingerprint moved +0.067% (their mmq retune, legitimate: dense and sparse both 0.046%), gate re-baselined; qsa-A (+9.8%/+26%) and qsa-B (+21%/+55% pp) intact, dense-vs-sparse still 5e-8. Their retune costs pp512 -11.2% here | done | [runs/E026-post-rebase-rebaseline.md](runs/E026-post-rebase-rebaseline.md) |
-| E027 | 2026-09-18 | T2 | bench-4x-r9700-32g | does sparse FA pay on the real model | **it engages and it does not pay**: probe prints 48 TRUE / 120 FALSE with `n_kv_max=2051`, the FALSE set being exactly the four depths under the 4102 gate, TRUE from 5120 - yet the same-build control sits inside +-0.34% on pp. So bench pp is not attention-read bound (H11 stall, four-way KV split). The +21.5% at 131k I first credited to it was their base drift (+4.5% tg at 4k) | done | [runs/E027-bench-sparse-engages.md](runs/E027-bench-sparse-engages.md) |
+| E027 | 2026-09-18 | T2 | bench-4x-r9700-32g | does sparse FA pay on the real model | **yes, once the stall in front of it is fixed** (third correction): same build 11071, `-lzm on-direct`, dense vs sparse -> +12.4/+15.4/+17.8% at d40960 and **+25.6/+42.3/+45.1%** at d131072, tg flat. The 11062 control's +-0.34% was PLE demand faults masking it; combined at pp4096@131k it is 759 -> 847 -> 1205, +59% | done | [runs/E027-bench-sparse-engages.md](runs/E027-bench-sparse-engages.md) |
 | E031 | 2026-09-18 | T2 | bench-4x-r9700-32g + dev-rx9070-16g | does PR 29030's direct-read gather pay | **yes, and it is the first thing that moves bench prefill**: pp512 @131k 476.2 -> **653.2 (+37.2%)**, pp4096 +9.4%, pp8192 and tg flat. Dev box +22.3% pp512 with golden PPL bit-identical. H11 confirmed | done | [runs/E031-lazy-direct-reads.md](runs/E031-lazy-direct-reads.md) |
 | E032 | 2026-09-18 | T0 | analysis (reviewer run) | is there an unbounded index in the sparse port | **not given the gate**, which moves the suspicion to the unclamped gather index, the zero-slack LDS in the new 256/256/1/16 instantiation, and an unenforced 16B alignment precondition. Found instead: my `static n_kv_max` latch (fixed, `1d724aca0`), and that this instantiation has **zero** coverage in test-backend-ops, so E019 never validated it | done | [runs/E032-audit-sparse-bounds.md](runs/E032-audit-sparse-bounds.md) | (local repro at 6 QSA layers with the real head geometry does not fault; content or multi-device left)
+| E033 | 2026-09-18 | T2 | bench-4x-r9700-32g | do the bench GPU faults belong to the sparse port | **no support for that any more**: dmesg shows MES timeouts at queue teardown on one device with zero GPUVM faults, i.e. hangs not illegal accesses, and the last incident was at `n_ctx=4608` where sparse cannot engage. It followed the `HIP_LAUNCH_BLOCKING` deadlock I recommended; after a power cycle the full matrix ran clean twice, dense and sparse | not attributed | [runs/E033-bench-gpu-hangs.md](runs/E033-bench-gpu-hangs.md) |
 
 ## Comparability breaks
 
@@ -209,11 +210,11 @@ measuring at all. Detail in the topic memories.
   with decode unchanged. Check against the bench rather than dismiss - but the dummy weights
   pp toward MoE matmuls, which is exactly what was retuned.
 
-- **Sparse FA runs on the bench and buys nothing (E027):** the gate prints TRUE from 5120 depth
-  with `n_kv_max=2051` and the FALSE lines stop at 4096 because the threshold is 2x2051=4102, so
-  the port and the arithmetic are both right on the real model - yet the same-build control is
-  inside +-0.34% on pp. Bench prefill is not attention-read bound: H11's I/O stall and the
-  four-way KV split are the better explanations. Fix the stall, then re-measure B.
+- **Sparse FA pays on the bench once the stall in front of it is gone (E027 correction 3):** on
+  build 11071 with `-lzm on-direct`, dense vs sparse gives +12 to +18% at d40960 and +26 to +45% at
+  d131072, tg flat. The 11062 control's +-0.34% was PLE demand faults masking the attention savings,
+  which is a cautionary tale about controls run behind a bottleneck: a null can mean the change is
+  worth nothing, or that the thing you changed is not the thing that was limiting you.
 - **The bench's fixed per-step cost has moved** (E027 base drift: +4.5% tg at 4k depth). E011-era
   percentages should be re-read against a fresh baseline before being quoted again.
 
