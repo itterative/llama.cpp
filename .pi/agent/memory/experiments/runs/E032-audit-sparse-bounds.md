@@ -75,3 +75,26 @@ and excludes CDNA. Worth a comment or an assert in the eventual upstream version
   is ever preceded by NaN in the logits, that is the mechanism, and it would be numerics not memory.
 - Sparse with an empty or short top-k row is the *normal* case (causal masking) and is handled: prefix
   written, `-1` padding, loads of `-1` become zeros and `-inf` mask entries.
+
+## Local repro attempt - negative so far
+
+Built a dummy with the real attention geometry but 6 QSA layers instead of 1:
+`models/q4exp-24l-6qsa.gguf` (`--layers 24 --experts 32 --ple-head-rows 100000 --ctx 16384`, from
+`text_config` in the HF cache at `/tmp/.../allfull`), so `head_dim 256`, 24 Q / 2 KV heads (gqa 12),
+`indexer_budget 2048`, `indexer_compress_ratio 4` -> `n_kv_max = 2051`, all identical to the real file.
+
+`Q4EXP_SPARSE_FA={0,1} HIP_LAUNCH_BLOCKING=1 llama-bench -ngl 99 -lm mmap -sm none -fa 1 -lzm on
+-d 16384 -p 512 -n 0 -r 1`:
+
+- flag off: 1361.02 t/s, flag on: **1478.26 t/s (+8.6%)**, exit 0 both, no fault, no `gpucore`.
+
+The pp gain is the engagement proof here (the probe was not applied to keep the tree clean). So at
+6x the QSA-layer count, on the exact head geometry, at a depth past the gate, one card does not fault.
+That leaves content-dependence (the real model's mask values) and the multi-device case as the two
+surviving axes, which is exactly R1 and R3.
+
+Note for anyone repeating this: `full_attention_interval=1` is rejected at load with
+`PLE layer 1 is not a linear attention layer` - PLE only exists on recurrent layers, so raising the
+QSA layer count means more layers at interval 4, not a smaller interval. Expert count is the knob
+that keeps such a file inside a 16 GB card (`--experts`), and 8 layers at the real 512 experts is
+13.5 GB of expert payload, which does not fit.
