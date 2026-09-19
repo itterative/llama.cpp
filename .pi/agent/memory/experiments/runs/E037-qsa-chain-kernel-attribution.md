@@ -55,10 +55,12 @@ ones, 11 of which belong to `top_k` alone.
   4x, deletes the cell-level expand (`k_get_rows_float<float,float>`, 1.16 s), the per-cell `relu`
   (0.50 s), the `cont(permute)` pair (1.18 s) and part of the adds. At their scale this is the biggest
   single lever, which is the opposite of what E036's follow-up concluded from the dev box.
-- **H9 (pooled indexer keys) - ~3.4 s, 23%.** The key gather (1.50 s), the four strided slices (0.91),
-  the pooling adds (~0.9) and the scale (0.15). `rms_norm` and `rope` stay, since they are
-  position-dependent and re-applied per step.
-- **Not addressed by either - ~2.9 s, 20%:** rope 1.34, rms_norm 0.59, the indexer matmuls 0.78.
+- **H9 (pooled indexer keys) - corrected by E043, ~11.1 ms/token/GPU = 84% of the decode chain.** The
+  key gather, the four strided slices, the pooling adds and the scale, PLUS `rms_norm` and `rope`,
+  which this record wrongly excluded: block keys use the block START position, which never moves, so
+  they are position-static, not position-dependent.
+- **Not addressed by either - ~2.9 s of the then-chain (rope 1.34, rms_norm 0.59, indexer matmuls
+  0.78); rms_norm/rope shown cacheable by E043**
 
 ## Corrections to earlier records
 
