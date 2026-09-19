@@ -85,9 +85,9 @@ The prefill numbers cannot be read that way, which is why the gate run above is 
 
 ## Still owed
 
-- rtile engagement at shallow depth: the width change moved the gate threshold from 4022 to 4104 cells per
-  device, so at `-d 4096` the margin is 248 cells. Worth confirming from the gate probe that rtile still
-  takes the job at 4096 and 16384 on the bench, since those are the depths where tg looks worse.
+- rtile engagement at shallow depth: settled by the review - the width change moves `2*n_kv_max` from
+  4102 to 4104, KV rows are 256-padded, so the smallest eligible depth is 4128 before and after. No
+  engagement boundary moved at any depth; nothing to confirm.
 - The decode sign disagreement between machines (E039 +2.3% vs E040 -4.5% at 40960). Needs the
   same-session alternating repeat described above before I look for a mechanism.
 - The selection-set differential from the H13 plan is still not done.

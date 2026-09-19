@@ -78,7 +78,26 @@ record/evidence corrections. All code dispositions are in `93136fa41` and `9959d
 | unified 2-seq (-kvu) | runs clean, 264605.3413 |
 | ops gates | 7/7 FA, 525/525 GET_ROWS/CONCAT/TOP_K |
 
+## Bench after the fix (user-run, real model)
+
+`results/user/qsa-experiements/results-h13-post-review.log`, build `93136fa41` (11103) = HEAD code (the
+last two commits are memory-only). Same grid and env as E040 arm A (rtile=1, block selection). Deltas vs
+the 11098 table:
+
+| depth | pp512 | pp4096 | pp8192 | tg128 |
+| --- | --- | --- | --- | --- |
+| 4096 | -1.1% | -0.1% | -0.1% | +0.1% |
+| 16384 | -0.7% | -0.5% | -0.5% | -0.1% |
+| 40960 | -0.5% | -0.3% | -0.4% | +0.7% |
+| 131072 | +1.2% | -0.8% | -0.6% | -0.1% |
+
+pp512 carries ~±9% stddev, so the only cell above 0.8% is noise. Expected: llama-bench has no unified KV
+and runs one sequence, so every step takes the fast path and the per-sequence map is never built - the
+fix is a no-op on this grid by construction. Read: no perf regression from the D1/D2 fix on the exercised
+path, and no new information on the decode-sign question (this log has no cell arm) or on the multi-seq
+general path (still only provable on a real checkpoint).
+
 ## Still owed
 
-The selection-set differential; a live multi-seq run; the real-model A/B through `Q4EXP_CELL_SEL`
-(bench); the decode-sign repeat (E040); deleting the gate + the unreachable fallback in a later commit.
+The selection-set differential; the real-model A/B through `Q4EXP_CELL_SEL` (bench); the
+decode-sign repeat (E040); deleting the gate + the unreachable fallback in a later commit.
