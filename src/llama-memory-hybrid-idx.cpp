@@ -9,12 +9,21 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 
 //
 // llama_memory_hybrid_idx
 //
+
+// env: Q4EXP_POOLED - pool the indexer block keys at write time instead of re-deriving them every step
+// turning it off reverts to the historic graph and frees the pool tensors
+static bool llama_qsa_pool_enabled() {
+    const char * val = std::getenv("Q4EXP_POOLED");
+
+    return val != nullptr && atoi(val) != 0;
+}
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
@@ -45,6 +54,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
+    // one pool per ratio is only addressed append-stably while the graph writes one stream at a time,
+    // so a cache that keeps a stream per sequence does not pay for it
+    qsa_pool_on((unified || n_seq_max == 1) && filter_idx != nullptr && llama_qsa_pool_enabled()),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -59,12 +71,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, block key pool = %d\n", __func__, kv_size, qsa_pool_on);
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", qsa_pool_on);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -145,6 +157,8 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     if (mem_idx) {
         mem_idx->clear(data);
+
+        qsa_pool_invalidate();
     }
 }
 
@@ -156,6 +170,8 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
+
+        qsa_pool_invalidate();
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
@@ -166,6 +182,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+        qsa_pool_invalidate();
     }
 }
 
@@ -174,6 +192,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
+
+        qsa_pool_invalidate();
     }
 }
 
@@ -182,6 +202,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
+
+        qsa_pool_invalidate();
     }
 }
 
@@ -190,6 +212,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
+
+        qsa_pool_invalidate();
     }
 }
 
@@ -241,6 +265,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             }
         }
 
+        // restored cells carry the positions they were saved with, which need not match the pool
+        qsa_pool_invalidate();
+
     } catch (...) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
@@ -264,10 +291,103 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
+
+    qsa_pool_invalidate();
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const {
+    llama_qsa_pool res;
+
+    // the pool is addressed by block index, which is only append-stable in the state the fast path of
+    // set_input_qsa handles: one sequence, its used cells a dense run of consecutive positions
+    if (!qsa_pool_on || ratio == 0 || n_stream != 1 || ubatch.n_tokens == 0) {
+        return res;
+    }
+
+    const auto & cells = mem_idx->get_cells(ubatch.seq_id[0][0]);
+
+    int n_seq = 0;
+
+    for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq < 2; ++sq) {
+        n_seq += cells.seq_pos_min(sq) >= 0;
+    }
+
+    if (n_seq > 1) {
+        return res;
+    }
+
+    const int64_t j0 = cells.used_min();
+    const int64_t j1 = cells.used_max_p1();
+    const int64_t nu = cells.get_used();
+
+    if (nu == 0 || j1 - j0 != nu) {
+        return res;
+    }
+
+    const llama_pos p0 = cells.pos_get(j0);
+    const llama_pos p1 = cells.pos_get(j1 - 1);
+
+    if (p0 < 0 || p1 != p0 + (llama_pos) (j1 - 1 - j0)) {
+        return res;
+    }
+
+    const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
+    if (p1/(llama_pos) ratio >= n_blocks) {
+        return res;
+    }
+
+    // a bucket is pooled only when all of its positions are inside the run
+    const uint32_t b_lo = (uint32_t) ((p0 + ratio - 1)/ratio);
+    const int64_t  b_hi = p1 >= (llama_pos) (ratio - 1) ? (p1 + 1 - (llama_pos) ratio)/(llama_pos) ratio : -1;
+
+    const uint32_t n_bid = b_hi >= (int64_t) b_lo ? (uint32_t) (b_hi - b_lo + 1) : 0;
+
+    const auto it = qsa_runs.find(ratio);
+
+    uint32_t wm = 0;
+
+    bool have = false;
+
+    if (it != qsa_runs.end()) {
+        // the run must be the one the rows were keyed on. set_input_qsa verified it dense and in
+        // position order through recorded j1, so only the cells appended since need looking at
+        have = it->second.j0 == (int32_t) j0 && it->second.p0 == p0
+            && it->second.b_lo == b_lo && it->second.wm > 0 && it->second.wm <= n_bid;
+
+        for (int64_t j = have ? std::max<int64_t>(it->second.j1, j0) : j1; have && j < j1; ++j) {
+            if (cells.pos_get(j) != p0 + (llama_pos) (j - j0)) {
+                have = false;
+            }
+        }
+
+        if (have) {
+            wm = it->second.wm;
+        }
+    }
+
+    if (!have) {
+        // nothing valid recorded for this numbering: re-derive every complete block once
+        res.mode  = llama_qsa_pool::REBUILD;
+        res.n_bid = n_bid;
+        res.n_new = n_bid;
+
+        return res;
+    }
+
+    res.mode  = llama_qsa_pool::CACHED;
+    res.wm    = wm;
+    res.n_bid = n_bid;
+
+    // re-writing the newest row when nothing completed keeps the write tensors, and with them the
+    // graph, shaped the same on every decode step
+    res.n_new = std::max<uint32_t>(1, n_bid - wm);
+
+    return res;
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -276,6 +396,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * new_rows,
+        ggml_tensor * new_cells,
+        ggml_tensor * new_pos,
+        const llama_qsa_pool & pool,
         const llama_ubatch * ubatch,
         uint32_t n_kv,
         uint32_t ratio,
@@ -291,9 +415,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
 
     const int64_t n_ns     = bias->ne[2];           // streams in this ubatch
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
-    const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
+    const int64_t n_blocks = blk_cells->ne[0]/r;
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(!blk_pos || blk_pos->ne[0] == 4*n_blocks*n_ns);
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -301,8 +427,33 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_tail      = tail_cells ? (int32_t *) tail_cells->data : nullptr;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    int32_t * dst_blk_pos   = blk_pos ? (int32_t *) blk_pos->data : nullptr;
     float   * dst_bias      = (float   *) bias->data;
+
+    // the pool rows the graph writes: [wm, n_bid) when it reads the pool, [0, n_bid) when it rebuilds
+    int32_t * dst_new_rows  = new_rows ? (int32_t *) new_rows->data : nullptr;
+    int32_t * dst_new_cells = new_cells ? (int32_t *) new_cells->data : nullptr;
+    int32_t * dst_new_pos   = new_pos  ? (int32_t *) new_pos->data  : nullptr;
+
+    GGML_ASSERT(pool.mode == llama_qsa_pool::NONE || n_ns == 1);
+    GGML_ASSERT(!dst_new_rows || (int64_t) pool.n_new == new_rows->ne[0]);
+
+    // the dense single-sequence run the pool numbering was built on, for stamping the watermark
+    bool      run_fast = false;
+    int32_t   run_j0   = -1;
+    llama_pos run_p0   = -1;
+    int32_t   run_j1   = -1;
+    uint32_t  run_b_lo = 0;
+    uint32_t  run_wm   = 0;
+
+    // the graph's pool copy is from its own build, so read the live watermark for the row range
+    uint32_t  wm_live  = 0;
+
+    if (pool.mode == llama_qsa_pool::CACHED) {
+        const auto it_wm = qsa_runs.find(ratio);
+
+        wm_live = it_wm != qsa_runs.end() ? it_wm->second.wm : 0;
+    }
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -326,7 +477,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
 
-    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
+    if (dst_blk_pos) {
+        std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
+    }
 
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
@@ -500,9 +653,54 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 bid_idx .push_back(idx);
                 bid_cell.push_back((int32_t) (j0 + (idx - p0)));
 
-                for (int64_t sec = 0; sec < 4; ++sec) {
+                for (int64_t sec = 0; sec < 4 && dst_blk_pos; ++sec) {
                     dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = idx;
                 }
+            }
+
+            if (dst_new_rows) {
+                // rows from the live watermark up to the newest complete block. a reused graph only
+                // guarantees the row count, so widen a short list by repeating the newest block - its
+                // key does not change, and the duplicate lands on the row that already holds it
+                const int32_t b0 = pool.mode == llama_qsa_pool::CACHED ? (int32_t) wm_live : 0;
+                const int32_t nw = (int32_t) pool.n_new;
+
+                GGML_ASSERT(nw > 0 && n_bid >= 1 && b0 <= n_bid && (uint32_t) (n_bid - b0) <= pool.n_new);
+
+                for (int32_t j = 0; j < nw; ++j) {
+                    int32_t b = b0 + j;
+
+                    if (b >= n_bid) {
+                        b = n_bid - 1;
+                    }
+
+                    const int32_t idx = (int32_t) ((b_lo + b)*r);
+
+                    dst_new_rows[j] = b;
+
+                    if (dst_new_cells) {
+                        const int32_t c0 = (int32_t) (j0 + (idx - p0));
+
+                        // block-major like blk_cells: the graph reads [r, n_new] with r fastest
+                        for (int64_t m = 0; m < r; ++m) {
+                            dst_new_cells[j*r + m] = c0 + (int32_t) m;
+                        }
+
+                        for (int64_t sec = 0; sec < 4; ++sec) {
+                            dst_new_pos[sec*nw + j] = idx;
+                        }
+                    }
+                }
+
+                run_wm = std::min<uint32_t>(n_bid, b0 + nw);
+            }
+
+            if (pool.mode != llama_qsa_pool::NONE) {
+                run_fast   = true;
+                run_j0     = (int32_t) j0;
+                run_p0     = p0;
+                run_j1     = (int32_t) j1;
+                run_b_lo   = b_lo;
             }
 
             fast_p0 = p0;
@@ -593,7 +791,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     sec_pos[3] = p;
                 }
 
-                for (int64_t sec = 0; sec < 4; ++sec) {
+                for (int64_t sec = 0; sec < 4 && dst_blk_pos; ++sec) {
                     dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
                 }
             }
@@ -744,6 +942,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
     }
+
+    // stamp the watermark only for the run the graph actually wrote: rows [0, pool.n_bid) hold valid
+    // keys once that graph has run. if the run broke since the build, forget it and rebuild next time
+    if (pool.mode != llama_qsa_pool::NONE) {
+        if (run_fast) {
+            qsa_runs[ratio] = { run_j0, run_p0, run_j1, run_b_lo, run_wm };
+        } else {
+            qsa_runs.erase(ratio);
+        }
+
+        LLAMA_LOG_DEBUG("%s: qsa pool: mode = %d, wm = %u, n_bid = %u, n_new = %u, written = %u, n_kv = %u\n", __func__,
+                pool.mode, pool.wm, pool.n_bid, pool.n_new, run_wm, n_kv);
+    }
 }
 
 //
@@ -773,7 +984,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        new llama_kv_cache_context(mem->get_mem_idx())),
+    is_update(true) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -783,7 +995,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+        mem->get_mem_idx()->init_update(lctx, optimize)),
+    is_update(true) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -812,6 +1025,12 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
+
+        // update() copies whole stream buffers and applies the K-shift: the pool is positional, so it
+        // cannot follow either
+        if (is_update) {
+            mem->qsa_pool_invalidate();
+        }
     }
 
     return res;
@@ -833,11 +1052,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * new_rows,
+        ggml_tensor * new_cells,
+        ggml_tensor * new_pos,
+        const llama_qsa_pool & pool,
         const llama_ubatch * ubatch,
         uint32_t n_kv,
         uint32_t ratio,
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(blk_cells, tail_cells, cell_blk, blk_pos, bias, ubatch, n_kv, ratio, blk_bias);
+    mem->set_input_qsa(blk_cells, tail_cells, cell_blk, blk_pos, bias,
+            new_rows, new_cells, new_pos, pool, ubatch, n_kv, ratio, blk_bias);
+}
+
+llama_qsa_pool llama_memory_hybrid_idx_context::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const {
+    GGML_ASSERT(mem != nullptr);
+
+    return mem->qsa_pool_get(ratio, ubatch, n_stream, n_kv);
 }

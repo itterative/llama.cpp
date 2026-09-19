@@ -79,8 +79,9 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
-    model(model), hparams(hparams), v_trans(v_trans),
+    const char *   name_tag,
+    const bool     with_pool) :
+    model(model), hparams(hparams), v_trans(v_trans), with_pool(with_pool),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -114,7 +115,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + (with_pool ? 1u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -230,11 +231,20 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
+        // one pooled key per block of r cells, f32 like the read path that consumes it
+        const uint32_t r_pool = with_pool ? hparams.dsv4_compress_ratios[il] : 0;
+        const uint32_t n_pool = r_pool > 0 ? (kv_size + r_pool - 1)/r_pool : 0;
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
-        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+        ggml_tensor * pool = n_pool > 0
+            ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_k_gqa, n_pool, n_stream)
+            : nullptr;
+
+        has_k  && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+        has_v  && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+        pool   && ggml_format_name(pool, "cache_%spool_l%d", name_tag, il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -246,7 +256,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, pool, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -1313,6 +1323,24 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * pool = layers[ikv].pool;
+
+    GGML_ASSERT(pool != nullptr && "qsa pool requested from a cache without one");
+    GGML_ASSERT(n_blocks <= (uint32_t) pool->ne[1]);
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    GGML_ASSERT(ns <= (uint32_t) pool->ne[2]);
+
+    return ggml_view_3d(ctx, pool,
+            pool->ne[0], n_blocks, ns,
+            pool->nb[1],
+            pool->nb[2],
+            pool->nb[2]*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2756,6 +2784,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
+    return kv->get_pool(ctx, il, n_blocks, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

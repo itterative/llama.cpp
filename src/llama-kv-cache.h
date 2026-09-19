@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // allocate a pool of block-level indexer keys per layer alongside K
+                 const bool     with_pool = false);
 
     ~llama_kv_cache() = default;
 
@@ -189,6 +191,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // view of the pooled indexer keys: [n_embd, n_blocks, n_stream] of the streams used by sinfo
+    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks, const slot_info & sinfo) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -255,11 +260,17 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        // pooled indexer block keys, one row per complete block (qsa pools at write time)
+        ggml_tensor * pool;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // the cache owns kv_layer::pool in addition to K and V
+    const bool with_pool = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -397,6 +408,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // view of the pooled indexer keys, see llama_kv_cache::get_pool
+    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
