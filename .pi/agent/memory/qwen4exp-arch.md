@@ -143,6 +143,9 @@ co-added to prevent reordering (`:696` comment).
 ## Known gap specific to multi-GPU
 
 `llm_arch_supports_sm_tensor` (`src/llama-arch.cpp:1130`) returns **false** for
-`LLM_ARCH_QWEN4EXP` at `:1161`, tagged upstream `// TODO: fix test-llama-archs`. So
-`-sm tensor` is unavailable; only layer split works. On 4 cards with heterogeneous layer
-types this is the first structural limitation to hit.
+`LLM_ARCH_QWEN4EXP` upstream - the entry at the old `:1161` carries
+`// TODO: fix test-llama-archs`. On this branch the fork commit `a8b24dfdf (tmp: re-enable
+-sm tensor for qwen4exp)` deletes that entry, so `-sm tensor` **is** available here, with a
+2-line `ggml_build_forward_expand(gf, res_hc)` workaround to keep `hc_init` in the same graph
+split as layer 0. The indexer cache is `SPLIT_AXIS_MIRRORED` (`llama-model.cpp:511-514`), so
+its cells are replicated whole on every device and the QSA selection is global (E038/H17).
