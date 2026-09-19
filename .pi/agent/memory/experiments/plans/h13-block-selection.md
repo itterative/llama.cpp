@@ -40,23 +40,40 @@ problems with expanding through it:
   the model would attend to token 0 in place of the last few tokens - silently, no crash, plausible PPL.
 - the spare bucket currently carries `+1e9`, so it *would* be selected.
 
+## Correction after re-reading the report
+
+Eq. 19 defines the tail **per query**: `{ r*floor((i+1)/r), ..., i }` - the prefix of the query's own
+block, so at most `r` tokens, and it always contains `i` itself. The port already computes exactly that
+boundary for the bias (`tail_start = (q+1)/r*r`, `llama-memory-hybrid-idx.cpp:621`), on rank for mrope
+and on position otherwise. Consequences:
+
+- `tail_cells` is `I32 [r, n_tps, ns]`, written per query row, padded by repeating the query's own cell -
+  legitimately a member of the set, so the padding is not a semantic change at all;
+- the capacity is bounded by construction: no overflow case, no assert, no regime gate, one selection path;
+- cells orphaned by an interior hole are **not** force-included. That is the single behavioural difference
+  from today, where the `+1e9` spare bucket force-includes every unpooled cell - an over-broad reading of
+  "always include the tail" that coincides with Eq. 19 only while positions are dense. The report defines
+  no behaviour for holes, so implementing Eq. 19 literally is the defensible reading.
+
+An earlier draft of this plan used a `[2r, ns]` list of "all cells outside a complete block", which is
+neither bounded nor what the paper says, and led me to ask about gating on `try_contiguous()`. That
+question is moot once Eq. 19 is taken literally.
+
 ## Changes
 
 ### Host (`src/llama-memory-hybrid-idx.{h,cpp}`)
 
-New input tensor `tail_cells I32 [2r, ns]`, filled in the passes that already write `cell_blk`:
-
-- for each stream, the cells outside `[b_lo, b_hi]` (incomplete head and tail) are written in order,
-  unused slots filled with `0`;
+New input tensor `tail_cells I32 [r, n_tps, ns]`, filled per query row with the block prefix of Eq. 19:
 - comment why `0` is safe: `build_attn_qsa` does `set_rows(fill(-INF), zeros, idx)` and then **adds**
   `kq_mask`, so a duplicate or padding index can only ever re-write a `0` flag on a cell the mask already
   decides. A cell the mask forbids stays `-INF` no matter how many times it is unmasked. This is the
   invariant that makes the whole thing safe, so it needs to be stated where `tail_cells` is documented
   (`llama-memory-hybrid-idx.h:76-84`);
-- the spare bucket's bias flips `+1e9` -> `-INF` (`:642`), since leftovers are now handled explicitly.
-  It must stay `-INF`-safe: an all-`-INF` block row makes top-k return arbitrary in-bounds block indices,
-  which expand to real cells and get resolved by the mask - no NaN, because the score array is never fed
-  to a softmax.
+- `cell_blk` becomes unused and is deleted with its host fill: its only consumer was the expand gather
+  (`src/models/qwen4exp.cpp:671`). That also removes an `O(n_kv)` int32 upload and store-fill per stream
+  per ubatch, which is the store-volume cost E021/E006 measured on the host side.
+- `n_kv` and the stream count were read off `cell_blk->ne[]` (`llama-memory-hybrid-idx.cpp:286-287`), so
+  they have to come from the cache context instead (`get_n_kv()`, `get_n_stream()`).
 
 ### Model (`src/models/qwen4exp.cpp`)
 
@@ -64,18 +81,24 @@ Replace steps 3-5 with:
 
 1. `sel = ggml_top_k(ctx0, score_blocks, K_B)` where `K_B = indexer_top_k / r` (= 512) ->
    `[K_B, n_tps, ns]` int32 block indices;
-2. `cells = ggml_get_rows(ctx0, ggml_reshape_3d(blk_cells, r, n_blocks, ns), sel)` -> `[r, K_B, n_tps, ns]`,
-   i.e. the r cell-axis indices of each selected block. No integer arithmetic on `sel`, and the gather is
-   over 2048 tiny rows instead of `n_kv` f32 ones;
-3. `top_k = ggml_cont(ctx0, ggml_reshape_2d(ggml_concat(ctx0, cells_flat, tail_cells), r*K_B + 2r, ns))`
-   -> fixed `width = 4*K_B + 2r = 2056`, reshaped to the `[width, n_tps, 1, ns]` that `build_attn_qsa`
-   already expects.
+2. `cells = ggml_get_rows(ctx0, blk_cells_3d, sel2d)` where `blk_cells_3d` is `blk_cells` viewed as
+   `[r, n_blocks, ns]` and `sel2d` is `sel` reshaped to `[K_B*n_tps, ns]`. Verified against the shape
+   rules: `ggml_get_rows` asserts `a->ne[2] == b->ne[1]` and `a->ne[3] == b->ne[2]`
+   (`ggml/src/ggml.c:3958-3959`), which is why `n_tps` has to fold into `b->ne[0]` and why the existing
+   code permutes `score` the way it does. Output is `[r, K_B*n_tps, ns]` and contiguous, so
+   `ggml_reshape_3d(cells, r*K_B, n_tps, ns)` is a view, no copy: within a query row the order is
+   `j + r*i`, which is exactly the cell list of the i-th selected block.
+3. `top_k = ggml_concat(ctx0, cells, tail_cells, 0)` -> `width = r*K_B + r = 2052`, then the
+   `[width, n_tps, 1, ns]` reshape `build_attn_qsa` already expects. Concat is dispatched on element
+   *size* (`ggml/src/ggml-cuda/concat.cu:224`) and `concat_cont<unsigned int, 0>` appears in the bench
+   profile, so I32 is fine. `ggml_repeat` is **not** available for I32 - the CUDA REPEAT path is F32/F16
+   only (`ggml-cuda.cu:5380-5382`) - which is why `tail_cells` carries the `n_tps` axis itself.
 
 Deleted nodes: the `n_kv` expand gather, both `cont(permute)`, the f32 mask-add into the score array.
 Added: one 2048-row int32 gather, one concat. Roughly flat node count, each surviving node ~4x cheaper.
 
 Knob to keep: `n_kv_max = use_sparse_fa ? top_k->ne[0] : 0` (`:772`) is unchanged in form, but the width
-moves 2051 -> 2056, which raises the rtile gate `K->ne[1] >= max(4096, 2*n_kv_max)` from 4022 to 4112 -
+moves 2051 -> 2052, which raises the rtile gate `K->ne[1] >= max(4096, 2*n_kv_max)` from 4022 to 4024 -
 still under 4352, so rtile still engages at `-d 4096`. Check that against the existing
 `test-backend-ops` sparse cases, which match on `n_kv_max`.
 
