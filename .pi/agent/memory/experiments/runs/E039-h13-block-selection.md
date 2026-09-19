@@ -53,6 +53,13 @@ interior hole were force-included by the `+1e9` spare bucket and now are not.
 - The +6.3% is the dummy with **one** QSA layer and the host cost counted once per step, so it does not
   transfer directly: on the real model the GPU terms are x12 while the `cell_blk` fill stays per-step.
   Needs the same A/B on the bench box at `-d 131072`.
+- Coverage gap: the `!blk_bias` fallback (per-cell bias, no block selection) is not exercised by any
+  measurement here. `-fa 0` runs clean and gives 263113.5607, but I could not confirm which branch it
+  took, and it may be unreachable for this arch in practice. If it is dead, a reviewer will ask why it is
+  kept, so that is worth settling before any submission.
+- The rtile gate threshold moves with the width: `K->ne[1] >= max(4096, 2*n_kv_max)` is now 4104 instead
+  of 4022, so rtile stops engaging below about 4104 cells per device. At `-d 4096` the bench showed 4352,
+  which still clears it, but the margin is now 248 cells rather than 330.
 - The `Q4EXP_CELL_SEL` gate is temporary and must be deleted, along with the whole per-cell path it
   protects, once the bench A/B is done (the fallback for `!blk_bias` stays - it is a different thing).
 - The promised selection-set differential (count differing cells per step) was not done; the PPL delta is
