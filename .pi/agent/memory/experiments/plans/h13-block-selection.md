@@ -122,7 +122,9 @@ Deleted nodes: the `n_kv` expand gather, both `cont(permute)`, the f32 mask-add 
 Added: one 2048-row int32 gather, one concat. Roughly flat node count, each surviving node ~4x cheaper.
 
 Knob to keep: `n_kv_max = use_sparse_fa ? top_k->ne[0] : 0` (`:772`) is unchanged in form, but the width
-moves 2051 -> 2052, which raises the rtile gate `K->ne[1] >= max(4096, 2*n_kv_max)` from 4022 to 4024 -
+moves 2051 -> 2052, so `2*n_kv_max` moves 4102 -> 4104. Combined with the KV padding to multiples of
+256 this changes **no** engagement boundary at any depth (smallest eligible depth is 4128 before and
+after). Corrected by the reviewer after E039/E040 wrote an optimistic 4022.
 still under 4352, so rtile still engages at `-d 4096`. Check that against the existing
 `test-backend-ops` sparse cases, which match on `n_kv_max`.
 
