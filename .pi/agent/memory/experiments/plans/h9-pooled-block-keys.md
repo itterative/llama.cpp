@@ -1,6 +1,9 @@
 # H9 design - persist pooled indexer block keys at write time
 
-Status: design, awaiting sign-off. No code written.
+Status: **built in `d8bce4e25`** behind `Q4EXP_POOLED` (default off), validated bit-identical on the
+dev box. Read [runs/E044-h9-pool-implementation.md](../runs/E044-h9-pool-implementation.md) for the
+six places where this design was wrong and what the validation matrix actually covers; the numbers
+below are kept as written at design time.
 
 Source of truth for the numbers: E043 review of E042 (runs/E043-review-of-e042.md, verbatim). All
 per-token-per-GPU figures use the reviewed divisor 1540 (385 tokens x 4 GPUs).
