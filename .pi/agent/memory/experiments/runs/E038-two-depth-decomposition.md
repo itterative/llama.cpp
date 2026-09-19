@@ -39,11 +39,18 @@ closed: every device sees all cells and the top-k is global, which is also what 
 probe line showed (`k=[256,4352,2] nkv=4352 gqa=12`). The mirror costs ~384 MiB/card at 131k, ~1.5 GiB
 across the box.
 
-The 4x-redundant-chain reading this invites is ruled out by wall clock, and that is what keeps the
-numbers below honest: if the chain ran on all four devices over the full cache it would cost
-12 x ~2.8 ms = ~33 ms/token at 131k against a 45 ms/token step, and `Q4EXP_NO_INDEXER` would multiply tg
-by 3-4x. It gave 1.5x. So the mirrored cache is read locally while the chain's critical path is about
-one card's work - independently the same answer as the 12.2 ms/token this record derives from the fit.
+~~The 4x-redundant-chain reading is ruled out by wall clock~~ **withdrawn the same day.** The argument
+went: 12 layers x ~2.8 ms = ~33 ms/token of a 45 ms step would predict a 3-4x tg gain from dropping the
+chain, and 1.5x was measured. But the 2.8 ms is *my dev box's* per-layer cost, and the argument silently
+assumed a card there costs the same as a card here. If an R9700 is ~2x an RX 9070, a fully replicated
+chain is ~17 ms/token, which also fits 15.5 ms. So replication is not excluded, and whether the chain's
+~41 nodes per QSA layer are copied into all four device sub-graphs is open (H17b). What is *not* open:
+the graph is partitioned per device, because the fork's own `a8b24dfdf` works around exactly that -
+upstream had `case LLM_ARCH_QWEN4EXP: // TODO: fix test-llama-archs` on the `-sm tensor` denylist, that
+commit deletes it and adds `ggml_build_forward_expand(gf, res_hc)` at `src/models/qwen4exp.cpp:390` to
+force `hc_init` into the same graph split as layer 0. So the upstream refusal is a test failure, not an
+architecture ruling, and the consequence for this record is that its per-card numbers are only valid
+under one of two placement models.
 
 ## Chain cost, split by phase
 
