@@ -57,9 +57,15 @@ Before, H13 was measured by hunches. This is the first decode-only attribution o
 
 ## Follow-ups
 
-- Get a bench wall time for the no-qsa arm at d131072 to pair with these device times.
+- qsa wall: 23.16 t/s unprofiled (results-h13-post-review.log). no-qsa wall: 24.29 ± 0.69 t/s under rocprofv3
+  (much slower than unprofiled; the qsa arm keeps hanging the GPU under rocprofv3, so a clean profiled
+  pair is not obtainable). To finish the pair, one plain unprofiled
+  `Q4EXP_NO_INDEXER=1 llama-bench -p 0 -n 128 -d 131072` run - no profiler, no hangs. Meanwhile 15.3
+  ms/GPU of device time vs 41.2 ms/token wall = 37% busy for no-qsa under the tool, so both arms spend
+  most of the wall outside kernels.
+- NCCL: dropped as an action item - fixed comm tax of 4-GPU split mode, user is right there is nothing
+  to do there. The no-qsa arm's longer per-call NCCL time at equal call count is queueing behind dense
+  FA, not an NCCL configuration issue.
 - Fuse gather+rope+adds into one kernel, or check `copyBufferRectAligned`'s caller. Biggest single
   lever left on the decoder side.
 - H9 (skip-and-reuse across steps) can cut the whole materialization family at once, but changes output.
-- NCCL: worth a dedicated question (how many allreduces per matvec, can some be fused), but it is
-  orthogonal to QSA.
