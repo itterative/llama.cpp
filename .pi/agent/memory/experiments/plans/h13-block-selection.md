@@ -1,5 +1,10 @@
 # H13 plan - block-level QSA selection
 
+**Status: implemented and measured on the dev box - see E039 (+6.3% tg, +6.8% pp at 164k, deep-arm PPL
++8e-8, ops gate green). Two corrections below were made while building it: the tail design, and the fact
+that the first A/B compared against the wrong path. The bench A/B on the real model is still owed, and
+`Q4EXP_CELL_SEL` plus the per-cell path it protects come out afterwards.**
+
 Objective: make `build_qsa_top_k` select at block granularity and expand afterwards, as the tech report
 does (Eq. 16 and 19), instead of expanding every block to its cells and running top-k over the cell
 array. Motivation is measured, not guessed: E037/E038.
@@ -58,6 +63,25 @@ and on position otherwise. Consequences:
 An earlier draft of this plan used a `[2r, ns]` list of "all cells outside a complete block", which is
 neither bounded nor what the paper says, and led me to ask about gating on `try_contiguous()`. That
 question is moot once Eq. 19 is taken literally.
+
+## What was actually built, and where the plan was wrong
+
+Landed as E039. Two things in this document were wrong and the code is the better for it:
+
+- `tail_cells` is `I32 [r, n_tps, ns]`, filled per query row. A `[2r, ns]` list cannot be broadcast to
+  `n_tps` on the device because CUDA `REPEAT` implements only F32/F16 (`ggml-cuda.cu:5380-5382`), and the
+  per-query form is what Eq. 19 describes anyway.
+- the A/B gate must be two flags, not one: `blk_bias` selects the *bias layout* and `block_sel` the
+  *selection path*. Collapsing them made "old" mean the no-per-block-bias fallback, which produced a
+  fabricated +86% pp / +46% tg result. The host distinguishes the modes by which index tensor it was
+  given (`tail_cells` vs `cell_blk`), and exactly one of them is non-null.
+
+The gather in step 2 works because `blk_cells` is block-major: viewed as `[r, n_blocks, ns]` it is the
+block -> cells map, and folding `n_tps` into the id axis satisfies `get_rows`' shape assert
+(`ggml.c:3958`). The result is contiguous, so `[r*K, n_tps, ns]` is a view, not a copy.
+
+Not done from the validation list: the selection-set differential. The PPL delta stands in for it, which
+is weaker evidence than this plan asked for.
 
 ## Changes
 
