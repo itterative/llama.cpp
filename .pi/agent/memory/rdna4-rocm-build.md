@@ -242,10 +242,7 @@ as experienced expectation, not verified behaviour.
 ## Not yet verified
 
 - **It's `-d`, not a loop.** llama-bench already accepts comma-separated values for `-d` (and `-p`, `-n`): `-d 4096,16384,40960,131072` gives one table per row. Do not for-loop-per-depth: it is 3x as many processes and one-third the clarity.
-- **Do not run GPU benches while a background agent is on the box.** The built-in reviewer gets command-runner and is authorised to run validation/gate commands, so an
-  agent takes the GPU concurrently and both sets of numbers get contaminated. If the GPU
-  is 16 GB or the reviewer has `test-backend-ops` or benches in flight, queue local GPU
-  work until its report lands.
+- GPU runs do not overlap on this box (user-verified: multiple GPU runs cannot execute at the same time), so a background reviewer running gates does **not** contaminate benches - they queue, and per-run numbers stay clean.
 
 - Whether `__GFX12__` is actually emitted for `gfx1201` (nobody ran the compiler). If it is
   not, every device-side RDNA4 path above is dead code in this build while the host-side
