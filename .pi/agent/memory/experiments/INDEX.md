@@ -75,6 +75,11 @@ Architecture walkthrough: [plans/qsa-ple-in-prefill-and-decode.md](plans/qsa-ple
 this model's real shapes, why the sparse port is structurally prefill-only here, and what a smarter
 table cache could and could not buy. Written to decide priorities, not to record a run.
 
+Implementation plan: [plans/h13-block-selection.md](plans/h13-block-selection.md) - block-level QSA
+selection as the paper does it, with the host-side `tail_cells` list that the spare-bucket trap forces,
+why the change is not equality-testable, and the six validation steps. Blocked on a go/no-go from the
+user, since it changes which cells attention sees.
+
 ## Findings that are not experiments
 - **E019's ops baseline says nothing about the sparse path (E032):** the `256/256` sparse cases dispatch to
   `ncols2=8` on NVIDIA or to VEC at `nb=1`, so the `(256,256,1,16)` instantiation the RDNA4 port had
