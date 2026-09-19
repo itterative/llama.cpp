@@ -286,6 +286,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     // exactly one of the two index lists is present: the tail for whole-block selection, the forward
     // map for the per-cell one
     GGML_ASSERT((tail_cells != nullptr) != (cell_blk != nullptr));
+    GGML_ASSERT(tail_cells == nullptr || blk_bias);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
 
@@ -337,9 +338,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
 
-        // the newest cell of this stream, used when the query's own block owns no pooled cells
-        int32_t newest_cell = 0;
-        int64_t newest_key  = 0;
+        // per-sequence key -> cell map for the tail (Eq. 19); the fast path instead maps keys to
+        // slots arithmetically, so this only serves the general path where several sequences can
+        // share one cells array and a bucket does not identify the query's own sequence
+        std::vector<llama_seq_id> key_seqs;
+        std::vector<int32_t>      key_cell;
+
+        int64_t fast_p0 = 0;
+        int64_t fast_j0 = 0;
 
         bid_idx  .clear();
         bid_cell .clear();
@@ -499,13 +505,23 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 }
             }
 
-            newest_cell = (int32_t) (j1 - 1);
-            newest_key  = p1;
+            fast_p0 = p0;
+            fast_j0 = j0;
 
             return true;
         };
 
-        if (!try_contiguous()) {
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+
+                if (std::find(key_seqs.begin(), key_seqs.end(), seq_id) == key_seqs.end()) {
+                    key_seqs.push_back(seq_id);
+                }
+            }
+
+            const bool fast = try_contiguous();
+
+            if (!fast) {
             group_cells();
 
             // mrope repeats one position across an image, so rank cells instead of using the position
@@ -587,6 +603,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
             const bool     have_dead_g = n_bid < n_blocks;
             const int32_t  dead_bid_g  = have_dead_g ? n_bid : n_blocks - 1;
 
+            if (tail_cells) {
+                key_cell.assign(n_kv*key_seqs.size(), 0);
+            }
+
+            // the block -> cells map, and the per-sequence key -> cell map the tail reads
             for (int64_t j = 0; j < n_kv; ++j) {
                 const int32_t g = cell_grp[j];
 
@@ -599,9 +620,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
                     }
 
-                    if (idx > newest_key) {
-                        newest_key  = idx;
-                        newest_cell = (int32_t) j;
+                    if (tail_cells && idx >= 0 && idx < n_kv) {
+                        for (int64_t si = 0; si < (int64_t) key_seqs.size(); ++si) {
+                            if (cells.seq_has((uint32_t) j, key_seqs[si])) {
+                                key_cell[si*n_kv + idx] = (int32_t) j;
+                            }
+                        }
                     }
                 }
 
@@ -661,40 +685,42 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     continue;   // per-cell selection: the caller walks the cells itself, no tail list
                 }
 
-                // Eq. 19: the cells of the query's own block up to and including the query. A pooled
-                // block holds its members densely, so a key names a slot; a key with no pooled block
-                // is a young or trimmed stream, where counting back from the newest cell is right and
-                // the mask drops any of them that are gone. Padding repeats the query's own cell, which
-                // is inert: the caller only ever writes a 0 flag and the mask decides the outcome.
-                int32_t lo = 0, hi = n_bid_last;
-
-                while (lo < hi) {
-                    const int32_t mid = (lo + hi)/2;
-
-                    if (bid_idx[mid] + r <= q) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-
-                const int32_t lb  = lo < n_bid_last && bid_idx[lo] <= q ? lo : -1;
-                const int64_t low = tail_start <= q ? tail_start : q;
-
-                auto cell_of = [&](int64_t key) -> int32_t {
-                    const int64_t cell = lb >= 0 ? cur_blk_cells[lb*r + (key - bid_idx[lb])]
-                                                 : newest_cell - (newest_key - key);
-
-                    // never hand the caller an index outside the cache; a clamped cell is inert
-                    return (int32_t) std::min<int64_t>(std::max<int64_t>(cell, 0), n_kv - 1);
-                };
-
+                // Eq. 19: the cells of the query's own block up to and including the query. The map
+                // is built per sequence, so a shared cells array cannot hand a query another
+                // sequence's cells. Padding repeats the query's own cell, which is inert: the caller
+                // only ever writes a 0 flag and the mask decides the outcome.
                 int32_t * cur_tail = dst_tail + i*r;
 
-                cur_tail[0] = cell_of(low);
+                for (int64_t j = 0; j < r; ++j) {
+                    const int64_t key = tail_start + j <= q ? tail_start + j : q;
 
-                for (int64_t j = 1; j < r; ++j) {
-                    cur_tail[j] = cell_of(low + j <= q ? low + j : q);
+                    int64_t cell;
+
+                    if (fast) {
+                        // the run is dense and single-sequence: slots are positions shifted by j0 - p0
+                        cell = fast_j0 + (std::max<int64_t>(key, fast_p0) - fast_p0);
+                    } else {
+                        int64_t si = 0;
+
+                        while (si < (int64_t) key_seqs.size() && key_seqs[si] != seq_id) {
+                            ++si;
+                        }
+
+                        GGML_ASSERT(si < (int64_t) key_seqs.size());
+
+                        const int64_t k0 = (int64_t) std::min<int64_t>(std::max<int64_t>(key, 0), n_kv - 1);
+                        const int64_t k1 = (int64_t) std::min<int64_t>(std::max<int64_t>(q,   0), n_kv - 1);
+
+                        cell = key_cell[si*n_kv + k0];
+
+                        // a trimmed cache can lose the cell a key names; fall back to the query's own
+                        if (!cells.seq_has((uint32_t) cell, seq_id)) {
+                            cell = key_cell[si*n_kv + k1];
+                        }
+                    }
+
+                    // never hand the caller an index outside the cache; a clamped cell is inert
+                    cur_tail[j] = (int32_t) std::min<int64_t>(std::max<int64_t>(cell, 0), n_kv - 1);
                 }
 
                 continue;

@@ -595,7 +595,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     llm_graph_input_qsa * inp = nullptr;
 
     const auto it = qsa_inps.find((uint32_t) r);
-    if (it != qsa_inps.end()) {
+    if (it != qsa_inps.end() && it->second->block_sel == block_sel) {
         inp = it->second;
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, block_sel);
@@ -696,8 +696,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     if (block_sel) {
         // whole blocks plus the query's own tail, as the reference does it: select the blocks, then
-        // expand each into its cells (Eq. 16 and 19). Nothing here walks the cell array
-        const int64_t n_blk_sel = std::min<int64_t>(n_blocks, (int64_t) hparams.indexer_top_k / r);
+        // expand each into its cells (Eq. 16 and 19). Nothing here walks the cell array.
+        // the tail always carries the query's own cell (Eq. 19's set can be empty at a block
+        // boundary), which is also what guarantees a query never gets a fully masked row
+        const int64_t n_blk_sel = std::min<int64_t>(n_blocks,
+                std::max<int64_t>((int64_t) hparams.indexer_top_k / r, 1));
 
         ggml_tensor * sel = ggml_top_k(ctx0, score, n_blk_sel);
 
@@ -733,6 +736,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
 
     const int64_t width = top_k->ne[0];
+
+    // width can exceed n_kv in a short context (n_kv <= 2048): the gates that read n_kv_max all
+    // require 2*n_kv_max cells, so it is inert there; do not clamp, or the tail would be dropped
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
