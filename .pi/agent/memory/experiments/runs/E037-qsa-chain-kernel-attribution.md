@@ -2,7 +2,7 @@
 
 Source: `results/user/qsa-kernel-traces/stats-qsa.log` and `stats-no-qsa.log` - per-kernel aggregate
 statistics the user pulled on the 4x R9700 box with the real checkpoint, two arms differing only by
-`Q4EXP_NO_INDEXER=1`. rtile was **off**, so FA stayed on the vec path in both arms (E034's dense/sparse
+`Q4EXP_NO_INDEXER=1` (build `7d376d617` plus `tools/qsa-no-indexer.patch`). rtile was **off**, so FA stayed on the vec path in both arms (E034's dense/sparse
 gate comparison in E027 was the same situation). This is the first per-kernel evidence on the real
 model, and it retires two of my claims the same day.
 
@@ -17,14 +17,13 @@ model, and it retires two of my claims the same day.
 
 Identical FA work confirms the vec path was used: with vec, the selection only changes mask *values*,
 so sparse buys nothing at attention and the chain is pure cost - which makes the delta a clean read of
-the chain. 1,700 chain invocations (`fill_kernel<__half>` calls / 12 QSA layers), of which 320 are
-prefill ubatches and 1,380 decode steps.
+the chain. 1,700 chain invocations (`fill_kernel<__half>` calls / 12 QSA layers); 320
+invocations include a node that only prefill builds (`cpy_scalar_transpose`, 3,840 calls = 320 per
+layer at 191 us), and 3 x 128 = 384 tokens were decoded, so the split is not yet known - see "Run shape".
 
-**844,740 extra launches / 1,380 decode steps = 612 launches per token.** The measured wall-clock gain
-from killing the chain was 15.5 ms/token (E036 follow-up: 22.24 -> 33.89 t/s at 128k), so ~25 us per
-launch of host dispatch explains the whole effect. The chain's *device* time is 14.8 s / 1,380 = 10.7
-ms/token summed over four cards, so about 2.7 ms/token of wall clock if evenly split. The gap between
-2.7 and 15.5 is dispatch, not bytes.
+What is shape-independent: **497 extra launches per chain invocation = 41 per QSA layer**, and 14.775 s of
+device time over 1,700 invocations = **8.7 ms per invocation = 0.72 ms per QSA layer per invocation**. The
+average chain kernel is 17.5 us of device time, which is small-kernel territory either way.
 
 ## The chain, ranked (delta = on minus off)
 
@@ -70,13 +69,54 @@ ones, 11 of which belong to `top_k` alone.
   pooling then runs on f32 arrays at 2x the bytes. A dtype-side change (keep the members and pooling in
   f16) is worth ~0.5-1 s of this on its own and needs no new op.
 
+## Run shape, and the numbers that depend on it
+
+Command (build `7d376d617` + `tools/qsa-no-indexer.patch`, so the two arms differ *only* by the chain):
+
+```
+rocprofv3 --kernel-trace --stats --output-format csv -o result_qsa_decode.csv -- \
+  llama-bench -m <Qwen3.8-Flash-Next-Q4_K_M> -lm none -sm tensor -fa 1 -lzm on-direct \
+  -ot per_layer_token_embd=CPU -d 40960 -p 0 -n 128 -r 3 -b 2048 -ub 1024
+```
+
+Shape-independent facts: 1,700 chain invocations over 12 QSA layers, so 497 extra launches per
+invocation = **41 per QSA layer per invocation**, and 8.7 ms of device time per invocation = **0.72 ms
+per QSA layer**. But 1,700 invocations against `3 x 128 = 384` decode tokens means the chain runs about
+4.4x per token, so either `-d 40960 -p 0` prefills to depth (120 ubatches at `ub=1024`) *and* the fork
+runs more than one graph pass per token, or both. Until that is settled, ms-per-*token* claims from
+these aggregates are unreliable; the ranking and the 46/23/20% grouping are per-invocation and stand
+either way.
+
+## Two side results
+
+**The indexer cache is f16, proven.** `llama-perplexity -v` on the dummy prints
+`llama_kv_cache: size = 0.50 MiB (512 cells, 1 layers, 4/4 seqs), K (f16): 0.50 MiB, V (f16): 0.00 MiB`
+immediately after `creating indexer KV cache` - so E036's correction this morning holds: `-ctk` drives
+both caches and the cached indexer key is 256 B per token. Method notes: `HIP_PROFILE=1` prints nothing
+on the dev box, and piping a `timeout`-killed run into grep loses the block-buffered log (a trap already
+in the records) - redirect to a file first.
+
+**One row the aggregates cannot name.** `k_get_rows_float<__half, float>` has a delta of exactly
++20,400 calls (1 per QSA layer per invocation) at 73 us each, 1.50 s. `getrows.cu:71` is
+`template<typename src0_t, typename dst_t>` and `ggml_cuda_op_get_rows` dispatches on `dst->type`
+(`getrows.cu:413,457`), so this is f16 in, f32 out - which a plain `get_rows` of an f16 cache cannot
+produce. Candidates: `members`, if the pooling really is staged through f32 (weakly supported by five
+f32 `op_add` instances per layer-step), or the argsort path in `ggml-cuda.cu:2077` - but
+`k_argsort_f32_i32` appears in *both* arms, so not that. If it is `members`, f16 staging is worth ~1.5 s
+plus a slice of the adds: backlog H15, no new op. Needs naming the node, not more aggregates.
+
+## What it would take to answer the rest
+
+- A third arm at `-d 131072`, same command otherwise: terms that scale with depth (gather, pooling,
+  expand) separate from terms that do not (top_k's 11 launches, the mask fill), and 131k is where the
+  33.89 t/s was measured.
+- Whether the fork runs extra graph passes per token, and whether `-d` prefill-seek is real, to convert
+  per-invocation into per-token.
+- The full `--kernel-trace` CSV only if it carries a device/agent column - that is the one question
+  aggregates cannot reach: does the chain run once per device over a quarter of the cells?
+
 ## Questions this raises (unanswered)
 
-- Were both arms run with CUDA graphs off (`-dgs none` or a `-ncg` build)? If so the 612-launch/token
-  chain is fully exposed, and re-running the same two arms with graphs on is the decisive test of the
-  dispatch hypothesis. There are `results-no-cudagraphs.csv.log` and
-  `results-disable-cudagraphs-reuse.csv.log` in the user directory, so graphs appear to be a known
-  problem on their fork - which would make "get graphs working" the top item on the backlog, above H13.
 - NCCL is 22 s in *both* arms (19% of all device time, 96 calls per invocation at 135 us each, i.e. 2
   per layer per step, mostly peer-wait). Identical in both arms, so the chain is not causing it; it is a
   separate 4-card item worth its own look.
