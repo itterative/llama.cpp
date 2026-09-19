@@ -82,11 +82,30 @@ pool rows cannot change anything. Any future pool test needs `n_kv > 512` (more 
   `gdb -batch -ex "frame 6" -ex "print this->pool" <binary> core` - iterating on a core is much faster
   than re-running a 12.7 GB model, and `print` after `run` in the same gdb invocation loses the frame.
 
+## Dev-box perf sanity (1x RX 9070, same build both arms)
+
+| dummy | depth | test | pool off | pool on | delta |
+| --- | --- | --- | --- | --- | --- |
+| `q4exp-48l-12qsa` (12 QSA layers) | 4096 | tg128 | 35.31 +/- 0.32 | 35.08 +/- 0.38 | none, within noise |
+| `q4exp-48l-12qsa` | 16384 | tg128 | 33.20 +/- 0.21 | **35.06 +/- 0.15** | **+5.6%** |
+| `q4exp-48l-12qsa` | 16384 | pp512 | 903.87 +/- 27.25 | 916.72 +/- 23.48 | +1.4%, noise-level |
+
+Flags both arms: `GGML_FATTN_RDNA_RTILE=1 Q4EXP_SPARSE_FA=1 -fa 1 -sm none -b 2048 -ub 2048 -r 3`,
+only `Q4EXP_POOLED` differs. The 4096-vs-16384 contrast is the mechanism check: the chain is
+`O(n_kv)`, so nothing shows while `n_kv` is small and it moves decode once `n_kv` is 16k.
+
+Build caveat: `CMAKE_CXX_FLAGS_RELEASE` is still `-O2 -g3` with asserts live (re-running `cmake` with
+only the HIP options does not reset a cached `NORMAL` string, and the bench prints
+`warning: asserts enabled`). Same build on both arms, so the deltas stand, but the absolute numbers
+are not comparable with the older dev-box records.
+
 ## Status and next
 
 - Implementation: done for P1, gate default off.
 - Pending: the 4-card A/B and a decode-only trace pair under the same recipe as E042, which is the
-  number that matters (predicted -11 ms/token/GPU device, and prefill `O(n_kv^2)` -> `O(n_kv)`).
+  number that matters (predicted -11 ms/token/GPU device, and prefill `O(n_kv^2)` -> `O(n_kv)`). The
+  dev box cannot see the prefill effect: its chain share at 16k is small enough that pp512 is
+  noise-level, so a 131k pp run is the real test of that claim.
 - Then P2: drop `blk_cells`/`blk_pos` uploads (the host scan is ~3.4 ms/token at 131k, plus ~1.2 MB of
   H2D), and F8 (the FA half-count ambiguity) is still open.
 - If the 4-card A/B shows the gain, flip the default to on and keep `Q4EXP_POOLED=0` for A/B.
