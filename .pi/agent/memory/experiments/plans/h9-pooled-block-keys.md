@@ -111,10 +111,33 @@ selection-overlap test below.
 - f16 later as an optional knob: halves VRAM and the matvec read but rounds the cached key, so the
   selection can shift last-bit; needs its own validation pass.
 
-### 6. State save/load
+### 6. State save/load and the RAM prompt cache
 
 - v1: pooled values are NOT persisted. state_read bumps gen -> the first graph after load is a cheap
-  rebuild (11.1 ms once). No state format change. Persisting pv is a future option.
+  rebuild (11.1 ms once). No state format change.
+- Checked: `-ln/--cache-ram` ("cram", PR 16391) is not a separate mechanism - `prompt_save` /
+  `prompt_load` in tools/server/server-context.cpp call `llama_state_seq_get_data_ext` /
+  `llama_state_seq_set_data_ext`, i.e. exactly the per-seq `state_write`/`state_read` path above
+  (llama-memory-hybrid-idx.cpp:208-251). So cram restore is covered by the same gen hook, and
+  skipping pv in v1 also keeps the saved blob byte-identical to today.
+- Persisting pv later would grow the blob 4x for the indexer part and needs a format version bump -
+  deferred, not complex, but no measured benefit yet (one 11 ms rebuild per restore).
+
+### 6b. Verified non-issues (checked while designing, so they do not have to be revisited)
+
+- `ctx_other`: wired only for GEMMA4_ASSISTANT, EAGLE3, DFLASH (llama-context.cpp:145-162) and it
+  feeds `mem_other` for shared-cell draft caches. The indexer cache is constructed with
+  `mem_other = nullptr` (llama-memory-hybrid-idx.cpp:19-68), so nothing here interacts with it.
+- MTP: `hparams.n_layer_nextn` is not set for qwen4exp (no nextn tensors), and LLM_ARCH_QWEN4EXP is
+  not in the `mtp_on_hybrid_qwen` list (llama-model.cpp:2582-2589), so there is no draft/MTP context
+  over this cache. Rewind-style reuse (re-decoding over existing positions) re-writes the raw key
+  with a deterministic-equal value and the pooled write re-derives the same row, so it is
+  self-consistent and needs no special handling.
+- Write timing must stay at completion, not the next token: today's completing token already scores
+  its own block (the ubatch's cells and positions exist when set_input_qsa runs, which is what
+  `tail_cells` and the causal binary search in the same function rely on). Deferring the write one
+  token would make that row unwritten at read time and change the selection. The in-graph write
+  after `cpy_k` and before the matvec reproduces the current semantics exactly.
 
 ### 7. What this is NOT (from E043, kept for scope discipline)
 
