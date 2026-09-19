@@ -3,6 +3,11 @@
 Same command as E037 with `-d 131072` instead of `-d 40960`, both arms (`stats-qsa-131k.log`,
 `stats-no-qsa-131k.log`). `rtile` off, so still dense vec FA in both arms.
 
+> **Trust ratios, not absolute ms:** the stats table's agent coverage and whether `--stats`
+> replays kernels are unconfirmed, so absolute millisecond figures are unknown up to a constant.
+> The cache-placement section below supplies the wall-clock bound that keeps the per-card
+> reading honest (1.5x tg from dropping the chain rules out 4x replication).
+
 ## The run shape falls out of the call counts
 
 `cpy_scalar_transpose` is built twice per prefill ubatch per QSA layer, `fill_kernel<__half>` once per
@@ -19,6 +24,26 @@ chain invocation per layer. Dividing by 12 layers:
 1,540 decode builds for 128 x 4 tokens = **3.0 chain builds per decoded token**, which answers the
 4.4x question from E037 (3, not MTP). Cross-checked by four independent count ratios: `mm_ids_helper`
 x3.20, the prefill Tensile GEMM x3.20, `mul_mat_vec_q<12,1>` x1.00, `gated_delta_net` x1.21.
+
+## Cache placement under `-sm tensor`, settled by the load log
+
+The user ran `llama-bench ... -sm tensor -d 8192 -p 0 -n 8 -r 1 -v` on the bench box and grepped the
+cache lines. Main attention cache: `size = 198.00 MiB (8448 cells, 12 layers)` with
+`Meta() KV buffer size = 49.50 MiB` = 198/4 -> **split four ways**. Indexer cache:
+`creating indexer KV cache, size = 8448 cells`, `size = 24.75 MiB (8448 cells, 12 layers)`,
+`K (f16): 24.75 MiB`, buffer line `24.75 MiB` = the whole thing -> **mirrored, a full copy per device**,
+which is what `src/llama-model.cpp:511-514` declares for `cache_idx_(k|v)_l*` ("the qsa indexer has one
+key head and its projections are mirrored, so its cache cannot be split") - a rule that arrived with
+upstream's own `6c84c7d5d model: add Qwen3.8-Flash-Next (qwen4exp)`. So H17's correctness half is
+closed: every device sees all cells and the top-k is global, which is also what the user's bench-side
+probe line showed (`k=[256,4352,2] nkv=4352 gqa=12`). The mirror costs ~384 MiB/card at 131k, ~1.5 GiB
+across the box.
+
+The 4x-redundant-chain reading this invites is ruled out by wall clock, and that is what keeps the
+numbers below honest: if the chain ran on all four devices over the full cache it would cost
+12 x ~2.8 ms = ~33 ms/token at 131k against a 45 ms/token step, and `Q4EXP_NO_INDEXER` would multiply tg
+by 3-4x. It gave 1.5x. So the mirrored cache is read locally while the chain's critical path is about
+one card's work - independently the same answer as the 12.2 ms/token this record derives from the fit.
 
 ## Chain cost, split by phase
 

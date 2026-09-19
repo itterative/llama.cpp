@@ -6,6 +6,11 @@ statistics the user pulled on the 4x R9700 box with the real checkpoint, two arm
 gate comparison in E027 was the same situation). This is the first per-kernel evidence on the real
 model, and it retires two of my claims the same day.
 
+> **Trust ratios, not absolute ms:** the stats table's agent coverage and whether `--stats`
+> replays kernels are unconfirmed, so absolute millisecond figures are unknown up to a
+> constant. E038's cache-placement section supplies the wall-clock bound that keeps the
+> per-card reading honest (1.5x tg from dropping the chain rules out 4x replication).
+
 ## Totals
 
 | | chain on | chain off | delta |
