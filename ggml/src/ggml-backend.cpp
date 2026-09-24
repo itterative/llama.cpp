@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-prof.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1609,6 +1610,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        // counter only. note what backend_ids_changed does NOT mean: it compares buffer-type
+        // assignments per node index (see above), so it is not a topology flag, and a node-count change
+        // can flip it by itself. both names here just say which test tripped
+        ggml_prof_region prof_realloc(backend_ids_changed ? "sched:realloc_buft" : "sched:realloc_size");
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1979,6 +1984,22 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+
+    if (ggml_prof_enabled()) {
+        // compare with the first runtime re-reserve: if a real ubatch later needs more than this, the
+        // measure graph is not measuring the graph that actually runs
+        size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+
+        ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+
+        size_t total = 0;
+        for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
+            total += sizes[i];
+        }
+
+        fprintf(stderr, "[prof] measure graph: nodes = %d, leafs = %d, need = %.2f MiB\n",
+                sched->graph.n_nodes, sched->graph.n_leafs, total * 1e-6);
     }
 
     ggml_backend_sched_reset(sched);
