@@ -1,0 +1,6 @@
+| model                          |       size |     params | backend    | ngl | n_ubatch |     sm |  fa | lazy_mode  |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | -----: | --: | ---------- | --------------: | -------------------: |
+| qwen4exp A3B (guessed) all F32 |   5.39 GiB |     8.82 B | ROCm       |  99 |     1024 | tensor |   1 | on-direct  | pp8192 @ d16384 |        703.78 ± 0.43 |
+| qwen4exp A3B (guessed) all F32 |   5.39 GiB |     8.82 B | ROCm       |  99 |     1024 | tensor |   1 | on-direct  |  tg128 @ d16384 |         33.07 ± 0.01 |
+
+build: 1e133458e (11138)
