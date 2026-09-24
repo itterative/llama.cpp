@@ -105,6 +105,16 @@ Caveats worth keeping: the byte table is derived from the architecture, not meas
 The wall time per step for *this* run is also not in the artifact (see above), so the busy fraction is not
 computable here; on the shallow run it was ~34%.
 
+**Follow-up from reading the dispatch code** (full detail in the `rdna4-rocm-build` memory, "MoE matmul
+dispatch at decode"): mmvq is not an untuned accident - at batch 1 MoE returns into mmvq before
+`should_use_mmq` is ever consulted (`ggml-cuda.cu:1993-2001` vs the RDNA4 caps at `mmvq.cu:258-282`), and
+mmvq's RDNA4 branch gives 8 warps at `ncols_dst == 1` for exactly our types (`mmvq.cu:465-489`). So 115
+GB/s is the tuned path's number. One mechanism worth naming here because it is specific to this split:
+`ffn_down_exps` is split along **k** (`SPLIT_AXIS_0`, `src/llama-model.cpp:573-583`) while up/gate are split
+along the output rows, so down-projection runs with 160 elements of k per card *and* needs a cross-device
+reduction of partials - plausibly part of the 96 collectives per step counted above, in the same row group
+that E053's type table cannot yet resolve.
+
 ## Still needed from the box
 
 - the run's actual `n_kv` / prompt token count, and its `[prof] phase:decode` line, for busy fraction
