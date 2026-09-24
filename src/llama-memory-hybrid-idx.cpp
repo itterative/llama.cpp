@@ -336,8 +336,11 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     llama_qsa_pool res;
 
     // the pool is addressed by block index, which is only append-stable in the state the fast path of
-    // set_input_qsa handles: one sequence, its used cells a dense run of consecutive positions
-    if (!qsa_pool_on || ratio == 0 || n_stream != 1 || ubatch.n_tokens == 0) {
+    // set_input_qsa handles: one sequence, its used cells a dense run of consecutive positions.
+    // single-token ubatches only: during prefill the graph is rebuilt every chunk anyway, so the pool
+    // saves no derivation, while its extra tensors change the node set often enough to keep forcing
+    // ggml-alloc re-reservations (-3% pp8192 on RX 9070 at d16384)
+    if (!qsa_pool_on || ratio == 0 || n_stream != 1 || ubatch.n_tokens != 1) {
         return res;
     }
 
