@@ -561,7 +561,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10
+        || table_id == MMVQ_PARAMETERS_RDNA4) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -1056,6 +1057,18 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// Experiment knob (branch-local): let gfx12 take the small_k block shape, see the E055 record. Default off,
+// which keeps upstream behaviour (RDNA excluded from small_k, rows_per_block = 1).
+static bool ggml_cuda_mmvq_rdna4_small_k(void) {
+    static const bool val = []() {
+        const char * name = getenv("GGML_CUDA_MMVQ_RDNA4_SMALL_K");
+
+        return name != nullptr && name[0] != '\0' && name[0] != '0';
+    }();
+
+    return val;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1117,7 +1130,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !(GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_mmvq_rdna4_small_k()))) {
             use = false;
         }
 
