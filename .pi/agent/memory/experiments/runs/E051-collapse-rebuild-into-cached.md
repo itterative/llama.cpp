@@ -67,6 +67,24 @@ reserve pass fell through to `cells.pos_get()` on an empty cache and died on
 `llama_kv_cells.h:392: Assertion 'pos[i] != -1'`. A release build would have read past the end of the
 cell array instead of stopping. Keep gates running against `-O2 -g3` without `-DNDEBUG`.
 
+## Naming trap that cost me a false alarm
+
+I reported a prefill numerics drift against `267035.1801` (E045) / `267035.3875` (E044) because today's
+`-c 8192 -sm tensor` run gave `267035.1320`. **There is no drift.** Those recorded numbers are the
+**dense FA** arm (no `Q4EXP_SPARSE_FA`) measured on the file called `tools/sparse-corpus.md`, and I
+read "sparse corpus" as the sparse arm. Reproduced on this build today:
+
+| arm (`-c 8192 -b 2048`, block selection) | `-sm none` | `-sm tensor` |
+| --- | --- | --- |
+| dense FA | **267035.3875** | **267035.1801** (re-measured today, exact match to E045) |
+| sparse FA (`Q4EXP_SPARSE_FA=1`) | **267035.3629** | 267035.1320 |
+
+E039's table already had `.3875` and `.3629` side by side as the dense and sparse columns, so the
+disambiguation was in the records the whole time. Both arms agree at `-c 4096` too (`264605.3096` each).
+
+Rule for the rest of this project: name the arm (`dense FA` / `sparse FA`), never lean on the corpus
+filename to imply it.
+
 ## Still open
 
 - 24 ms once per pass for the decode reservation mismatch. Fixing it means teaching `sched_reserve` to

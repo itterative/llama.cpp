@@ -50,7 +50,8 @@
    written by the rebuild itself were the bad ones.
 
 Numbers moved by the bug hunt: `-c 8192` sparse corpus 267035.3875 (off) vs 267035.0962 (on, buggy)
-vs 267035.3875 (on, fixed).
+vs 267035.3875 (on, fixed). That is **dense FA** on the sparse-corpus file - the sparse-arm value is
+267035.3629, and the name collision is spelled out in E051.
 
 ## Validation (all after the fixes, same build, env differing only)
 
