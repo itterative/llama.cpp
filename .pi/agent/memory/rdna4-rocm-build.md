@@ -152,10 +152,14 @@ The condition is plainly true here: `ffn_down` at Q5_0, `k = 640` -> `blocks_per
 row**, paying a cross-warp shared-memory reduction per output value for 2.5 warps' worth of K trips. That is
 exactly the case small_k was written for, disabled for the architecture with the widest blocks.
 
-**Measured (E055, dev box): allowing it is worth +4.1% tg** on the 4l/512-expert dummy, **+7.4%** on the
-48l-12qsa one, with pp unmoved (batch 4096 is mmq territory, above `MMVQ_MAX_BATCH_SIZE`), the golden
-bit-identical, and `MUL_MAT` / `MUL_MAT_ID` ops green. Behind `GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`, default
-off, RDNA4 only.
+**Measured, and it transfers.** Dev box (E055): **+4.1% tg** on the 4l/512-expert dummy, **+7.4%** on the
+48l-12qsa one, pp unmoved (batch 4096 is mmq territory, above `MMVQ_MAX_BATCH_SIZE`), golden bit-identical,
+`MUL_MAT` / `MUL_MAT_ID` ops green. Bench box, 4x R9700, real Q4_K_M model: **+5.5% to +6.6% tg at every
+depth from 4k to 131k**, well outside that box's ~1% run-to-run spread. Behind
+`GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`, default off, RDNA4 only.
+
+The gain is flat in depth, unlike the pool's, so the two are additive: the pool removes work that grows with
+context, small_k removes per-matmul reduction work that does not.
 
 Origins: `ec16a072f` ("Optimize MOE GEMV kernel for BS > 1.", #20905) added small_k and the RDNA exclusion
 in the same commit - the exclusion came with the feature rather than after measuring RDNA, which is
