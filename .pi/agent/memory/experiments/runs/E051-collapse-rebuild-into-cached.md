@@ -1,6 +1,8 @@
 # E051 - collapsing REBUILD into CACHED(wm=0) is a win; reserving the pooled shape is not
 
-Follows E049 (mechanism) and E050 (4-card confirmation of the decode-only gate). Dev box,
+Follows E049 (mechanism) and E050 (4-card confirmation of the decode-only gate). d1 is `8206d79d8`
+(`llama : one qsa pool graph instead of two`); d2 was tried and reverted within this record's session.
+Dev box,
 `q4exp-48l-12qsa` + `q4exp-4l`, `-sm tensor -fa 1 -lzm on-direct -b 2048 -ub 1024 -r 2`,
 `GGML_PROF_REGIONS=1`, same session for all arms. Raw:
 [results/E051-pooled-prefill-a-b-c/](../results/E051-pooled-prefill-a-b-c/) (A/B/C, the d1+d2 attempt) and
