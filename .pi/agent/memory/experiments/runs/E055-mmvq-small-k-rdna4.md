@@ -58,15 +58,37 @@ Claimed: on gfx1201, for these MoE shapes, one row per 256-thread block is the w
 small_k is worth single-digit-to-double-digit tg with no other movement.
 
 Not claimed:
-- **Not measured on the 4-card box.** Under `-sm tensor` there, `ffn_down_exps` is split along k
-  (`SPLIT_AXIS_0`, `src/llama-model.cpp:573-583`), leaving 160 elements of k per card and
-  `blocks_per_row_x = 5` - the condition is satisfied far more strongly, so the gain should be at least as
-  large, but that is a prediction, not a result.
-- **Not measured on RDNA3**, which the same blanket clause also excludes and which my knob deliberately
-  does not enable (`GGML_CUDA_CC_IS_RDNA4` only). If RDNA3 loses, that is the reason the clause exists and
-  the fix stays RDNA4-scoped.
+- **RDNA3**, which the same blanket clause also excludes and which my knob deliberately does not enable
+  (`GGML_CUDA_CC_IS_RDNA4` only). If RDNA3 loses, that is the reason the clause exists and the fix stays
+  RDNA4-scoped.
 - The `nwarps = 8` choice itself is untested against `nwarps = 1` with small_k; those two interact, and a
   real tuning pass would sweep them together.
+
+## Confirmed on the bench box: +5.5% to +6.6% of tg, flat across depth
+
+`results/user/llama-bench/82bc067c3/run1.log`, build `ea2c69a30` (which contains the knob - the first
+attempt at this A/B ran on `82bc067c3`, before it existed, and both arms were then the same binary), 4x
+R9700, real Qwen3.8-Flash-Next Q4_K_M 111.38 GiB, `-sm tensor -fa 1 -lzm on-direct -b 2048 -ub 1024 -p 0
+-n 128 -r 3`, `Q4EXP_POOLED=1 GGML_FATTN_RDNA_RTILE=1 Q4EXP_SPARSE_FA=1`:
+
+| depth | knob off | knob on | delta |
+|---|---|---|---|
+| d4096 | 31.95 +/- 1.65 | 34.07 +/- 1.90 | **+6.6%** |
+| d16384 | 32.08 +/- 1.30 | 34.09 +/- 1.47 | **+6.3%** |
+| d40960 | 31.35 +/- 1.17 | 33.31 +/- 1.46 | **+6.3%** |
+| d131072 | 29.19 +/- 1.13 | 30.79 +/- 1.24 | **+5.5%** |
+
+All four depths move the same direction by 5.5-6.6%, which is far outside the ~1% run-to-run spread this
+box shows at `-r 3`. The effect is flat in depth, as expected for a per-expert-matmul change and unlike the
+pool, whose benefit grows with context - so this one is additive on top of H9 rather than depth-dependent.
+
+Two consistency checks that passed. The off arm reproduces the pre-knob build within noise (31.95/29.19
+here against 31.39/28.83 on `82bc067c3`), so the default-off path really is unchanged behaviour. And the on
+arm lands where E050 measured 30.12 at d131072 - that overlap is across different builds, so treat it as
+comforting, not as evidence.
+
+What is still not measured here: pp on the box (this run was `-p 0`). Locally pp did not move at all, which
+is the expected result since batch 4096 is above `MMVQ_MAX_BATCH_SIZE` and therefore on mmq.
 
 ## If this goes upstream
 

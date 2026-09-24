@@ -109,16 +109,16 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   mmvq's tuned branch is the right kernel at n_rows 1 and the ~115 GB/s is an mmvq-internal question -
   `calc_rows_per_block` / `small_k`, or the `-sm tensor` k-split below. What is left of the idea: the
   k-split case was excluded on purpose, so it is still untested on 4 cards.
-- **E055 found where the bytes actually go**: mmvq's `small_k` shape is blanket-excluded for RDNA
-  (`should_use_small_k`, `mmvq.cu:~1090`, no comment) and `calc_rows_per_block` omits
-  `MMVQ_PARAMETERS_RDNA4`, so an 8-warp block reduces one 480-byte `ffn_down` row at a time. Letting gfx12
-  take small_k (`GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`) is **+4.1% tg on the 4l dummy and +7.4% on the 48l one**,
-  pp unmoved, golden bit-identical, ops green. Full record:
+- **E055 found where the bytes actually go, and it is confirmed on both boxes**: mmvq's `small_k` shape is
+  blanket-excluded for RDNA (`should_use_small_k`, `mmvq.cu:~1090`, no comment) and `calc_rows_per_block`
+  omits `MMVQ_PARAMETERS_RDNA4`, so an 8-warp block reduces one 480-byte `ffn_down` row at a time. Letting
+  gfx12 take small_k (`GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`) is **+4.1% / +7.4% tg on the dev dummies and
+  +5.5..6.6% on the real model across 4 cards at every depth**, pp unmoved, golden bit-identical, ops green.
+  Flat in depth, so it stacks with the pool rather than overlapping it. Full record:
   [runs/E055-mmvq-small-k-rdna4.md](../runs/E055-mmvq-small-k-rdna4.md).
-- **Open for the bench box (T2, one env var, no rebuild beyond pulling)**: confirm at 4 cards, where the
-  `ffn_down_exps` k-split leaves 5 blocks per row instead of 20 so the condition is stronger - and get an
-  RDNA3 data point, which is the missing justification for the blanket clause. `tg128` at `d131072` with
-  `GGML_CUDA_MMVQ_RDNA4_SMALL_K=0` vs `1`.
+- **Open on this item**: decide whether the knob becomes the default here (dev + box both say yes, RDNA3
+  unknown), and whether it is worth an upstream proposal - which would need an RDNA3 data point and the
+  `has_ids` / `should_halve_iters` objection answered in advance.
 
 ### L4 - 16 GB of fp32 recurrent state
 
