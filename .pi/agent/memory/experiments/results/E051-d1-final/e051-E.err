@@ -1,0 +1,35 @@
+warning: asserts enabled, performance may be affected
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9070, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 16304 MiB
+register_backend: registered backend ROCm (1 devices)
+register_device: registered device ROCm0 (AMD Radeon RX 9070)
+register_backend: registered backend CPU (1 devices)
+register_device: registered device CPU (AMD Ryzen 7 5700X 8-Core Processor)
+load_backend: failed to find ggml_backend_init in /home/sd/Repos/worktrees/llama.cpp/polished-quarry/llama.cpp/build/bin/libggml-hip.so
+load_backend: failed to find ggml_backend_init in /home/sd/Repos/worktrees/llama.cpp/polished-quarry/llama.cpp/build/bin/libggml-cpu.so
+[prof] regions on: counters
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 1134.82 MiB
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 20.90 MiB
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 1134.82 MiB
+[prof] warmup: 5 regions
+[prof]   graph:compute                       8 calls    9652.13 ms total 1206.5165 ms/call 888.15.. 1410.92 ms
+[prof]   meta:subgraph                     772 calls    2250.38 ms total   2.9150 ms/call   0.02..  241.67 ms
+[prof]   graph:alloc                         8 calls     179.11 ms total  22.3893 ms/call  19.64..   36.12 ms
+[prof]   graph:set_inputs                    8 calls      99.38 ms total  12.4226 ms/call  10.65..   13.96 ms
+[prof]   graph:build                         8 calls       9.96 ms total   1.2449 ms/call   1.09..    1.29 ms
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 1110.38 MiB
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 14.25 MiB
+[prof] measure graph: nodes = 6775, leafs = 1358, need = 1110.38 MiB
+[prof] warmup: 5 regions
+[prof]   graph:compute                      33 calls   40456.69 ms total 1225.9605 ms/call  22.78.. 1811.21 ms
+[prof]   meta:subgraph                    3185 calls    1173.74 ms total   0.3685 ms/call   0.01..  238.29 ms
+[prof]   graph:alloc                        33 calls     671.00 ms total  20.3333 ms/call  19.50..   25.30 ms
+[prof]   graph:set_inputs                   33 calls     575.58 ms total  17.4419 ms/call   0.05..   25.89 ms
+[prof]   graph:build                        33 calls      42.26 ms total   1.2805 ms/call   1.17..    1.98 ms
+[prof] exit: 6 regions
+[prof]   graph:compute                     256 calls     560.56 ms total   2.1897 ms/call   1.37..   46.12 ms
+[prof]   meta:subgraph                   24832 calls     359.89 ms total   0.0145 ms/call   0.00..    5.17 ms
+[prof]   graph:alloc                         4 calls      86.77 ms total  21.6925 ms/call  20.00..   25.12 ms
+[prof]   graph:set_inputs                  256 calls      42.62 ms total   0.1665 ms/call   0.13..    0.43 ms
+[prof]   sched:realloc_buft                  1 calls      24.33 ms total  24.3320 ms/call  24.33..   24.33 ms
+[prof]   graph:build                         4 calls       5.07 ms total   1.2685 ms/call   1.24..    1.30 ms
