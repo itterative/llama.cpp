@@ -116,9 +116,11 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   +5.5..6.6% on the real model across 4 cards at every depth**, pp unmoved, golden bit-identical, ops green.
   Flat in depth, so it stacks with the pool rather than overlapping it. Full record:
   [runs/E055-mmvq-small-k-rdna4.md](../runs/E055-mmvq-small-k-rdna4.md).
-- **Open on this item**: decide whether the knob becomes the default here (dev + box both say yes, RDNA3
-  unknown), and whether it is worth an upstream proposal - which would need an RDNA3 data point and the
-  `has_ids` / `should_halve_iters` objection answered in advance.
+- **Open on this item**: the default is now on (`855a65544`), so **every tg number on this branch before
+  that commit sits ~6% low** - re-baseline E050/E052/E043 comparisons rather than reading them as movement.
+  Still to decide: whether it is worth an upstream proposal, which needs an RDNA3 data point and the
+  `has_ids` / `should_halve_iters` objection answered in advance. pp on the box is also unconfirmed (E055
+  ran `-p 0`); locally it did not move, and batch 4096 is mmq territory so it should not.
 
 ### L4 - 16 GB of fp32 recurrent state
 

@@ -158,6 +158,10 @@ exactly the case small_k was written for, disabled for the architecture with the
 depth from 4k to 131k**, well outside that box's ~1% run-to-run spread. Behind
 `GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`, default off, RDNA4 only.
 
+`[>]` **Now default on** (`855a65544`); `=0` / `=off` restores the upstream shape. Which means every tg
+number on this branch recorded before that commit sits ~6% low relative to the same command today -
+re-baseline before comparing.
+
 The gain is flat in depth, unlike the pool's, so the two are additive: the pool removes work that grows with
 context, small_k removes per-matmul reduction work that does not.
 
