@@ -265,21 +265,23 @@ static __global__ void flash_attn_rtile(
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
-    // Index contract with launch_fattn (identical to fattn-tile).
+    // Index contract with launch_fattn (identical to fattn-tile): blockIdx.x is the Q tile,
+    // blockIdx.y the KV split and blockIdx.z the (head group, sequence) pair.
     const int sequence = blockIdx.z / (ne02/ncols2);
     const int head0 = blockIdx.z*ncols2 - sequence*ne02;
     const int gqa_ratio = ne02 / ne12;
-    const float * Q_f  = (const float *) (Q + nb03*sequence + nb02*head0);
+    const int q_idx  = blockIdx.x;
+    const float * Q_f  = (const float *) (Q + nb03*sequence + nb02*head0 + nb01*q_idx);
     const char  * K_d  = K + nb13*sequence + nb12*(head0 / gqa_ratio);
     const char  * V_d  = V + nb23*sequence + nb22*(head0 / gqa_ratio);
-    const half  * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+    const half  * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb31*q_idx) : nullptr;
 
     const int64_t stride_K = nb11; // byte strides; rows are f16 or q8_0
     const int64_t stride_V = nb21;
 
     // launch_fattn passes n_kv_max in ne11 when the op is sparse, and one int32 row of
     // gathered indices per (sequence, query) tile in idx_all
-    const int * idx_row = use_sparse ? idx_all + (int64_t((sequence % ne33)*ne31 + blockIdx.x) * ne11) : nullptr;
+    const int * idx_row = use_sparse ? idx_all + (int64_t((sequence % ne33)*ne31 + q_idx) * ne11) : nullptr;
 
     constexpr float L2E = GGML_FATTN_RTILE_EXP2 ? 1.44269504088896340736f : 1.0f;
     constexpr float KQ_MAX_OFF = FATTN_KQ_MAX_OFFSET*L2E;
@@ -593,7 +595,7 @@ static __global__ void flash_attn_rtile(
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
         const int jc = threadIdx.y*cpw + jc0;
         const float scale_o = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
-        const int j_dst = (sequence*int(ne01.z)*ne02 + head0 + jc)*gridDim.y + blockIdx.y;
+        const int j_dst = ((sequence*int(ne01.z) + q_idx)*ne02 + head0 + jc)*gridDim.y + blockIdx.y;
 
         __align__(16) float2 tmp[DL2];
 #pragma unroll

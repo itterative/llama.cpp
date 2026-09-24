@@ -90,7 +90,8 @@ void ggml_cuda_flash_attn_ext_rtile(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(logit_softcap == 0.0f && "fattn-rtile: no logit softcap");
     GGML_ASSERT(max_bias == 0.0f       && "fattn-rtile: no alibi");
     GGML_ASSERT(K->ne[0] == V->ne[0] && (K->ne[0] == 128 || K->ne[0] == 256 || K->ne[0] == 512) && "fattn-rtile: D=128/256/512 only");
-    GGML_ASSERT(Q->ne[1] == 1 && "fattn-rtile: single Q token only");
+    GGML_ASSERT(Q->ne[1] <= 16 && Q->ne[1] >= 1 && "fattn-rtile: one block per Q token, up to 16");
+    GGML_ASSERT((Q->ne[1] == 1 || ggml_get_op_params_i32(KQV, 4) > 0) && "fattn-rtile: multi-Q needs a gather");
     GGML_ASSERT(K->type == V->type && "fattn-rtile: K and V must have the same type");
     GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(K->ne[1] % 32 == 0 && "fattn-rtile: kv must be a multiple of 32");

@@ -33,12 +33,18 @@ static bool ggml_cuda_fattn_rdna_can_use_rtile(const fattn_props & props) {
         return false;
     }
 
-    // decode only: single Q token; ncols2 is the largest of {16,8,4,2} dividing gqa
-    if (Q->ne[1] != 1 || props.gqa_ratio < 2 || props.gqa_ratio % 2 != 0 || K->ne[1] % 32 != 0) {
+    // ncols2 is the largest of {16,8,4,2} dividing gqa
+    // one block per Q token, so a dense op would re-read the whole cache per query and is left to
+    // the kernels that pack queries; a sparse op gathers a private index row per query, where
+    // separate blocks are not redundant work. 16 covers speculative verification widths.
+    const int32_t n_kv_max = ggml_get_op_params_i32(props.dst, 4);
+    const int64_t n_q_max = n_kv_max > 0 ? 16 : 1;
+
+    if (Q->ne[1] > n_q_max || Q->ne[1] < 1 || props.gqa_ratio < 2 || props.gqa_ratio % 2 != 0 ||
+            K->ne[1] % 32 != 0) {
         return false;
     }
 
-    const int32_t n_kv_max = ggml_get_op_params_i32(props.dst, 4);
     if (n_kv_max == 0) {
         return true; // dense: walk the cache
     }
