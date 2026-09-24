@@ -127,10 +127,17 @@ summed across devices - which is a plausible chunk of the 96 collectives per ste
 So down-projection decode matmuls are simultaneously the worst-shaped for mmvq and the only expert matmul
 that costs a reduction.
 
-**Open, cheap, and not yet run**: whether mmq would actually beat mmvq at batch 1 for these shapes. The
-experiment is a constant, not a subsystem - set the RDNA4 cap to 0 for one type so MoE falls through to
-`ggml_cuda_mul_mat_q` at every batch, rebuild, compare `tg`. It tests the one thing the in-source comment
-("MMQ is consistently faster on RDNA4") never covered, because its evidence was pp-shaped.
+**Answered by E054: mmq is not the fix.** Forcing MoE onto mmq at batch 1 (cap to 0, which also disables
+the glu fusion because it consults the same table) costs **3.6% of tg** on the dev box, ~1.2% of that being
+the fusion and ~2.4% mmq being the slower kernel at `n_rows == 1`. So mmvq's tuned 8-warp branch really is
+the right choice on RDNA4, the `should_use_mmq` `n_experts > 0` clause is properly read as a prefill
+statement, and the ~115 GB/s has to be explained inside mmvq (`calc_rows_per_block`, the `small_k` path) or
+by the k-split. Caveat that survives: E054 ran `-sm none` on purpose, so the 4-card k-split case is
+untested.
+
+Two measurement traps found on the way, both worth remembering: an env boolean written as `getenv(name) !=
+nullptr` is **true for `NAME=`**, which silently turned a control arm into a treatment arm; and llama-bench
+CSV `avg_ns` is per repetition, not per token (128x at `-n 128`).
 
 ## Flash attention on gfx1201, and what qwen4exp actually gets
 

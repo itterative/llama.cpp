@@ -104,11 +104,11 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `quant-block-size-fallback` memory), 8 = Q8_0 (11.5%), 12 = Q4_K (8.8% across both variants),
   14 = Q6_K (4.2%). Whether the Q5_0 row really is `ffn_down` is still the open identification - the
   loader's type census answers it.
-- **Cheapest new candidate in this file**: `ffn_down_exps` splits on `SPLIT_AXIS_0`
-  (`src/llama-model.cpp:573-583`), i.e. along k, so under `-sm tensor` each card does the down projection
-  with 160 elements of k and must reduce partials across devices, while up/gate split on output rows and
-  need no reduction. Setting the RDNA4 mmvq cap to 0 for one type falls MoE through to mmq at batch 1 and
-  tests whether that shape is served better there: one constant, one rebuild, dev box, no bench time.
+- **Cheapest new candidate, now answered (E054): mmq is not the fix.** Forcing `MUL_MAT_ID` onto mmq at
+  batch 1 costs 3.6% of tg on the dev box (1.2% of that is the glu fusion the same knob disables), so
+  mmvq's tuned branch is the right kernel at n_rows 1 and the ~115 GB/s is an mmvq-internal question -
+  `calc_rows_per_block` / `small_k`, or the `-sm tensor` k-split below. What is left of the idea: the
+  k-split case was excluded on purpose, so it is still untested on 4 cards.
 
 ### L4 - 16 GB of fp32 recurrent state
 
