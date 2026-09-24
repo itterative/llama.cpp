@@ -81,15 +81,42 @@ checkpoint, continues, re-inserts and replays):
   `-sm tensor -c 8192` gives 267035.1801 in both arms (the `-sm none` value 267035.3875 differs by
   ~1e-6 because tensor splitting changes reduction order, and both arms move the same way).
 
+## Addendum - the clamp on the real MTP path (user's numbers, same day)
+
+At ctx 245760 on the 4-card box: no spec **34.86 t/s**, mtp before the clamp **21.5 t/s** (acceptance
+0.23), mtp after **23.06 t/s** (0.26). So MTP still costs a third of decode throughput, and the gain
+is small - with the acceptance rate moving between the two runs, it is not clean evidence that the
+clamp did anything. Two things came out of reading the path properly:
+
+- qwen4exp is listed in `llm_arch_supports_rs_rollback`, and `need_n_rs_seq()` returns `draft.n_max`,
+  so the target ctx gets 6 recurrent snapshots and a rejection of <= 6 positions lands on
+  `llama_memory_hybrid_idx::seq_rm(p_keep, -1)` - the branch the clamp was written for. A *larger*
+  rewind lands on `load_tgt(PARTIAL_ONLY)`, which still clears: that restore does not touch the
+  indexer cells, so the run's own `pos_max` still spans the rejected tokens and cannot bound the cut.
+  Clearing there is safe (the next step is `REBUILD`, recomputing every row from live cells) but it is
+  also untested - the harness restores with `FLAGS_NONE`, i.e. the whole-state path.
+- The same knob costs VRAM that nobody priced: `n_rs_seq = 6` puts the target's recurrent cache at
+  **756 MiB** instead of 108 (their load log: `size = 787.99 MiB ... 6 rs_seq`), because
+  `llama_memory-recurrent.cpp:101` allocates `mem_size * (1 + n_rs_seq)`. On top of the pool's 354
+  MiB/card, that is most of the free-VRAM collapse seen before the hang, with `common_fit_params`
+  refusing to back anything off under tensor split.
+- Where the remaining MTP tax probably lives (H18): 43.4 ms/token at 0.26 acceptance over 6 drafts is
+  ~2.5 tokens per step, so ~111 ms/step, of which the verify pass is ~28.7 ms - leaving ~13.7 ms per
+  draft replay for a 1-layer draft. That is fixed cost, not compute, and it smells like the same
+  host-side/dispatch tax E039 measured, once per draft token.
+
 ## Next
 
 1. pp regression: pool=0 on `36ec37826`, then a `-ub 512/2048` sweep. If it is meta-side, the fix is
    in the subgraph/re-init path, not in H9.
-2. Memory: if the server needs to stay at 245760 ctx, either f16 pool storage (halves 354 MiB, moves
-   the golden) or persist the pool in the checkpoint blob (restores without any rebuild). Both are
-   small; decide from the pp investigation, since they share the "what does pp cost per ubatch" data.
+2. Memory: the two knobs that matter at 245760 are f16 pool storage (halves 354 MiB/card, moves
+   the golden) and `n_rs_seq`, which costs 648 MiB more than anyone priced. If the server stays
+   where it is, sizing the pool from the fit result beats either.
 3. P2 (host scan + `blk_cells`/`bias` uploads) still open, priority depends on what the traces say
    about the remaining non-kernel time.
 4. The dev-box gates keep using `-sm none`, so any future pool change must also be A/B'd under
    `-sm tensor` - this hole was invisible on 1 device only because the *invalidation* path, not the
    data path, was wrong.
+5. H18 (the MTP tax) plus two test gaps this addendum exposed: teach the rollback harness to drive a
+   `seq_rm(p_keep, -1)` truncation (needs `cparams.n_rs_seq > 0`, which is how the real path arrives)
+   and a `PARTIAL_ONLY` restore, so both doors are covered rather than just the whole-state one.
