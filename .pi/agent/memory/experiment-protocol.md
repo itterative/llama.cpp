@@ -99,6 +99,31 @@ often enough on its own, and the thing to reach for before fighting rocprofv3.
   and not from `--help`). check `rocprofv3 --help | grep -i -A3 region` on the bench box. if their build
   lacks selected-region support, the roctx ranges still arrive as marker rows to slice on afterwards, and
   the counters work either way - the window is an optimization on top, not the mechanism.
+  `[x]` confirmed on the bench box: `--selected-regions` is real there, and its own warning names
+  `roctxProfilerResume(0)`/`roctxProfilerPause`, i.e. exactly the pair `ggml_prof_window` calls.
+
+### Two traps in the roctx sink itself (`5acbd6377`)
+
+- **resolve at first use, never at load.** `prof-roctx.cu` used to dlopen the shim from a static
+  initialiser, i.e. while an attached profiler is still bringing up its own SDK: under rocprofv3 the
+  attempt failed and the null handle was cached forever, so ranges and windows were both silent. The
+  pre-`ggml_prof` llama-bench code avoided this by resolving inside the measurement loop. Attempts are now
+  bounded (16 on the region path, unbounded when opening a window) so a box without the SDK does not pay a
+  failed dlopen per region.
+- **`/opt/rocm` is not the only prefix.** The dev box keeps ROCm under `/usr/lib64/rocm` and also has an
+  old `/opt/rocm-6.4.0`, so the sink now additionally tries the directory `libamdhip64` was actually
+  loaded from (`dladdr` on `hipGetDevice`).
+
+Testing the sink with no profiler attached, on any box that has the roctx lib somewhere:
+
+```sh
+LD_PRELOAD=/opt/rocm-6.4.0/lib/librocprofiler-sdk-roctx.so.1 GGML_PROF_REGIONS=1 GGML_PROF_DECODE=1 \
+  build/bin/llama-cli -m <small model> -ngl 0 --temp 0 -st -p hi -n 2
+```
+
+which prints `[prof] roctx: attached, roctxProfilerResume present ...` instead of `library not found`. The
+symbol is present in that SDK build, so a `--selected-regions` run recording nothing means the sink did
+not attach, not that the API is missing.
 
 Reading the table, all three of which I got wrong the first time:
 
