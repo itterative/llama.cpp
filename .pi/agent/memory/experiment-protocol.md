@@ -78,7 +78,27 @@ correct output here, not a failure.
 
 Live regions: `graph:build`, `graph:alloc`, `graph:set_inputs`, `graph:compute` (llama-context),
 `meta:subgraph`, `meta:allreduce` (tensor/row split dispatch), `spec:draft_decode` (draft-mtp),
-`ckpt:save_tgt`, `ckpt:load_tgt` (the rollback door).
+`ckpt:save_tgt`, `ckpt:load_tgt` (the rollback door), `phase:decode` (`0f641cc1b`).
+
+### Capturing decode only
+
+`GGML_PROF_DECODE=<max n_tokens counted as decode>` opens a capture window (`roctxProfilerResume` /
+`Pause`) on the first batch at or below that width and closes it on the next wider batch or at exit, so a
+whole-turn trace carries decode kernels and nothing from the prompt pass. It also brackets a
+`phase:decode` region, which reports per-step decode wall time at exit with no profiler attached at all -
+often enough on its own, and the thing to reach for before fighting rocprofv3.
+
+- plain decode: `GGML_PROF_DECODE=1`
+- **speculative decode: `n_draft + 1`, not 1.** A verify pass wider than the limit closes the window and
+  the next draft step reopens it, so the trace arrives chopped into slivers. Set the limit above the
+  verify width to keep one contiguous region per turn.
+- the draft context's own single-token steps go through the same hook, so the region count is draft steps
+  plus target steps, not tokens. that is usually what is wanted for H18, but it is not a token count.
+- unverified from the dev box: whether `--selected-regions` is the flag that consumes the resume/pause
+  pair (no rocprofv3 or rocprofiler-register installed here, so the claim in `ggml-prof.h` came from docs
+  and not from `--help`). check `rocprofv3 --help | grep -i -A3 region` on the bench box. if their build
+  lacks selected-region support, the roctx ranges still arrive as marker rows to slice on afterwards, and
+  the counters work either way - the window is an optimization on top, not the mechanism.
 
 Reading the table, all three of which I got wrong the first time:
 
