@@ -1057,13 +1057,18 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
-// Experiment knob (branch-local): let gfx12 take the small_k block shape, see the E055 record. Default off,
-// which keeps upstream behaviour (RDNA excluded from small_k, rows_per_block = 1).
+// On this branch RDNA4 takes the mmvq small_k block shape by default (worth 5.5-6.6% of tg on 4 cards,
+// see the E055 record). Set GGML_CUDA_MMVQ_RDNA4_SMALL_K to 0 / off / false to go back to the upstream
+// shape of one row per block, which is what non-gfx12 builds always get.
 static bool ggml_cuda_mmvq_rdna4_small_k(void) {
     static const bool val = []() {
         const char * name = getenv("GGML_CUDA_MMVQ_RDNA4_SMALL_K");
 
-        return name != nullptr && name[0] != '\0' && name[0] != '0';
+        if (name == nullptr) {
+            return true;
+        }
+
+        return name[0] != '\0' && name[0] != '0' && name[0] != 'o' && name[0] != 'f';
     }();
 
     return val;
