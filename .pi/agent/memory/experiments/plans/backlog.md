@@ -81,19 +81,26 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
 - **Next:** measure faults, do not build. `ple-prefetch.md` method 1 = `iostat` during a decode run,
   zero code. See E008b.
 
-### L3 - 10-of-512 expert routing on HIP **now the biggest live item (E053)**
+### L3 - 10-of-512 expert routing on HIP **routing is fine; E053 redirected this row**
 
 - `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`: ~2% of expert weights touched per token
   per layer, so `tg` is a scattered-read problem.
 - Good news from the survey: `should_use_mmq` is **unconditionally true on RDNA4** (`mmq.cu:380-382`)
   `[s]` and MMQ tile selection is already expert-aware (`mmq.cu:248-251`) `[s]`, so the machinery is
   tuned for this. The open question is `-sm layer` imbalance across 4 cards.
-- **E053 promoted it**: quantized weight matvecs are **41.3% of decode device time** on 4 cards (2.53 M
-  calls over 1736 steps), and that share is depth-independent, so it is the largest controllable block
-  once the parked collective is excluded. The rows to read first by type: 6 = Q5_1 (20.4% of the visible
-  total on its own, 29 us per call), 8 = Q8_0 (9.6%), 12 = Q4_K (4.2% + 2.3%), 14 = Q6_K (3.4% + 0.8%) -
-  i.e. which tensors got which class in the file, and whether mmvq's warp choice fits 512-way expert reads
-  at n_rows 1.
+- **E053 first read, then partly retracted.** The quantized weight matvecs are 41.3% of decode device time
+  on 4 cards (519 launches per card per step, 7.05 ms per card per step), which made this look like the top
+  item. It is not the routing: 519 launches cannot be 24,576, so we touch the 10 active experts and nothing
+  more. What the row actually measures is **weight reads at n_rows 1 running near 20% of achievable
+  bandwidth** (0.8 GB per card per step should be ~1.3 ms and takes 7.05). That redirects the question to
+  mmvq's RDNA4 configuration (H6: `mmvq.cu:417-492` nwarps whitelist, `ggml-cuda.cu:1512`
+  `prefer_f32_output`) and to the 519 per-matvec `quantize_q8_1` launches (0.58 ms, ~8% of the matvec time
+  re-quantizing the activation once per matvec).
+- Rows by type, for whoever picks this up: 6 = **Q5_0** (20.4% of the visible total, 29 us per call - and
+  Q5_0 rather than Q4_K is exactly the block-size fallback this model's 640-wide `ffn_down` triggers; see
+  the `quant-block-size-fallback` memory), 8 = Q8_0 (11.5%), 12 = Q4_K (8.8% across both variants),
+  14 = Q6_K (4.2%). Whether the Q5_0 row really is `ffn_down` is still the open identification - the
+  loader's type census answers it.
 
 ### L4 - 16 GB of fp32 recurrent state
 
