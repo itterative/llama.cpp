@@ -63,3 +63,11 @@ so nothing would back the context off automatically), and whatever wedges MES in
 power-profile change addresses neither directly, so a clean run would be a clue rather than a diagnosis
 - most likely pointing at clock/DVFS transitions on the idle-to-burst pattern of speculative decode
 rather than at memory.
+
+**Update, same day: it hung again, with `rocprofv3` attached, under the `compute` profile.** So the
+profile change is not validated as a fix, and the user's own observation is that hangs are common with
+this tool (E053's run is the second one in a row to end that way). That makes the tracer itself the
+strongest correlate in the list, above MTP and above depth, and it is worth remembering when a trace
+vanishes mid-run: a missing `output generation` line means the box went, not the pipeline.
+
+This is parked, not dismissed - the user's call is that hangs are not the thing to chase right now.
