@@ -85,9 +85,12 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
 
 - `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`: ~2% of expert weights touched per token
   per layer, so `tg` is a scattered-read problem.
-- Good news from the survey: `should_use_mmq` is **unconditionally true on RDNA4** (`mmq.cu:380-382`)
-  `[s]` and MMQ tile selection is already expert-aware (`mmq.cu:248-251`) `[s]`, so the machinery is
-  tuned for this. The open question is `-sm layer` imbalance across 4 cards.
+- Good news from the survey - **corrected by reading the dispatch code** (see the `rdna4-rocm-build`
+  memory, "MoE matmul dispatch at decode"): `should_use_mmq` returning true on RDNA4 and MMQ tile
+  selection being expert-aware (`mmq.cu:248-251`, `:380-386`) are **prefill facts, not decode ones**. At
+  batch 1 `ggml_cuda_mul_mat_id` returns into mmvq first (`ggml-cuda.cu:1993-2001`), because batch 1 is
+  below every RDNA4 per-type cap (`mmvq.cu:258-282`), so decode runs mmvq's nwarps table - and the ~115
+  GB/s is on that table's *tuned* 8-warp branch. The trace agrees: there is no `mul_mat_q` row.
 - **E053 first read, then partly retracted.** The quantized weight matvecs are 41.3% of decode device time
   on 4 cards (519 launches per card per step, 7.05 ms per card per step), which made this look like the top
   item. It is not the routing: 519 launches cannot be 24,576, so we touch the 10 active experts and nothing
@@ -101,6 +104,11 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `quant-block-size-fallback` memory), 8 = Q8_0 (11.5%), 12 = Q4_K (8.8% across both variants),
   14 = Q6_K (4.2%). Whether the Q5_0 row really is `ffn_down` is still the open identification - the
   loader's type census answers it.
+- **Cheapest new candidate in this file**: `ffn_down_exps` splits on `SPLIT_AXIS_0`
+  (`src/llama-model.cpp:573-583`), i.e. along k, so under `-sm tensor` each card does the down projection
+  with 160 elements of k and must reduce partials across devices, while up/gate split on output rows and
+  need no reduction. Setting the RDNA4 mmvq cap to 0 for one type falls MoE through to mmq at batch 1 and
+  tests whether that shape is served better there: one constant, one rebuild, dev box, no bench time.
 
 ### L4 - 16 GB of fp32 recurrent state
 

@@ -1,6 +1,6 @@
 ---
 name: rdna4-rocm-build
-description: How to build and measure llama.cpp HIP on RDNA4/gfx1201 - cmake paths, knobs that are inert, RDNA4 kernel behaviour, FA family selection, and the qwen4exp op-support verdicts.
+description: How to build and measure llama.cpp HIP on RDNA4/gfx1201 - cmake paths, knobs that are inert, which matmul kernel MoE decode actually picks (mmvq vs mmq), RDNA4 kernel behaviour, FA family selection, and the qwen4exp op-support verdicts.
 category: project
 priority: 4
 keep_updated: true
@@ -82,9 +82,13 @@ Runtime env that matters here (all `[s]` unless noted):
 
 ## What RDNA4 does differently
 
-- **`should_use_mmq` returns true unconditionally on RDNA4** (`mmq.cu:380-382`; the in-source
-  note says MMQ beats dequant+hipBLAS for every type/batch, ref PR #18537) `[s]`. So quantized
-  matmuls are always MMQ here - `GGML_CUDA_FORCE_CUBLAS` experiments are a different ISA path.
+- **`should_use_mmq` is NOT what runs at decode - correcting an earlier version of this file.** It does
+  return true for RDNA4 with `n_experts > 0` (`mmq.cu:380-386`, in-source ref PR #18537), but for MoE it is
+  never consulted at batch 1: `ggml_cuda_mul_mat_id` returns into mmvq first when
+  `ne2 <= get_mmvq_mmid_max_batch(type, cc)` (`ggml-cuda.cu:1993-2001`), and the same ordering applies to
+  plain MUL_MAT (`:1936-1944`). See "MoE matmul dispatch" below. `[x]` the previous bullet here claimed
+  "quantized matmuls are always MMQ here"; it was marked `[s]` and E053's decode trace disproves it (zero
+  `mul_mat_q` rows in 1736 steps).
 - `prefer_f32_output` is **forced on** for RDNA4 (`ggml-cuda.cu:1512`, `:1514`) `[v]`.
 - MMQ tile selection uses `ncols_opt = ceil(ne12*n_expert_used/ne02)` for MoE on RDNA3/4
   (`mmq.cu:248-251`) `[s]` - so with `num_experts_per_tok = 10` the tile choice is already
@@ -98,6 +102,35 @@ Runtime env that matters here (all `[s]` unless noted):
   `GGML_CUDA_CC_IS_RDNA4(cc)` true for gfx1201 (`common.cuh:84`, `:93`) `[s]`. **So host-side
   heuristics work even in a binary whose device code lacks the macro** - a subtle way to get a
   half-tuned build if `GPU_TARGETS` is ever set wrong.
+
+## MoE matmul dispatch at decode, and why the split axis matters (`[v]` from source, 2026-09-24)
+
+**Decode MoE is mmvq, and it is the *tuned* branch.** The gate is a per-type batch cap,
+`get_mmvq_mmid_max_batch_rdna4` (`mmvq.cu:258-282`): Q4_K 4, Q5_K 5, Q6_K 5, Q3_K 4, IQ2/IQ3 4,
+Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_* 7, default 8. Batch 1 is below every one of them, so all of this model's
+expert types go to mmvq and `should_use_mmq`'s `n_experts > 0` clause only ever fires on prefill. Inside
+mmvq, `MMVQ_PARAMETERS_RDNA4` (`calc_nwarps`, `mmvq.cu:465-489`) gives **8 warps at `ncols_dst == 1`** for
+exactly those types - so the measured ~115 GB/s is happening on the branch RDNA4 tuning was written to
+favor, which is the point of the whole investigation.
+
+**Two tables matter, not one:**
+- `get_mmvq_mmid_max_batch_rdna4` (`mmvq.cu:258`) - who gets mmvq at which batch.
+- `calc_nwarps` / `calc_rows_per_block` under `MMVQ_PARAMETERS_RDNA4` (`:465`, `:563`) - block shape.
+  Both take `small_k` and `halve_iters`, which are where a narrow-k tensor is handled.
+
+**`ffn_down_exps` is the narrow-k case, and the split makes it narrower.** `src/llama-model.cpp:573-583`:
+`ffn_up_exps` / `ffn_gate_exps` / fused `ffn_gate_up_exps` split on `SPLIT_AXIS_1` (the output/intermediate
+rows, so k stays whole), but `ffn_down_exps` splits on `SPLIT_AXIS_0` - which for down is **k**. Under
+`-sm tensor` on 4 cards that leaves `moe_intermediate_size / 4 = 160` elements of k per device per row
+(a 32-block type spans it in 5 blocks) and, because the reduction is over a split k, the partials must be
+summed across devices - which is a plausible chunk of the 96 collectives per step per device E053 counted.
+So down-projection decode matmuls are simultaneously the worst-shaped for mmvq and the only expert matmul
+that costs a reduction.
+
+**Open, cheap, and not yet run**: whether mmq would actually beat mmvq at batch 1 for these shapes. The
+experiment is a constant, not a subsystem - set the RDNA4 cap to 0 for one type so MoE falls through to
+`ggml_cuda_mul_mat_q` at every batch, rebuild, compare `tg`. It tests the one thing the in-source comment
+("MMQ is consistently faster on RDNA4") never covered, because its evidence was pp-shaped.
 
 ## Flash attention on gfx1201, and what qwen4exp actually gets
 
