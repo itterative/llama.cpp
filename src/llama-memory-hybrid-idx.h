@@ -126,6 +126,11 @@ public:
         qsa_runs.clear();
     }
 
+    // truncating at p0 leaves every position below it in place, so the blocks that end below it keep
+    // their pooled keys. rolling a speculative draft back is a truncation, and clearing the whole run
+    // for it would re-derive the entire cache on nearly every decode step
+    void qsa_pool_truncate(llama_seq_id seq_id, llama_pos p0);
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore

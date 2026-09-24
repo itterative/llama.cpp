@@ -171,7 +171,11 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
 
-        qsa_pool_invalidate();
+        if (p1 == -1 && p0 >= 0) {
+            qsa_pool_truncate(seq_id, p0);
+        } else {
+            qsa_pool_invalidate();
+        }
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
@@ -265,8 +269,17 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             }
         }
 
-        // restored cells carry the positions they were saved with, which need not match the pool
-        qsa_pool_invalidate();
+        // restored cells carry the positions they were saved with, which need not match the pool.
+        // a per-sequence restore truncates instead of rebuilding the world: speculative rollbacks land
+        // here (the recurrent cache refuses partial seq_rm), and only the blocks past the restored end
+        // lose their keys
+        if (mem_idx && seq_id >= 0 && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            const llama_pos p_end = mem_idx->seq_pos_max(seq_id);
+
+            qsa_pool_truncate(seq_id, p_end + 1);
+        } else {
+            qsa_pool_invalidate();
+        }
 
     } catch (...) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
@@ -297,6 +310,26 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+void llama_memory_hybrid_idx::qsa_pool_truncate(llama_seq_id seq_id, llama_pos p0) {
+    if (qsa_runs.empty()) {
+        return;
+    }
+
+    // the pool only exists for a single-stream cache, so this is the cells array the runs were keyed on
+    const int32_t j1 = (int32_t) mem_idx->get_cells(seq_id).used_max_p1();
+
+    for (auto & [ratio, run] : qsa_runs) {
+        // block b covers [(b_lo + b)*r, (b_lo + b)*r + r - 1], so it survives a cut at p0 whole if its
+        // last position is below it - the rest is re-derived by the next steps as it completes again
+        const int64_t n_keep = p0 >= (llama_pos) ratio
+            ? (p0 - (llama_pos) ratio)/(llama_pos) ratio - (int64_t) run.b_lo + 1
+            : 0;
+
+        run.wm = std::min<uint32_t>(run.wm, n_keep > 0 ? (uint32_t) n_keep : 0);
+        run.j1 = std::min(run.j1, j1);
+    }
 }
 
 llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const {
