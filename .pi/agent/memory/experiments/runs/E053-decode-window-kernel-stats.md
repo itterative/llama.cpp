@@ -32,7 +32,7 @@ path engaged, so depth was above the 2048 budget.
 | group | ms | share | calls | note |
 |---|---|---|---|---|
 | `ncclDevKernel_Generic_4` | 40434 | **34.1%** | 666,624 | 5.82 ms per step per device, 60.7 us per call |
-| quantized weight matvecs (`mul_mat_vec_q`, 7 types) | 48943 | **41.3%** | 2,527,616 | the MoE/FFN read, depth-independent by construction |
+| quantized weight matvecs (`mul_mat_vec_q`, 7 rows) | 48943 | **41.3%** | 2,527,616 | all weight matvecs at n_rows 1 - experts *and* the dense half; the per-type split is below, and the experts-vs-dense share is not yet identified |
 | f32 + bf16 matvecs | 7273 | 6.1% | 930,496 | HC, norms-side, indexer projections |
 | **whole sparse chain**: `mask_to_sparse_indices`, `flash_attn_rtile`, `combine_results`, `top_k_radix_*` | 3745 | **3.2%** | 1,041,600 | see below |
 | micro elementwise (`quantize_q8_1`, `scale_f32`, `k_bin_bcast`, sigmoid, fills) | 5505 | 4.6% | **4,818,368** | 28% of all launches, avg 1.1-1.4 us each |
@@ -55,9 +55,9 @@ consequences worth stating plainly:
   the 35% that motivated them. H17b is still a legitimate correctness question about the cost model, but
   it is no longer a perf priority, and this is the measurement that says so.
 - The two things that dominate are depth-independent by construction: the collective (34%) and the expert
-  weight reads (41%). That is L3 and H16 - and H16 is parked by the user, so **L3 (10-of-512 routing on
-  RDNA4) is now the biggest live item on the box by this table**, which is a change from every previous
-  ranking in this directory.
+  weight reads (41%). That is L3 and H16 - and H16 is parked by the user, so the quantized-matvec group is
+  the live one, which is a change from every previous ranking in this directory. **Corrected below: the 41%
+  is all weight matvecs, not "experts" - that label was mine and unverified.**
 
 **The launch tail is bigger than it looks.** 4.8 M micro-kernel calls in 1736 steps is 2,776 launches per
 step across 4 devices, ~694 per device per step, each 1.1-1.4 us. They total only 4.6% of device time, so
@@ -71,6 +71,39 @@ prompt) reported `phase:decode` min 7.03 ms untraced vs 20.78 ms min under the s
 attaching inflates a step by roughly 14 ms at that size. Absolute per-step ms from any of these traces is
 therefore upper-bounded by the tool's cost, and shares across two traced runs are comparable while their
 totals are not.
+
+## Are we dequantizing too many experts? No - and that reframes the 41%
+
+Asked directly, because 41% of decode device time in weight matvecs is either "too many bytes" or "bytes
+moving too slowly", and only one of those is an mmvq problem.
+
+**Too many experts is ruled out by launch counts, with two orders of magnitude of margin.** Reading all 512
+experts in all 48 layers would be ~24,576 launches per card per step. The whole table has 2,450 launches
+per step per card, of which 519 are quantized matvecs at all. So routing works: we touch the 10 active
+experts, and the byte count follows from that -
+
+| per token, whole box | bytes |
+|---|---|
+| `ffn_down` 48 x 10 x (640x2560) at Q5_0 | 0.59 GB (0.44 GB if it were Q4_K - see the new `quant-block-size-fallback` memory) |
+| `gate`+`up` 48 x 10 x 2 x (2560x640) at Q4_K | 0.88 GB |
+| GDN in/out for 36 layers, attention for 12, shared expert, `lm_head` (248,320 vocab) | ~1.4 GB |
+| **total, per card = 1/4** | **~0.8 GB** |
+
+**The gap is inside the kernels.** 0.8 GB per card per step at the R9700's ~640 GB/s is ~1.3 ms. The
+quantized matvecs take **7.05 ms per card per step**, i.e. ~115 GB/s achieved, **roughly a fifth of peak**,
+and the f32/bf16 matvecs add 1.0 ms more. Per-call cost is 5.5-29 us for tensors whose slices are single-digit
+megabytes, so this is not launch latency either - each kernel is moving its own bytes slowly.
+
+So the framing changes: not "MoE traffic is 41% of decode, go make routing smarter", but **"n_rows == 1
+weight reads run at ~20% of achievable bandwidth"**, which points at mmvq's RDNA4 configuration
+(H6's `mmvq.cu:417-492` nwarps whitelist and the `prefer_f32_output` at `ggml-cuda.cu:1512`) and at the
+519 Q8_1 activation-quantize launches per card per step (0.58 ms, i.e. ~8% of the matvec time is spent
+re-quantizing the activation once per matvec rather than once per width).
+
+Caveats worth keeping: the byte table is derived from the architecture, not measured, and it assumes
+`ffn_down` is the Q5_0 row - the loader's type census settles that in one line and is still outstanding.
+The wall time per step for *this* run is also not in the artifact (see above), so the busy fraction is not
+computable here; on the shallow run it was ~34%.
 
 ## Still needed from the box
 
