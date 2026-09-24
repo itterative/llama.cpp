@@ -139,6 +139,29 @@ Two measurement traps found on the way, both worth remembering: an env boolean w
 nullptr` is **true for `NAME=`**, which silently turned a control arm into a treatment arm; and llama-bench
 CSV `avg_ns` is per repetition, not per token (128x at `-n 128`).
 
+## What E055 found instead: mmvq's small_k is blanket-excluded for RDNA
+
+E054 left the ~115 GB/s inside mmvq. It has a concrete cause. RDNA4 uses **8 warps** at `ncols_dst == 1`
+for the types this model has (`calc_nwarps`, `mmvq.cu:465-489`), but `calc_rows_per_block`
+(`mmvq.cu:563-567`) gives `MMVQ_PARAMETERS_RDNA4` the default 1 - only GENERIC/GCN/TURING/GB10 get
+`small_k ? nwarps : 1` - and `should_use_small_k` discards its own computed condition for
+`GGML_CUDA_CC_IS_RDNA(cc)` on the same `else if` line as the per-type NVIDIA lists, with no comment.
+
+The condition is plainly true here: `ffn_down` at Q5_0, `k = 640` -> `blocks_per_row_x = 20`, versus
+`nwarps * blocks_per_iter_1warp = 8 * 8 = 64`. So a 256-thread block cooperatively reduces a **480-byte
+row**, paying a cross-warp shared-memory reduction per output value for 2.5 warps' worth of K trips. That is
+exactly the case small_k was written for, disabled for the architecture with the widest blocks.
+
+**Measured (E055, dev box): allowing it is worth +4.1% tg** on the 4l/512-expert dummy, **+7.4%** on the
+48l-12qsa one, with pp unmoved (batch 4096 is mmq territory, above `MMVQ_MAX_BATCH_SIZE`), the golden
+bit-identical, and `MUL_MAT` / `MUL_MAT_ID` ops green. Behind `GGML_CUDA_MMVQ_RDNA4_SMALL_K=1`, default
+off, RDNA4 only.
+
+Origins: `ec16a072f` ("Optimize MOE GEMV kernel for BS > 1.", #20905) added small_k and the RDNA exclusion
+in the same commit - the exclusion came with the feature rather than after measuring RDNA, which is
+consistent with untested rather than lost. Unproven either way, and RDNA3 is unmeasured, which is the other
+half of why the clause must not simply be deleted.
+
 ## Flash attention on gfx1201, and what qwen4exp actually gets
 
 FA is available (`FLASH_ATTN_AVAILABLE` is just `!GGML_CUDA_NO_FA`, `common.cuh:304-306`)
