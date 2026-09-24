@@ -42,3 +42,24 @@ Lessons worth keeping:
 - `AMD_LOG_LEVEL=2` emitted nothing on this ROCm build, so it is not a way to name a faulting kernel here.
 - A GPU *hang* produces no `gpucore.*` and the kernel devcoredump is single-shot: the second and
   third resets destroyed the only artifact from the first.
+
+## Update 2026-09-24: power profile changed, validation pending
+
+The hangs surfaced again on the 4-card box (E045's server crash at ctx 245760, and during the E050
+suite), still with the same `MES failed to respond to msg=REMOVE_QUEUE / SUSPEND` signature. The user
+has switched the box's **power profile from `auto` to `compute`** as a possible fix; untested as of
+writing, and recorded in the hw profile as `bench-4x-r9700-32g` v2.
+
+What would count as evidence, since "it hasn't hung today" is not: the failures clustered on long
+`draft-mtp` sessions at the deepest context, so the test is the workload that previously died (MTP
+decode at ctx ~245760, an hour or more, or the E050 bench suite end to end) running clean more than
+once. If it does hold, note that a profile change is a comparability break for power-bound work: any
+`t/s` comparison straddling 2026-09-24 needs the v1/v2 boundary stated, and `tg` at these depths is
+plausibly power-limited enough to move.
+
+Nothing here closes the two live suspects, both still unproven: VRAM headroom at ctx 245760 (free
+memory was 22832 MiB aggregate after load, and `common_fit_params` refuses to fit under tensor split,
+so nothing would back the context off automatically), and whatever wedges MES in the first place. A
+power-profile change addresses neither directly, so a clean run would be a clue rather than a diagnosis
+- most likely pointing at clock/DVFS transitions on the idle-to-burst pattern of speculative decode
+rather than at memory.

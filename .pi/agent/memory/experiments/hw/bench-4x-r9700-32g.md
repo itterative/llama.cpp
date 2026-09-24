@@ -1,4 +1,8 @@
-# hw profile: bench-4x-r9700-32g (v1)
+# hw profile: bench-4x-r9700-32g (v2)
+
+> v2 (2026-09-24): power profile changed from `auto` to `compute`, to test whether it stops the GPU
+> hangs (E033). Unvalidated as of writing - if it turns out to change clock behaviour, numbers either
+> side of it are not comparable and E033/E045/E050 rows straddle the change.
 
 The 4-GPU box. The only machine that can run real `qwen4exp`, so the sole source of T2
 evidence. User-supplied facts marked (user); everything else still to confirm.
@@ -12,6 +16,7 @@ evidence. User-supplied facts marked (user); everything else still to confirm.
 | total VRAM | 128 GB |
 | **system RAM** | **62.7 GiB total** (screenshot 2026-09-18 19:21, `gtop` mem panel; 7.70 GiB used, 12%) - the "32g" in this profile's name is **not** RAM, and the earlier reasoning that a 30-36 GB PLE table cannot fit in RAM was wrong |
 | role | T2: real `qwen4exp` end-to-end, multi-GPU |
+| power profile | **`compute`** (was `auto` until 2026-09-24; changed while chasing the hangs in E033, validation pending) |
 | reachability | separate machine, not reachable from this session; user runs commands by hand |
 
 Still unconfirmed: ROCm version, driver, PCIe topology / any Infinity Fabric links, CPU +
