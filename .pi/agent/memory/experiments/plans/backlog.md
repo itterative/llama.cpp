@@ -81,13 +81,19 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
 - **Next:** measure faults, do not build. `ple-prefetch.md` method 1 = `iostat` during a decode run,
   zero code. See E008b.
 
-### L3 - 10-of-512 expert routing on HIP
+### L3 - 10-of-512 expert routing on HIP **now the biggest live item (E053)**
 
 - `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`: ~2% of expert weights touched per token
   per layer, so `tg` is a scattered-read problem.
 - Good news from the survey: `should_use_mmq` is **unconditionally true on RDNA4** (`mmq.cu:380-382`)
   `[s]` and MMQ tile selection is already expert-aware (`mmq.cu:248-251`) `[s]`, so the machinery is
   tuned for this. The open question is `-sm layer` imbalance across 4 cards.
+- **E053 promoted it**: quantized weight matvecs are **41.3% of decode device time** on 4 cards (2.53 M
+  calls over 1736 steps), and that share is depth-independent, so it is the largest controllable block
+  once the parked collective is excluded. The rows to read first by type: 6 = Q5_1 (20.4% of the visible
+  total on its own, 29 us per call), 8 = Q8_0 (9.6%), 12 = Q4_K (4.2% + 2.3%), 14 = Q6_K (3.4% + 0.8%) -
+  i.e. which tensors got which class in the file, and whether mmvq's warp choice fits 512-way expert reads
+  at n_rows 1.
 
 ### L4 - 16 GB of fp32 recurrent state
 
@@ -350,7 +356,12 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   figure was wrong twice over (3 chain builds per token, and per-call counts normalized across phases).
   Keep only as a footnote: graphs-off costs ~7% of tg on the dev box (E008).
 
-### H15 - keep the indexer gather and pooling in f16 **mostly superseded by H9/E044**
+### H15 - keep the indexer gather and pooling in f16 **superseded by H9, ceiling cut by E053**
+
+- **E053 sizes what is left**: the entire sparse chain (mask->indices, rtile FA, combine, radix top-k) is
+  **3.2% of decode device time**, against the 35% E042/E043 measured pre-pool. Halving the one f32 read
+  that survives is a ~1% prize, not a 35% one. Keep the VRAM argument (354 MiB/card at 245760), drop the
+  perf argument.
 
 - In the `CACHED` variant the gather, the pooling, the norm and the rope are gone, so the only f32
   traffic left is the pool read under the score matvec. The remaining version of this item is the plan's
@@ -359,7 +370,7 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `REBUILD`/fallback path, where the gather is still f16 -> f32.
 - **Scope:** prefill, decode.
 
-### H16 - the 4-card reduce is NCCL, and it is 22% of device time
+### H16 - the 4-card reduce is NCCL, and it is 22% of device time **34% in decode per E053, still parked**
 
 - E037: `ncclDevKernel_Generic_4` is **163,124 calls, 22.0 s** in the chain-off arm and 22.2 s in the
   chain-on arm, i.e. 96 collectives per graph build (2 per layer) at **135 us each** for a 2560-wide f32
@@ -392,6 +403,12 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
 - **Cost half is open as H17b.**
 
 ### H17b - is the QSA chain replicated into all four device sub-graphs under `-sm tensor`?
+
+- **E053 cut the prize to ~3%.** The whole sparse chain is 3.2% of decode device time post-pool, so full
+  4x replication would be a ~2% win, not the H9+H13-sized prize this row was written for. The counts also
+  point the other way: 12 QSA layers produce 6 rtile launches per step per device, i.e. attention lands on
+  2 of 4 devices as the head split implies, while the radix top-k runs 48 times per step per device
+  (12 layers x 4 kernels). If anything is replicated it is selection, not attention.
 
 - `src/llama-model.cpp:512` mirrors the indexer cache, so every device *can* run the whole chain, and
   `a8b24dfdf` shows the graph is partitioned into per-device sub-graphs with nodes landing in whichever
