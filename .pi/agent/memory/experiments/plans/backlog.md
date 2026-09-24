@@ -440,6 +440,13 @@ H13 leftovers.
 - Finally, the 0.23 -> 0.26 acceptance shift means the +7% is not clean evidence for the clamp; and 0.26
   acceptance on 6 drafts is a bad trade on its own terms, so `--n-draft 2` is worth a run regardless of
   the diagnosis. Full mechanics in `../../qwen4exp-arch.md` ("the two rollback doors").
+- **E046 adds the ceiling:** at alpha 0.25 the most speculative decoding can do is +33% tokens per step,
+  and only if the replays were free, while the measured MTP/no-spec ratio is 22.77/34.86 - so ~30 ms of
+  draft-side work per step is the whole story and it is not in a kernel (rtile nb>1, `d2319c937`, was
+  worth ~1.2% of it at the op level and did not register). The next check is not a measurement: whether
+  `blk.N.nextn.*` exists in the GGUF at all, because `n_mtp_layers` defaults to 1 and the `n_max` clamp
+  only applies under `chain_heads`, so a head-less file still drafts 6 steps. If absent, alpha 0.25 is an
+  export gap (`supports_mtp_export = False` in `plans/model-shape.md`) and not a model property.
 - **Scope:** decode, 4-card.
 
 ---
