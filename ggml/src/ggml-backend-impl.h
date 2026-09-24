@@ -10,6 +10,20 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 2
 
+    // Optional profiler hooks for the named regions in ggml-prof.h: ggml-base always counts them, a
+    // backend may also mirror the regions into its own profiler. Registered at backend load, absent
+    // otherwise.
+    struct ggml_prof_sink {
+        const char * name;
+
+        void (* region_begin)(const char * name);
+        void (* region_end)(void);
+        void (* window_begin)(void);
+        void (* window_end)(void);
+    };
+
+    GGML_API void ggml_prof_register_sink(const struct ggml_prof_sink * sink);
+
     //
     // Backend buffer type
     //
