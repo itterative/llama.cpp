@@ -447,6 +447,17 @@ H13 leftovers.
   `blk.N.nextn.*` exists in the GGUF at all, because `n_mtp_layers` defaults to 1 and the `n_max` clamp
   only applies under `chain_heads`, so a head-less file still drafts 6 steps. If absent, alpha 0.25 is an
   export gap (`supports_mtp_export = False` in `plans/model-shape.md`) and not a model property.
+- **Superseded framing (E048):** "draft-mtp costs a third of decode" is a property of `n_draft = 6`, not
+  of MTP - with 3 drafts the same box reports 37-57 t/s. At acceptance 0.25, drafts 4-6 add 0.4% to the
+  accepted tokens per step, so the honest headline is "over-drafting costs a third of decode".
+- **The accounting exists already; what is missing is plumbing, not a tracer:** `llama_perf_context()`
+  returns per-ctx `t_p_eval_ms`/`t_eval_ms`/`n_reused` and `llama_perf_sampler()` returns `t_sample_ms`,
+  both with `_reset` variants for interval deltas. `common_perf_print` (common/sampling.cpp:540-575)
+  already computes `t_unacc_ms = total - (sampling + p_eval + eval)` - and the draft ctx's time lands in
+  that bucket, because the function only ever receives the target ctx. Two gaps: `ctx_dft` is private to
+  `common_speculative`, and `common_perf_print` is called only by `tools/completion` (llama-bench has no
+  spec decode, so MTP has to be measured through the server or cli). Closing both is ~30-40 host-side
+  lines with nothing ROCm-specific.
 - **Scope:** decode, 4-card.
 
 ---
