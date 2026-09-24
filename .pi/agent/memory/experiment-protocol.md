@@ -61,7 +61,26 @@ export LD_LIBRARY_PATH=$PWD/build/bin        # ~/.local/lib64 has a stale instal
 ldd build/bin/llama-bench | grep -E 'lib(ggml|llama)\.so\.0 '
 ```
 
-Device filter is exactly `ROCm0`, and a filter that matches nothing *passes silently*.
+Device filter is exactly `ROCm0`, and a filter that matches nothing *passes silently*. Same trap for
+feature gates: an equal result between two arms means nothing until something proves the new path
+ran - print or grep one line only the live path emits (e.g. `block key pool = 1`, `qsa pool: mode = 2`).
+Two separate times this produced a false "identical, so it is safe".
+
+## Crash and debug loop on this box
+
+- Debug build without losing the HIP objects: `cmake -B build -DCMAKE_CXX_FLAGS_RELEASE="-O2 -g3
+  -fno-omit-frame-pointer"` (same for `_CXX_FLAGS_RELEASE`/`_C_FLAGS_RELEASE`). It drops `-DNDEBUG`, so
+  `GGML_ASSERT` fires with a message instead of corrupting silently. The variable is cached, so
+  re-running plain `cmake` does **not** restore `-O3`: pass it explicitly again.
+- llama.cpp log prefixes are `MM.SS.mmm.uuu` (minutes), not days or hours - misreading them invented a
+  "15-day uptime" theory that the real timeline contradicted.
+- Multi-device emulation is unavailable here: `GGML_CUDA_DEVICES` takes a *count* (a device list is
+  rejected) and requesting more devices than exist dies with `invalid device ordinal` on HIP. But
+  `-sm tensor` still routes through `ggml-backend-meta.cpp` on one device, which is how a 4-card-only
+  bug turned up locally at all.
+- Cores: `coredumpctl --all list` (needs `--all`), `coredumpctl --all dump PID > core`, then
+  `gdb -batch -ex "frame N" -ex "print ..." <bin> core`. Iterate on the core, not by re-running a
+  12 GB model. `print` after `run` in one `gdb -batch` loses the frame.
 
 ## Git hygiene for these files
 
