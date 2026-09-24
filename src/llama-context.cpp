@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -1662,6 +1663,54 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// capture window over decode steps only, for profiler traces: GGML_PROF_DECODE=<max n_tokens still
+// counted as decode>. 1 for plain decode; raise it to cover speculative verify (n_draft + 1) or -np > 1
+// slots. opens on the first matching batch, closes on the next larger one or at exit
+static int llama_prof_decode_limit(void) {
+    static const int val = []() {
+        const char * env = getenv("GGML_PROF_DECODE");
+
+        return env != nullptr ? std::max(1, atoi(env)) : 0;
+    }();
+
+    return val;
+}
+
+static bool llama_prof_decode_open = false;
+
+static void llama_prof_decode_close(void) {
+    if (llama_prof_decode_open) {
+        ggml_prof_window_end();
+
+        llama_prof_decode_open = false;
+    }
+}
+
+static bool llama_prof_decode_touch(int n_tokens) {
+    const int limit = llama_prof_decode_limit();
+
+    if (limit == 0) {
+        return false;
+    }
+
+    if (n_tokens > limit) {
+        llama_prof_decode_close();
+
+        return false;
+    }
+
+    if (!llama_prof_decode_open) {
+        static const bool registered = []() { atexit(llama_prof_decode_close); return true; }();
+
+        (void) registered;
+
+        ggml_prof_window_begin();
+        llama_prof_decode_open = true;
+    }
+
+    return true;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1675,6 +1724,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // declared ahead of the returns below so the region is closed on every path
+    const bool                      prof_decode = llama_prof_decode_touch(batch_inp.n_tokens);
+    std::optional<ggml_prof_region> prof;
+
+    if (prof_decode && ggml_prof_enabled()) {
+        prof.emplace("phase:decode");
     }
 
     const auto & vocab   = model.vocab;
