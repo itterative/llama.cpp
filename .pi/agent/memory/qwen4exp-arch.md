@@ -149,3 +149,29 @@ co-added to prevent reordering (`:696` comment).
 2-line `ggml_build_forward_expand(gf, res_hc)` workaround to keep `hc_init` in the same graph
 split as layer 0. The indexer cache is `SPLIT_AXIS_MIRRORED` (`llama-model.cpp:511-514`), so
 its cells are replicated whole on every device and the QSA selection is global (E038/H17).
+
+## How a speculative rollback reaches this arch's caches
+
+Two doors, and which one fires decides what any per-block cache keyed on positions may keep:
+
+1. `llama_memory_hybrid_idx::seq_rm(seq, p_keep, -1)` - the common case. `LLM_ARCH_QWEN4EXP` is in
+   `llm_arch_supports_rs_rollback` (`llama-arch.cpp`), and `common_params_speculative::need_n_rs_seq()`
+   returns `draft.n_max` for `draft-mtp`/eagle3/dflash/dspark, so the target ctx is built with
+   `n_rs_seq = n_max`. The recurrent cache then rewinds through its per-token snapshot index
+   (`llama_memory-recurrent.cpp:193`, `rollback <= n_rs_seq`) and the hybrid wrapper proceeds into the
+   attention and indexer caches. Anything beyond that window is refused outright, so a caller that
+   ignores the return value silently keeps stale cells.
+2. `common_prompt_checkpoint::load_tgt(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)` - the fallback in
+   `server-context.cpp` when `ctx_*_seq_rm_type` is FULL or the rewind exceeds the snapshot window. It
+   restores *only* the partial caches (recurrent/SWA); the full-attention and indexer sections are
+   skipped by the `PARTIAL_ONLY` gate, so their cells and positions are untouched by the restore.
+   Anything derived from cell contents stays valid; anything keyed on "how far the run reaches" does
+   not, because the rejected rows are still physically present at the moment the restore is observed.
+
+The draft ctx never gets snapshots (`common.cpp:1311`, `speculative.cpp:2554` force `n_rs_seq = 0`), so
+its side always rolls back through door 2, and `qwen3_5_mtp` drafts carry no recurrent state at all
+(their load log shows `size = 0.00 MiB ... 0 rs_seq`).
+
+Cost worth remembering: the snapshots multiply the recurrent allocation by `(1 + n_rs_seq)`
+(`llama_memory-recurrent.cpp:101`). At `n_max = 6` on a 48-layer GDN stack that is 108 MiB -> 756 MiB,
+which is a bigger VRAM line than the whole indexer pool.
