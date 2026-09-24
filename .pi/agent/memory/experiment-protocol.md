@@ -66,6 +66,31 @@ feature gates: an equal result between two arms means nothing until something pr
 ran - print or grep one line only the live path emits (e.g. `block key pool = 1`, `qsa pool: mode = 2`).
 Two separate times this produced a false "identical, so it is safe".
 
+## Region profiling inside the process (`02d963eb0`)
+
+`ggml_prof_region("name")` from `ggml/include/ggml-prof.h` brackets a host phase. With
+`GGML_PROF_REGIONS=1`, ggml-base counts calls / total / max and prints a table at exit. A backend may
+register a `ggml_prof_sink` that mirrors each region into its own profiler; the HIP backend does that
+by loading the roctx marker library by name (`ggml/src/ggml-cuda/prof-roctx.cu`), so a rocprofv3 trace
+groups kernel rows by phase. **Annotations only - nothing here collects data, and collection stays in
+the external tool.** The dev box has no roctx SDK and no rocprofv3, so `regions on: counters` is the
+correct output here, not a failure.
+
+Live regions: `graph:build`, `graph:alloc`, `graph:set_inputs`, `graph:compute` (llama-context),
+`meta:subgraph`, `meta:allreduce` (tensor/row split dispatch), `spec:draft_decode` (draft-mtp),
+`ckpt:save_tgt`, `ckpt:load_tgt` (the rollback door).
+
+Reading the table, all three of which I got wrong the first time:
+
+- totals are **inclusive** of nested regions. Summing rows is meaningless; subtract children for self
+  time. `graph:compute` contains `meta:subgraph`.
+- region-ms is a per-thread aggregate, so a run can report far more region-ms than it took in wall
+  time. `-r 1` still runs several passes (warmup + estimate), which is why `calls` can be ~4x the
+  ubatch count in a bench row. Check `calls` before converting to ms/token.
+- `graph:compute` is the *async* entry point: it returns after enqueueing, so its ms is mostly device
+  wait only where something inside synchronizes. Do not read it as dispatch cost.
+- counters are not locked; overlapping threads can double count. Today's sites are all main-thread.
+
 ## Crash and debug loop on this box
 
 - Debug build without losing the HIP objects: `cmake -B build -DCMAKE_CXX_FLAGS_RELEASE="-O2 -g3
