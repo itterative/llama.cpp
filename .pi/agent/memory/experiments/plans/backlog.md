@@ -11,9 +11,9 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H9's prefill regression (the open question on a feature that is already built),
-H18 (the MTP tax), E008b (the measurement that decides the whole PLE/prefetch line), H17b, and the
-H13 leftovers.
+**Live right now:** H18 (the MTP tax, now framed as over-drafting), H17b (is the QSA chain 4x
+replicated), E008b (the measurement that decides the whole PLE/prefetch line), the H13 leftovers, the
+E052 MTP-with-pool check, and the H9 leftovers (f16 pool storage, E028 host mapping).
 
 ---
 
@@ -59,16 +59,20 @@ H13 leftovers.
 - **Status:** presumably done - E019 re-baselined the ops gate on 7.1.1 on this box, which required it.
   Close formally on the next clean configure.
 
-### B4 - pull in the bench box's fork changes (user-requested)
+### ~~B4 - pull in the bench box's fork changes~~ done, all three were already here
 
-- The fork at `c9a59ef73` carries three things this branch lacks, each already proven useful on this
-  exact hardware: **(1) RDNA4 MMQ fixes**, **(2) a custom AllReduce** (RCCL does not work on that setup
-  - and here `GGML_HIP_RCCL=OFF` plus the `#ifndef GGML_USE_HIP` guard on the "rebuild with NCCL"
-  warning means the fallback to internal AllReduce is *silent*), **(3) `-sm tensor` enabled for
-  qwen4exp**.
-- **Ordering matters:** the user reports the P2P parts **conflict with recent upstream changes**, so
-  MMQ lands first and the AllReduce last. Measure after each - three separate A/Bs, not one
-  unresolvable blob.
+Verified against this checkout rather than assumed:
+
+| item | commit | state |
+|---|---|---|
+| RDNA3/4 mmq tuning | `e6902b597` | in `mmq.cu` (`:248-251` tile choice, `:380-382` unconditional MMQ on RDNA4) |
+| custom AllReduce | `36c3e6d7d` | `allreduce-p2p.cu` (1298 lines), reached as the **internal** option: `ggml-cuda.cu:1076-1138` selects `try_allreduce_{nccl,internal,butterfly}` |
+| `-sm tensor` for qwen4exp | `a8b24dfdf` | `llm_arch_supports_sm_tensor` falls through to `return true` |
+
+The ordering warning that came with this item no longer applies, but one new question does: E037 traced
+`ncclDevKernel_Generic_4` on the bench box, so that build resolves the allreduce selector to **nccl**
+(its `GGML_HIP_RCCL` is presumably ON, unlike the dev box) and never reaches the fork's p2p kernels. See
+H16, which the user has told me not to chase without asking.
 
 ---
 
@@ -157,11 +161,17 @@ H13 leftovers.
 - What *is* usable on 1 card: `-sm tensor` still routes through `ggml-backend-meta.cpp` with
   `n_backends = 1`, which is how the meta-backend crash (E044/E045) was reproduced locally at all.
 
-### N4 - verify `__GFX12__` is actually emitted for gfx1201
+### ~~N4 - verify `__GFX12__` is actually emitted for gfx1201~~ yes, it is
 
-- Device-side RDNA4 paths hinge on `vendors/hip.h:215-217` (`__GFX12__` -> RDNA4) `[s]`, never
-  compiled-and-checked. If absent, every `#if defined(RDNA4)` device branch is dead while host-side
-  `IS_RDNA4(cc)` still claims RDNA4 - a half-tuned build that looks fine.
+`/usr/bin/hipcc --offload-arch=gfx1201 -dM -E` over a TU that includes `hip/hip_runtime.h` prints
+`#define __GFX12__ 1` inside the `hip-amdgcn-amd-amdhsa--gfx1201` offload bundle, and
+`vendors/hip.h:215-217` keys `RDNA4` off exactly that. So the device branches are live, and the host-side
+`IS_RDNA4(cc)` claim is not half-tuned.
+
+**Trap that made me report this as a failure for five minutes:** compiling the same probe with `-c` and
+reading it with `nm` shows only the **host** pass symbols (`__device_stub__...`), where `__GFX12__` is
+correctly *not* defined - so the conditional kernel looks absent when it is present in the device bundle.
+Use `-dM -E`, not `-c` + `nm`.
 
 ### N5 - HC inputs are F32-only
 
@@ -239,7 +249,7 @@ H13 leftovers.
 - The "rebuild with NCCL" warning is `#ifndef GGML_USE_HIP`, so without RCCL the fallback to internal
   AllReduce is **silent** `[s]`. Only worth a record once B2 reports the topology.
 
-### H9 - cache pooled indexer block keys (coarse cache) **built, 4-card half-answered**
+### H9 - cache pooled indexer block keys (coarse cache) **shipped as a long-context decode feature**
 
 - **Original question (added by E024):** `build_qsa_top_k` re-gathers the whole raw indexer cache and
   re-pools it every step - ~76 MB and ~33 graph nodes per QSA layer per step at 40k, about 2x dense
@@ -266,9 +276,14 @@ H13 leftovers.
   arithmetic: speculative rollback arrives as a checkpoint `state_read`, not a partial `seq_rm`, so
   clearing the run there re-derives everything on nearly every step - fixed by clamping the watermark to
   the surviving blocks (E045, `90b9ccf9d`).
-- **Open:** the 4-card box shows **tg +30% at 131k** but **pp -16..-22% at every depth**, unlocalized
-  (needs pool=0 on the same build plus a `-ub` sweep), and the pool taxes **354 MiB/card at ctx
-  245760**, so f16 storage is on the table.
+- **Answered (E049-E052):** the pp regression was never the pool's maths - `sched_reserve` measured an
+  empty cache, so the first pooled ubatch re-reserved the compute buffers and every depth-proportional
+  tensor kept ratcheting. Fixed, confirmed on 4 cards (pp back to -0.5..-0.9%, tg win intact), then
+  collapsed to one graph shape and widened to all ubatch widths, with prefill behind
+  `Q4EXP_POOLED_NO_PREFILL`. What the pool is for: long-context decode, +30% tg at 131k.
+- **Open:** the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
+  the E052 width change has never been measured where it matters, under `draft-mtp`; and the crossover
+  depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is unexplained.
 - **Scope:** prefill, decode, 4-card.
 
 ### H10 - mmq cutoff tuning for MoE models
@@ -375,6 +390,11 @@ H13 leftovers.
   payload size is depth-independent - that is peer-wait, i.e. imbalance exposure growing with depth, and
   it is ~15 ms/token of a ~45 ms/token step, the same order as the whole chain.
 - **Do not chase without asking:** the user says NCCL is not an issue.
+- **One thing learned while checking B4:** the fork's custom AllReduce is *not* dead code - it is wired as
+  the `internal` option of a selector (`ggml-cuda.cu:1076-1138`, `try_allreduce_{nccl,internal,butterfly}`)
+  - but the box's RCCL kernels in this trace mean that selector resolved to nccl there. So "22% of device
+  time is NCCL" and "the box has a p2p allreduce" are both true and not in conflict; which one runs is a
+  build flag on the bench box, still unrecorded (B2).
 - **Scope:** decode, 4-card.
 
 ### ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
@@ -572,6 +592,16 @@ H13 leftovers.
   cost relative to real serving. Source: E008b.
 
 ---
+
+### E052b - does the pooled path actually engage under `draft-mtp` **the case E052 exists for**
+
+- `llama-bench` has no spec decode, so no ubatch ever lands in the 2..15 token band that E052 opened up.
+  Run `tg` at 131k with `--spec-type draft-mtp --n-draft 3`, `Q4EXP_POOLED=0` vs `1`, with `-v`, and count
+  `qsa pool: mode` lines.
+- Decides between three outcomes: verify steps reach the cached path (the change pays), they keep landing on
+  the cold-start rebuild (the width gate is keyed on the wrong thing), or the mode is NONE because the draft
+  and target contexts disagree about the shared memory state.
+- Source: E052.
 
 ## Code-level items
 
