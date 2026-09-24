@@ -78,8 +78,9 @@ checkpoint, continues, re-inserts and replays):
   `rollback_replay_mismatch=0` - restoring a checkpoint reproduces the continuation exactly.
 - 1 rebuild across two restores with 350 cached steps (before the clamp: a rebuild per restore).
 - golden PPL 263113.6984 both arms; `test-save-load-state` all pass with the pool on; sparse corpus
-  `-sm tensor -c 8192` gives 267035.1801 in both arms (the `-sm none` value 267035.3875 differs by
-  ~1e-6 because tensor splitting changes reduction order, and both arms move the same way).
+  (`-sm tensor -c 8192`, **dense FA**, i.e. no `Q4EXP_SPARSE_FA` - "sparse corpus" names the file, not
+  the arm, see the trap note in E051) gives 267035.1801 in both arms (the `-sm none` value 267035.3875
+  differs by ~1e-6 because tensor splitting changes reduction order, and both arms move the same way).
 
 ## Addendum - the clamp on the real MTP path (user's numbers, same day)
 
