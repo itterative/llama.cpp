@@ -609,9 +609,9 @@ public:
     ggml_tensor * cell_blk   = nullptr;   // I32 [n_kv, n_stream]           - per-cell bias mode only
     ggml_tensor * tail_cells = nullptr;   // I32 [ratio, n_tokens/n_stream, n_stream] - whole-block mode
 
-    // pool rows this graph writes: the blocks that completed since the previous step (CACHED) or all
-    // of them (REBUILD). new_cells / new_pos name their members and only exist for CACHED.
-    ggml_tensor * new_cells  = nullptr;   // I32 [ratio*n_new, n_stream]
+    // pool rows this graph writes: the blocks that completed since the previous step, or all of them on
+    // a cold start. new_cells / new_pos name their members, blk_pos the historic path's positions.
+    ggml_tensor * new_cells  = nullptr;   // I32 [ratio,n_new, n_stream]
     ggml_tensor * new_pos    = nullptr;   // I32 [4*n_new]
     ggml_tensor * new_rows   = nullptr;   // I32 [n_new]
 
@@ -682,9 +682,9 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
         qsa->pool = block_sel ? mctx_hyb->qsa_pool_get((uint32_t) r, ubatch, n_stream, n_kv)
                               : llama_qsa_pool();
 
-        // reading the pool replaces the whole-cache rope, so blk_pos has no consumer left in that
+        // reading the pool replaces the whole-cache rope, so blk_pos has no consumer left in the pooled
         // variant - and an input nobody uses never gets memory
-        if (qsa->pool.mode != llama_qsa_pool::CACHED) {
+        if (qsa->pool.mode == llama_qsa_pool::NONE) {
             qsa->blk_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         }
 
@@ -692,8 +692,8 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
             qsa->new_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, qsa->pool.n_new);
             ggml_set_input(qsa->new_rows);
 
-            // only the CACHED variant derives rows in the graph, so only it names their members
-            if (qsa->pool.mode == llama_qsa_pool::CACHED) {
+            // the pooled variant derives the rows it writes inside the graph, so it names their members
+            if (qsa->pool.mode != llama_qsa_pool::NONE) {
                 qsa->new_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*qsa->pool.n_new, n_stream);
                 qsa->new_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*qsa->pool.n_new);
 
@@ -735,12 +735,7 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
 
     ggml_tensor * pooled = nullptr;
 
-    if (inp->pool.mode == llama_qsa_pool::CACHED) {
-        // the keys of complete blocks are in the pool, written when each block finished: reading them
-        // back replaces the whole-cache gather and the pooling, norm and rope that follow it
-        pooled = mctx_idx->get_pool(ctx0, il, n_blocks);
-        cb(pooled, "indexer_k", il);
-    } else {
+    if (inp->pool.mode == llama_qsa_pool::NONE) {
         // gathers per stream: blk_cells row s indexes stream s's own cells
         ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
@@ -766,53 +761,44 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
                 ext_factor, attn_factor, beta_fast, beta_slow);
         pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
         cb(pooled, "indexer_k", il);
-    }
-
-    // write the pool rows this step owns before the scores read them
-    if (inp->new_rows) {
-        // the destination is the pool in both writing variants; in REBUILD the pool was not read, so
-        // its view has to be taken separately from the chain result that feeds the scores
-        ggml_tensor * pool = inp->pool.mode == llama_qsa_pool::CACHED
-                           ? pooled
-                           : mctx_idx->get_pool(ctx0, il, n_blocks);
+    } else {
+        // one shape whether the pool holds nothing or everything: derive the rows this step owns, write
+        // them, and score the result of the write. ggml_set_rows returns a view of its destination, so
+        // the scores depend on the write through the graph instead of through node order
+        ggml_tensor * pool = mctx_idx->get_pool(ctx0, il, n_blocks);
 
         ggml_tensor * dst = ggml_view_4d(ctx0, pool, idx_dim, pool->ne[1], 1, n_stream,
                 pool->nb[1], pool->nb[2], pool->nb[2], 0);
 
-        ggml_tensor * src = nullptr;
+        // the blocks this step writes, pooled exactly the way the historic branch above pools all of
+        // them, so the rows are bit-identical either way
+        ggml_tensor * memb = ggml_get_rows(ctx0, k_all, inp->new_cells);
+        memb = ggml_reshape_4d(ctx0, memb, idx_dim, r, inp->pool.n_new, n_stream);
 
-        if (inp->pool.mode == llama_qsa_pool::CACHED) {
-            // the blocks that completed since the previous step, pooled the same way the historic path
-            // above pools all of them, so the rows are bit-identical either way
-            ggml_tensor * memb = ggml_get_rows(ctx0, k_all, inp->new_cells);
-            memb = ggml_reshape_4d(ctx0, memb, idx_dim, r, inp->pool.n_new, n_stream);
+        ggml_tensor * fresh = nullptr;
 
-            ggml_tensor * sum = nullptr;
-
-            for (int64_t i = 0; i < r; ++i) {
-                ggml_tensor * slice = ggml_cont(ctx0,
-                        ggml_view_3d(ctx0, memb, idx_dim, inp->pool.n_new, n_stream,
-                                memb->nb[2], memb->nb[3], i*memb->nb[1]));
-                sum = sum ? ggml_add(ctx0, sum, slice) : slice;
-            }
-
-            sum = ggml_scale(ctx0, sum, 1.0f/(float) r);
-            sum = ggml_reshape_3d(ctx0, sum, idx_dim, inp->pool.n_new*n_stream, 1);
-            sum = build_norm(sum, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-            sum = ggml_reshape_3d(ctx0, sum, idx_dim, 1, inp->pool.n_new*n_stream);
-            sum = ggml_rope_multi(ctx0, sum, inp->new_pos, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            sum = ggml_reshape_4d(ctx0, sum, idx_dim, inp->pool.n_new, 1, n_stream);
-
-            src = sum;
-        } else {
-            // rebuild: the chain above derived every complete block, so keep the ones it scored
-            src = ggml_view_4d(ctx0, pooled, idx_dim, inp->pool.n_new, 1, n_stream,
-                    pooled->nb[1], pooled->nb[2], pooled->nb[2], 0);
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, memb, idx_dim, inp->pool.n_new, n_stream,
+                            memb->nb[2], memb->nb[3], i*memb->nb[1]));
+            fresh = fresh ? ggml_add(ctx0, fresh, slice) : slice;
         }
 
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, src, inp->new_rows));
+        fresh = ggml_scale(ctx0, fresh, 1.0f/(float) r);
+        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, inp->pool.n_new*n_stream, 1);
+        fresh = build_norm(fresh, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+        fresh = ggml_reshape_3d(ctx0, fresh, idx_dim, 1, inp->pool.n_new*n_stream);
+        fresh = ggml_rope_multi(ctx0, fresh, inp->new_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        fresh = ggml_reshape_4d(ctx0, fresh, idx_dim, inp->pool.n_new, 1, n_stream);
+        cb(fresh, "indexer_k_new", il);
+
+        // rows the pool already held are untouched by the write, so the result of set_rows is the whole
+        // [0, n_blocks) range the scores need
+        pooled = ggml_reshape_3d(ctx0, ggml_set_rows(ctx0, dst, fresh, inp->new_rows),
+                idx_dim, n_blocks, n_stream);
+        cb(pooled, "indexer_k", il);
     }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);

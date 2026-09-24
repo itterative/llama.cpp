@@ -360,6 +360,8 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     const int64_t j1 = cells.used_max_p1();
     const int64_t nu = cells.get_used();
 
+    const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
     if (nu == 0 || j1 - j0 != nu) {
         return res;
     }
@@ -370,8 +372,6 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     if (p0 < 0 || p1 != p0 + (llama_pos) (j1 - 1 - j0)) {
         return res;
     }
-
-    const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
 
     if (p1/(llama_pos) ratio >= n_blocks) {
         return res;
@@ -407,8 +407,15 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     }
 
     if (!have) {
-        // nothing valid recorded for this numbering: re-derive every complete block once
-        res.mode  = llama_qsa_pool::REBUILD;
+        if (n_bid == 0) {
+            return res; // nothing complete to pool yet: the historic chain has to supply every column
+        }
+
+        // nothing valid recorded for this numbering: the same graph as the cached case with wm = 0, so
+        // it derives and writes every complete block. one shape for both, and a cold start no longer
+        // changes the node set
+        res.mode  = llama_qsa_pool::CACHED;
+        res.wm    = 0;
         res.n_bid = n_bid;
         res.n_new = n_bid;
 

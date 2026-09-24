@@ -18,15 +18,14 @@
 // re-derived from the raw cache on every step
 struct llama_qsa_pool {
     enum mode_e {
-        NONE = 0,    // no usable pool state: derive block keys every step, write nothing
-        REBUILD,     // rows are stale: derive every complete block once and write all of them back
-        CACHED,      // rows [0, wm) are valid: read them and write the blocks that completed since
+        NONE = 0,    // no pool for this graph: derive the block keys every step, write nothing
+        CACHED,      // rows [0, wm) already sit in the pool: read them, write [wm, n_bid), score the result
     };
 
     mode_e   mode  = NONE;
-    uint32_t wm    = 0;   // rows valid before this graph (CACHED)
+    uint32_t wm    = 0;   // rows valid before this graph
     uint32_t n_bid = 0;   // complete blocks this ubatch scores
-    uint32_t n_new = 0;   // rows this graph writes: [wm, n_bid) for CACHED, [0, n_bid) for REBUILD
+    uint32_t n_new = 0;   // rows this graph writes: [wm, n_bid)
 };
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
