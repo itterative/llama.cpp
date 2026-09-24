@@ -13,6 +13,7 @@ struct ggml_prof_region_stat {
     const char * name;
     uint64_t     total_ns;
     uint64_t     max_ns;
+    uint64_t     min_ns;
     uint64_t     count;
 };
 
@@ -47,7 +48,7 @@ static int ggml_prof_region_idx(const char * name) {
 
     const int i = ggml_prof_n_regions++;
 
-    ggml_prof_regions[i] = { name, 0, 0, 0 };
+    ggml_prof_regions[i] = { name, 0, 0, UINT64_MAX, 0 };
 
     return i;
 }
@@ -118,6 +119,7 @@ void ggml_prof_region_end(void) {
     r->total_ns += dt;
     r->count    += 1;
     r->max_ns    = dt > r->max_ns ? dt : r->max_ns;
+    r->min_ns    = dt < r->min_ns ? dt : r->min_ns;
 
     if (ggml_prof_sink && ggml_prof_sink->region_end) {
         ggml_prof_sink->region_end();
@@ -145,16 +147,17 @@ void ggml_prof_report(const char * title) {
     for (int i = 0; i < ord_n; ++i) {
         const ggml_prof_region_stat * r = order[i];
 
-        fprintf(stderr, "[prof]   %-28s %8llu calls %10.2f ms total %8.4f ms/call %8.2f ms max\n",
+        fprintf(stderr, "[prof]   %-28s %8llu calls %10.2f ms total %8.4f ms/call %6.2f..%8.2f ms\n",
                 r->name,
                 (unsigned long long) r->count,
                 r->total_ns * 1e-6,
                 r->count ? r->total_ns * 1e-6 / r->count : 0.0,
+                r->count ? r->min_ns * 1e-6 : 0.0,
                 r->max_ns  * 1e-6);
     }
 
     for (int i = 0; i < ggml_prof_n_regions; ++i) {
-        ggml_prof_regions[i] = { ggml_prof_regions[i].name, 0, 0, 0 };
+        ggml_prof_regions[i] = { ggml_prof_regions[i].name, 0, 0, UINT64_MAX, 0 };
     }
 }
 
