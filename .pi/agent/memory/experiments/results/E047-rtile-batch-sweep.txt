@@ -1,0 +1,43 @@
+E047 raw - rtile vs generic dispatch across query-tile counts (n_q = 1..16)
+
+box: 1x RX 9070 (gfx1201, RDNA4), build c83df91bf+ (worktree with d2319c937 / d3f4928e5), assert build
+     (CMAKE_CXX_FLAGS_RELEASE="-O2 -g3 -fno-omit-frame-pointer")
+command (both arms):
+  GGML_FATTN_DEBUG=1 GGML_FATTN_RDNA_RTILE=<0|1> LD_LIBRARY_PATH=$PWD/build/bin \
+    build/bin/test-backend-ops perf -o FLASH_ATTN_EXT -b ROCm0 \
+    -p "hsk=256,hsv=256,nh=2,nr23=\[12,1\]"
+shape: D=256, 2 KV heads, gqa 12 (24 Q heads), mask=1, f16 KV, n_kv_max=2048 (qwen4exp QSA shape),
+       kv in {4096, 16384, 32768, 131072}, nb in {1, 2, 4, 7, 8, 16}
+kernel attribution: separate one-case-per-invocation runs, same filter plus ",nb=<n>,"; every case
+       reported the kernel on the GGML_FATTN_DEBUG line (see kernel-per-nb.txt in the scratch dir)
+
+arm RTILE=0 (generic dispatch)          arm RTILE=1 (rdna_rtile)
+kv,nb            kernel    us/run        kv,nb          kernel        us/run
+4096,1           tile        32.56       4096,1         rdna_rtile      29.84
+16384,1          tile        98.56       16384,1        rdna_rtile      38.54
+32768,1          tile       189.63       32768,1        rdna_rtile      51.10
+32768,1          tile       189.92       32768,1        rdna_rtile      51.13
+32768,2          tile       438.24       32768,2        rdna_rtile      67.70
+32768,4          tile       442.66       32768,4        rdna_rtile      77.53
+32768,7          mma_f16    160.19       32768,7        rdna_rtile     105.75
+32768,8          mma_f16    177.40       32768,8        rdna_rtile     147.50
+32768,16         mma_f16    308.95       32768,16       rdna_rtile     217.02
+131072,1         tile       778.20       131072,1       rdna_rtile     125.34
+131072,2         tile      2011.22       131072,2       rdna_rtile     144.53
+131072,4         tile      1754.95       131072,4       rdna_rtile     152.45
+131072,7         mma_f16    241.60       131072,7       rdna_rtile     182.65
+131072,8         mma_f16    260.97       131072,8       rdna_rtile     224.64
+131072,16        mma_f16    435.90       131072,16      rdna_rtile     307.48
+
+two 32768,nb=1 rows per arm are expected: one pre-existing case, one added in d3f4928e5; they agree to
+0.15% (189.63/189.92, 51.10/51.13), which is the run-to-run noise floor of this harness.
+
+kernel= lines as emitted (one-case-per-invocation, RTILE=0 then 1):
+  nb=1   tile          nb=1   rdna_rtile
+  nb=2   tile          nb=2   rdna_rtile
+  nb=4   tile          nb=4   rdna_rtile
+  nb=7   mma_f16       nb=7   rdna_rtile
+  nb=8   mma_f16       nb=8   rdna_rtile
+  nb=16  mma_f16       nb=16  rdna_rtile
+  (vec is never selected: gqa_opt_applies is true for gqa 12 + aligned mask, and the unquantized
+   vector path requires !gqa_opt_applies && nb == 1 - fattn.cu:629-645,691-709)
