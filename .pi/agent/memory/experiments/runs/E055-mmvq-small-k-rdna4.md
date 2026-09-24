@@ -90,6 +90,18 @@ comforting, not as evidence.
 What is still not measured here: pp on the box (this run was `-p 0`). Locally pp did not move at all, which
 is the expected result since batch 4096 is above `MMVQ_MAX_BATCH_SIZE` and therefore on mmq.
 
+## Default flipped to on (`855a65544`)
+
+`GGML_CUDA_MMVQ_RDNA4_SMALL_K` now enables by default on gfx1201; `=0` or `=off` restores the upstream
+shape. Verified after the flip: dev-box default 238.06 / 237.41 t/s (was 228.2 with it off), `=0` and `=off`
+both back to 228.2, golden bit-identical under the default. Non-gfx12 builds are untouched by construction
+(`GGML_CUDA_CC_IS_RDNA4` gates it).
+
+**This breaks tg comparability on the branch.** Every decode number recorded before `855a65544` - E050's
+30.12 at d131072, the E052 arm table, anything from E043 - is from a build without small_k, so it sits ~6%
+below what the same command reports now. Re-baseline before comparing against them; the pool A/Bs are still
+internally valid because both arms of each ran on the same build.
+
 ## If this goes upstream
 
 The change as it would need to look is two lines: add `MMVQ_PARAMETERS_RDNA4` to the `calc_rows_per_block`
