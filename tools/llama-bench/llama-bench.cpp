@@ -2413,6 +2413,11 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        // flush the region counters here so the table at exit covers only the measured passes
+        if (ggml_prof_enabled()) {
+            ggml_prof_report("warmup");
+        }
+
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
