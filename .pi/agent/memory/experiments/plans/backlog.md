@@ -1,162 +1,643 @@
 # Backlog - candidate threads, qwen4exp on RDNA4
 
-Not experiments yet. A thread becomes an `E<nnn>` id only when it has a falsifiable
-hypothesis and a deciding metric (see `PROTOCOL.md` 3.1).
+Not experiments yet. A thread becomes an `E<nnn>` id only when it has a falsifiable hypothesis and a
+deciding metric (see `../PROTOCOL.md` 3.1).
 
-Anchors at commit `ebbb18522`. **[v]** = read directly by me, **[s]** = from the `scout-1`
-survey not re-read, **[x]** = corrected after verification. See `../rdna4-rocm-build`
-memory for the full HIP/RDNA4 backend picture, and `model-shape.md` for real dims.
+Anchors at commit `ebbb18522`. Markers: **[v]** read directly by me, **[s]** from the `scout-1` survey
+and not re-read, **[x]** corrected after verification. Backend picture lives in
+`../../rdna4-rocm-build.md`; real dims in [model-shape.md](model-shape.md).
+
+Format: one item per `###` heading, `id - question`, with the fields as bolded labels underneath. A
+struck-through id means the thread is answered or dead; the answer stays inline, because these notes
+are why later experiments were scoped the way they were.
+
+**Live right now:** H9's prefill regression (the open question on a feature that is already built),
+H18 (the MTP tax), E008b (the measurement that decides the whole PLE/prefetch line), H17b, and the
+H13 leftovers.
+
+---
 
 ## Prerequisites
 
-| id | thread | why it blocks |
-|---|---|---|
-| B0 | make the build un-shadowable: **rpath**, since `GGML_STATIC` is a hard `FATAL_ERROR` on the HIP path | `BUILD_SHARED_LIBS=ON` + `~/.local/lib64` holding a Sep 15 llama.cpp means an unpinned run silently measures old code. Found in E001. `CMAKE_BUILD_RPATH=$PWD/build/bin` is the one-line fix |
-| B1 | ~~triage `test-backend-ops` crashing on AMD GPUs~~ **closed on the dev box** | it does not crash here: 1500/1500 non-FA and 3973/3979 FA cases pass on gfx1201 / ROCm 6.4.4, so rule 3 has a working gate (E001 update). **Re-baselined on 7.1.1 in E019: 5633 OK / 7 FAIL, all the known FA 192/128 family; capture works here now; `-j 1` only.** The bench-box hang the user remembers is real but box-specific - candidates are the 4-GPU config, its ROCm version, or its code state, all B2 unknowns. Two sharp edges to keep in mind: no insufficient-memory skip logic (oversized case OOM-aborts) `[s]`, and `-b` is an exact `strcmp` that exits 0 having tested nothing on a typo `[v]` |
-| B2 | bench box: ROCm version, PCIe topology, system RAM | gfx target is now known: **gfx1201 on both boxes** (user-confirmed), so a dev build is ISA-valid there. What remains decides whether numbers are comparable, not whether binaries run |
-| ~~B3~~ | ~~decide the dev-box ROCm version policy~~ **resolved: upgraded** | The user moved the dev box to Fedora 44 / ROCm 7.1.1 on 2026-09-17, so the predicted comparability break is now real: **every v1 dev number (E001, E002) sits on the old stack**, and hw profile v2 must be re-established before dev results are usable. Predicted upside that is now testable locally: graph capture (never succeeded under 6.4, works on the bench), and FA family selection pp vs decode |
-| B5 | **rebuild the dev tree against ROCm 7.1.1** | `build/` is unloadable, verified: its `libggml-hip.so` still `NEEDED`s `libamdhip64.so.6` / `librocblas.so.4` / `libhipblas.so.2`, all of which the upgrade deleted, so the `LD_LIBRARY_PATH` pin cannot save it. Flags are unchanged (the prefix `/usr/lib64/rocm` is the same); hazard: the upgrade also removed `compiler-rt18` and `libomp18` |
-| B4 | **pull in the bench box's fork changes** (user-requested) | The fork at `c9a59ef73` carries three things this branch lacks, each already proven useful on this exact hardware: **(1) RDNA4 MMQ fixes**, **(2) a custom AllReduce** (RCCL does not work on that setup - and here `GGML_HIP_RCCL=OFF` plus the `#ifndef GGML_USE_HIP` guard on the "rebuild with NCCL" warning means the fallback to internal AllReduce is *silent*), **(3) `-sm tensor` enabled for qwen4exp**. Ordering matters: the user reports the P2P parts **conflict with recent upstream changes**, so MMQ should land first and the AllReduce last. Measure after each - three separate A/Bs, not one unresolvable blob |
+### B0 - make the build un-shadowable
+
+- **Why:** `BUILD_SHARED_LIBS=ON` plus `~/.local/lib64` holding a Sep 15 llama.cpp means an unpinned
+  run silently measures old code. `GGML_STATIC` is a hard `FATAL_ERROR` on the HIP path, so rpath is
+  the fix: `CMAKE_BUILD_RPATH=$PWD/build/bin`. Found in E001.
+- **Status:** open, and still relevant - this session lost several runs to it again. The current
+  workaround is `LD_LIBRARY_PATH=$PWD/build/bin` plus an `ldd` check before every measurement.
+
+### B1 - `test-backend-ops` on AMD GPUs
+
+- **Status:** closed on the dev box. It does not crash: 1500/1500 non-FA and 3973/3979 FA cases pass on
+  gfx1201 / ROCm 6.4.4, so rule 3 has a working gate (E001 update). Re-baselined on 7.1.1 in E019:
+  **5633 OK / 7 FAIL**, all the known FA 192/128 family; capture works here now; `-j 1` only.
+- **Still open:** the bench-box hang the user remembers is real but box-specific - candidates are the
+  4-GPU config, its ROCm version, or its code state, all B2 unknowns.
+- **Two sharp edges:** no insufficient-memory skip logic, so an oversized case OOM-aborts `[s]`; and
+  `-b` is an exact `strcmp` that exits 0 having tested nothing on a typo `[v]`.
+
+### B2 - bench box facts still unknown
+
+- ROCm version, PCIe topology, system RAM. The gfx target is now known: **gfx1201 on both boxes**
+  (user-confirmed), so a dev build is ISA-valid there. What remains decides whether numbers are
+  comparable, not whether binaries run.
+
+### ~~B3 - dev-box ROCm version policy~~ resolved: upgraded
+
+- The user moved the dev box to Fedora 44 / ROCm 7.1.1 on 2026-09-17, so the predicted comparability
+  break is real: **every v1 dev number (E001, E002) sits on the old stack**, and hw profile v2 must be
+  re-established before dev results are usable. Predicted upside now testable locally: graph capture
+  (never succeeded under 6.4, works on the bench) and FA family selection pp vs decode.
+
+### B5 - rebuild the dev tree against ROCm 7.1.1
+
+- `build/` was unloadable, verified: its `libggml-hip.so` still `NEEDED` `libamdhip64.so.6` /
+  `librocblas.so.4` / `libhipblas.so.2`, all deleted by the upgrade, so the `LD_LIBRARY_PATH` pin cannot
+  save it. Flags are unchanged (the prefix `/usr/lib64/rocm` is the same). Hazard: the upgrade also
+  removed `compiler-rt18` and `libomp18`.
+- **Status:** presumably done - E019 re-baselined the ops gate on 7.1.1 on this box, which required it.
+  Close formally on the next clean configure.
+
+### B4 - pull in the bench box's fork changes (user-requested)
+
+- The fork at `c9a59ef73` carries three things this branch lacks, each already proven useful on this
+  exact hardware: **(1) RDNA4 MMQ fixes**, **(2) a custom AllReduce** (RCCL does not work on that setup
+  - and here `GGML_HIP_RCCL=OFF` plus the `#ifndef GGML_USE_HIP` guard on the "rebuild with NCCL"
+  warning means the fallback to internal AllReduce is *silent*), **(3) `-sm tensor` enabled for
+  qwen4exp**.
+- **Ordering matters:** the user reports the P2P parts **conflict with recent upstream changes**, so
+  MMQ lands first and the AllReduce last. Measure after each - three separate A/Bs, not one
+  unresolvable blob.
+
+---
 
 ## Likely bottlenecks (this is where the effort should go)
 
-| id | thread | why |
-|---|---|---|
-| L1 | **is the Q5 n-gram table actually resident?** | `-lzm auto` lazy-reads any tensor over 4 GiB (`src/llama-model-loader.cpp:1088-1100`) `[v]`, so a ~33 GB table is probably served from the page cache on demand, not held in RAM. Check the existing load log for `lazy read enabled`, then A/B `-lzm off` / `auto` / `--load-mode mmap+mlock` on `tg` stability. Zero code change, no rerun to diagnose, and irregular `tg` over a 20 M-row random gather is exactly its signature |
-| L2 | PLE placement is *suspected* of costing tg - unresolved | the table is the `ggml_get_rows` source at `src/models/qwen4exp.cpp:1202`. On CPU: host gather + H2D copy + split, and the n-gram hash is already host-side (no int64/xor in ggml). **Whether that is what costs 35 ms/token is unknown** - the user's own read is "hard to say". Putting the table on GPU is not an option (mirrored, ~30 GB/card), so the earlier "keep it on GPU" framing here was wrong. Next step is measuring faults, not building: `ple-prefetch.md` method 1 = `iostat` during a decode run, zero code |
-| L3 | 10-of-512 expert routing on HIP | `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`. ~2% of expert weights touched per token per layer, so `tg` is a scattered-read problem. Good news from the survey: `should_use_mmq` is **unconditionally true on RDNA4** (`mmq.cu:380-382`) `[s]` and MMQ tile selection is already expert-aware (`mmq.cu:248-251`) `[s]`, so the machinery is tuned for this - the open question is `-sm layer` imbalance across 4 cards |
-| L4 | 16 GB of fp32 recurrent state | `mamba_ssm_dtype: float32` x 36 linear-attention layers with key 2048 / value 6144 wide. State size is a fixed VRAM tax that competes with the 262 k context, and it resists fp16 tricks |
+### L1 - is the Q5 n-gram table actually resident?
+
+- `-lzm auto` lazy-reads any tensor over 4 GiB (`src/llama-model-loader.cpp:1088-1100`) `[v]`, so a
+  ~33 GB table is probably served from the page cache on demand, not held in RAM.
+- **Next:** check the load log for `lazy read enabled`, then A/B `-lzm off` / `auto` /
+  `--load-mode mmap+mlock` on `tg` stability. Zero code change, no rerun to diagnose, and irregular
+  `tg` over a 20 M-row random gather is exactly its signature.
+
+### L2 - PLE placement is *suspected* of costing tg, unresolved
+
+- The table is the `ggml_get_rows` source at `src/models/qwen4exp.cpp:1202`. On CPU that is host gather
+  + H2D copy + split, and the n-gram hash is already host-side (no int64/xor in ggml).
+- **Whether that is what costs 35 ms/token is unknown** - the user's own read is "hard to say". Putting
+  the table on GPU is not an option (mirrored, ~30 GB/card), so the earlier "keep it on GPU" framing
+  here was wrong.
+- **Next:** measure faults, do not build. `ple-prefetch.md` method 1 = `iostat` during a decode run,
+  zero code. See E008b.
+
+### L3 - 10-of-512 expert routing on HIP
+
+- `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`: ~2% of expert weights touched per token
+  per layer, so `tg` is a scattered-read problem.
+- Good news from the survey: `should_use_mmq` is **unconditionally true on RDNA4** (`mmq.cu:380-382`)
+  `[s]` and MMQ tile selection is already expert-aware (`mmq.cu:248-251`) `[s]`, so the machinery is
+  tuned for this. The open question is `-sm layer` imbalance across 4 cards.
+
+### L4 - 16 GB of fp32 recurrent state
+
+- `mamba_ssm_dtype: float32` x 36 linear-attention layers with key 2048 / value 6144 wide. State size is
+  a fixed VRAM tax that competes with the 262 k context, and it resists fp16 tricks. Note that
+  `n_rs_seq` multiplies it again - see H18.
+
+---
 
 ## Closed by the survey (do not re-probe)
 
-| id | was | now |
-|---|---|---|
-| P1 | which ops fall off the GPU | **now measured, not merely reasoned:** `test-backend-ops support -b ROCm0` over 13 families -> 9906 supported / 2384 unsupported cases, and the non-FA `test` run passed 1500/1500 `[v]`. Every op in the graph has a real HIP kernel. Remaining escape hatches: elementwise contiguity gates, and `ARGSORT` needing `ne[0] <= 1024` `[v]` - real `num_experts = 512`, so the router stays on GPU |
-| P4 | which FA family does gfx1201 get | **`mma_f16` for prompt processing, not for decode.** `amd_wmma_available` + DK 256 + `gqa_ratio_eff 4` gives threshold `Q->ne[1]*4 > 16` (`ggml/src/ggml-cuda/fattn.cu:667-671` `[v]`, `(256,256,*)` instances exist `[v]`). Decode of 1 token falls to tile/vec. Since sparse FA lives only in `mma_f16`, H4b is a **pp-only** win - which is where long-context cost is anyway |
-| H3 | HC kernels may be shape-restricted | **not on HIP.** The gate is dtype-only, all-F32, no shape restriction (`ggml-cuda.cu:5492-5501`) `[v]`. The `ne[1] == 4` rule I feared is Metal/Vulkan's. Replaced by N1 below |
-| P5 | does the model fit | capacity is not the constraint on this box; see `model-shape.md` |
+### ~~P1 - which ops fall off the GPU~~ measured
+
+- `test-backend-ops support -b ROCm0` over 13 families -> 9906 supported / 2384 unsupported cases, and
+  the non-FA `test` run passed 1500/1500 `[v]`. Every op in the graph has a real HIP kernel.
+- Remaining escape hatches: elementwise contiguity gates, and `ARGSORT` needing `ne[0] <= 1024` `[v]` -
+  real `num_experts = 512`, so the router stays on GPU.
+
+### ~~P4 - which FA family does gfx1201 get~~ `mma_f16` for prompt processing, not for decode
+
+- `amd_wmma_available` + DK 256 + `gqa_ratio_eff 4` gives threshold `Q->ne[1]*4 > 16`
+  (`ggml/src/ggml-cuda/fattn.cu:667-671` `[v]`, `(256,256,*)` instances exist `[v]`). Decode of 1 token
+  falls to tile/vec. Since sparse FA lives only in `mma_f16`, H4b is a **pp-only** win - which is where
+  long-context cost is anyway.
+
+### ~~H3 - HC kernels may be shape-restricted~~ not on HIP
+
+- The gate is dtype-only, all-F32, no shape restriction (`ggml-cuda.cu:5492-5501`) `[v]`. The
+  `ne[1] == 4` rule I feared is Metal/Vulkan's. Replaced by N1 below.
+
+### ~~P5 - does the model fit~~ capacity is not the constraint on this box
+
+- See `model-shape.md`.
+
+---
 
 ## New, from the survey
 
-| id | thread | anchor |
-|---|---|---|
-| N1 | **`RMS_NORM+MUL+ROPE` fusion is rejected for qwen4exp because it is IMROPE** | the 3-node fusion accepts only `GGML_ROPE_TYPE_NORMAL`/`NEOX` (`ggml/src/ggml-cuda/ggml-cuda.cu:2734-2735`) `[v]` and `llama-model.cpp:3063-3070` gives this arch `IMROPE` `[s]`. Self-contained, clearly-scoped fusion gap on 12 full-attention layers |
-| N2 | a quantized KV cache may not be usable | `SET_ROWS` dst whitelist excludes **Q4_K/Q5_K/Q6_K** `[s]`, and qwen4exp writes KV through `cpy_k`/`cpy_v` = `set_rows`. If anyone tries a Q4_K KV cache to fit 262 k context, that is a support failure, not a slowdown |
-| N3 | `GGML_CUDA_DEVICES` makes multi-device testable on the 16 GB box | it exposes N *virtual* devices round-robined over physical GPUs (`ggml-cuda.cu:235-259`) `[v]`. So `-sm layer` split behaviour, per-device balance and split counts become **T1**, not T2-only. Directly upgrades H1 |
-| N4 | verify `__GFX12__` is actually emitted for gfx1201 | device-side RDNA4 paths hinge on `vendors/hip.h:215-217` (`__GFX12__ -> RDNA4`) `[s]`, never compiled-and-checked. If absent, every `#if defined(RDNA4)` device branch is dead while host-side `IS_RDNA4(cc)` still claims RDNA4 - a half-tuned build that looks fine |
-| N5 | HC inputs are F32-only | the gate requires f32 for all HC operands `[v]`, so any fusion or cast that lands f16 there silently leaves the fused path. Constraint on H2, not an experiment |
+### N1 - `RMS_NORM+MUL+ROPE` fusion is rejected for qwen4exp because it is IMROPE
+
+- The 3-node fusion accepts only `GGML_ROPE_TYPE_NORMAL`/`NEOX`
+  (`ggml/src/ggml-cuda/ggml-cuda.cu:2734-2735`) `[v]` and `llama-model.cpp:3063-3070` gives this arch
+  `IMROPE` `[s]`. Self-contained, clearly-scoped fusion gap on 12 full-attention layers.
+
+### N2 - a quantized KV cache may not be usable
+
+- `SET_ROWS` dst whitelist excludes **Q4_K/Q5_K/Q6_K** `[s]`, and qwen4exp writes KV through
+  `cpy_k`/`cpy_v` = `set_rows`. If anyone tries a Q4_K KV cache to fit 262 k context, that is a support
+  failure, not a slowdown.
+
+### N3 - `GGML_CUDA_DEVICES` for multi-device testing
+
+- `[x]` **does not work on this box.** It exposes N *virtual* devices round-robined over physical GPUs
+  (`ggml-cuda.cu:235-259`) `[v]` and takes a *count*, but requesting more devices than exist dies with
+  `invalid device ordinal` on HIP, so `-sm layer` split behaviour and split counts stay T2-only here.
+- What *is* usable on 1 card: `-sm tensor` still routes through `ggml-backend-meta.cpp` with
+  `n_backends = 1`, which is how the meta-backend crash (E044/E045) was reproduced locally at all.
+
+### N4 - verify `__GFX12__` is actually emitted for gfx1201
+
+- Device-side RDNA4 paths hinge on `vendors/hip.h:215-217` (`__GFX12__` -> RDNA4) `[s]`, never
+  compiled-and-checked. If absent, every `#if defined(RDNA4)` device branch is dead while host-side
+  `IS_RDNA4(cc)` still claims RDNA4 - a half-tuned build that looks fine.
+
+### N5 - HC inputs are F32-only
+
+- The gate requires f32 for all HC operands `[v]`, so any fusion or cast that lands f16 there silently
+  leaves the fused path. Constraint on H2, not an experiment.
+
+---
 
 ## Hypothesis-ready (write the record, then run)
 
-| id | thread | anchor / rationale |
-|---|---|---|
-| H1 | ~~`-sm tensor` unavailable for qwen4exp forces layer split~~ **revised by E005** | This branch *throws* for `-sm tensor` on qwen4exp: `llm_arch_supports_sm_tensor` returns false (`src/llama-arch.cpp:1161`) and `llama_model_create` raises `LLAMA_SPLIT_MODE_TENSOR not implemented` (`src/llama-model.cpp:358`). **But the user runs tensor split on the bench box**, so their fork enables it - and merging forward will break their command line until that patch comes along (B4). The upstream guard is test-driven (`// TODO: fix test-llama-archs`), i.e. the blocker is the dummy model, not the backend. This row previously claimed layer split was forced; it was not, and that error cost a detour. **E006: tensor wins tg, as the user expected.** For pp the general rule is the *opposite* - layer usually wins, because layers pipeline across cards and the transfers hide behind inter-layer compute overlap - so this run's layer-loses-pp result is an anomaly, not a rule, and it is now read as a symptom of the CPU split (F3, E007b). The guard stays an obstacle to clear in B4 |
-| H2 | the hyper-connection chain is under-optimised on HIP | HC replaces every per-layer norm, so it is per-layer and every-token in both modes. Only `_PRE`(gated) and `_POST`(comb=null) are emitted `[x]`; both are f32-only `[v]`; and `rms_norm+mul` fusion was only just enabled (`41abbfd59`). New kernels are usually correct before they are tuned. Bounded by N5 |
-| H4a | stop paying the indexer + mask-rebuild tax while compaction is unavailable | mask rebuild is `fill(-INF)` + `set_rows` + `add` per full-attn layer per ubatch (`src/models/qwen4exp.cpp:735-758`) `[v]` - traffic scaling with context for a mask whose interior the kernel ignores. `:566` already trims the upload to `1/ratio` of cells. Obsolete the moment H4b lands. **Corrected by E024: H4b landed and this tax is small** - the mask tensors are `O(n_kv)` f16 (~0.3 MB/layer/step at 40k), while the indexer gather and pooling next to them are ~50 MB. Deprioritised in favour of H9; the per-ubatch cost that matters at prefill is `O(n_blocks x n_tps)`, which is host-side (E021) |
-| H4b | port the mask compaction to HIP, then flip `n_kv_max` | narrowed by the survey to: one warp-ballot kernel (`fattn.cu:10-89`, `WARP_SIZE == 32` which gfx1201 has, but `ggml_cuda_pdl_*` are NVIDIA-only), the `#if !defined(GGML_USE_HIP)` compile guards (`:92-96`, `:109-113`, `:133-140`) `[v]`, and the call site (`qwen4exp.cpp:767`) `[v]`. **Updated by E001: flipping the call site first is inert, not a safe first step** - sparse cases already report SUPPORTED and compute dense, so results and cost are unchanged either way. Effect size: `indexer_budget 2048` of 262,144 context, on 12 of 48 layers, pp-only per P4. **DONE by E020** - ported and measured: pp512 +23.3% @40k / +58.5% @164k, tg flat on the pre-rtile build (superseded by E043: with rtile + block
-  selection the sparse arm is ~1.4 ms/token/GPU cheaper than dense at 131k decode), numerics match dense to 6e-7. P4's list was short three items: the `__ballot_sync` 64-bit mask signature, the `may_use_sparse` DKQ whitelist, and the fact that RDNA has no FA device code below 16 tiles so the tiling must be 1x16 and had to be added to `generate_cu_files.py` |
-| H5 | PLE n-gram hashing | `ple_n_heads = (3-1)*8 = 16` gathers per token from a ~20 M x 2560 table = ~51 B params = 28% of the model, serving one layer, hashed host-side. Superseded in priority by L1/L2 |
-| H6 | fp32 output preference on RDNA4 | `prefer_f32_output` is forced on for RDNA4 (`ggml-cuda.cu:1512`, `:1514`) `[v]`, and `mmvq.cu:417-492` has an RDNA4-only `nwarps` whitelist `[s]`. Confirmed as real, still unmeasured: a per-model override is a plausible small win |
-| H7 | VMM disabled | `GGML_HIP_NO_VMM` defaults ON, and the `VMM: no` banner is just that flag, not a device query `[s]`. Allocation/fragmentation behaviour differs from a CUDA default - relevant to both the 16 GB box and a 4-card split |
-| H8 | `GGML_HIP_RCCL=OFF` | and the "rebuild with NCCL" warning is `#ifndef GGML_USE_HIP`, so without RCCL the fallback to internal AllReduce is **silent** `[s]`. Only worth a record once B2 reports the topology |
-| H12 | **put the PLE table in VRAM instead of streaming it** | the structural version of H11. The table is 32.8 GiB (Q5_0, 51.2 B params) and 29% of the file, and it is mirrored across cards, so it cannot be placed on GPU as it stands (E007). Split 4 ways it is 8.2 GiB per card against ~10 GiB currently free, so it *would* fit - the size is no longer the obstacle, E031 is: once `-lzm on-direct` removed the demand faults, the table costs 1760 bytes of reads per token, which is nothing. **Dead on cost/benefit; kept as the record of what the streaming was.** E014 (resident table, `-lzm off`) is the variant that is now feasible and worth a flag-only run, because 32.8 GiB fits in the box's RAM |
-| H11 | **prefill runs the GPUs at 20-30% while decode sits near 100%** | reported by the user on the bench box, present before *and* after the rebase, so it is not a merge artifact. This is inverted: prefill is the compute-bound phase (512-8192 tokens per ubatch through 48 layers of MoE GEMMs) and should be the one saturating the cards, while decode is small-kernel and collective-bound. Three readings, in the order I would kill them: **(1) the 100% on decode may not be work** - `amd-smi`/`rocm-smi` utilisation counts any resident kernel, so a spin-wait custom/p2p AllReduce reads as busy; E005 measured **9% util during decode** on this same box, which is either the opposite truth or a different sampling window, and both cannot be right. **(2) prefill may be host-serialised between ubatches** - per-ubatch host work exists (`set_input_qsa` bias fill measured at 4-6 ms per ubatch at 25-30k on the dev box, E021; input construction and the QSA mask rebuild), but 512 tokens at pp512@131k is ~1.3 s of wall time, so a few ms of host work cannot hide 70% of the card. **(3) something in the pp path is genuinely GPU-idle** - cross-card sync per layer with tensor split, MoE expert dispatch with a device->host count read forcing a sync, or graph rebuild when ubatch shapes change (E010: one build is ~20-22 ms; pp changes n_kv as the cache grows, so a reuse miss would stall). Discriminator, cheapest first: define the measurement (tool, per-device vs per-process, window), then compare pp and tg util **on the dev box with the dummy** - one GPU, no collectives, same model code. If prefill under-runs there too, the cause is in the single-card pp path and not in the 4-card topology, and it becomes measurable with the graph-reuse and node-count probes already built | **Superseded in likelihood by the user's n-gram streaming hypothesis, which the arithmetic supports**: the hw profile has the PLE table as Q5 in **system RAM** at ~30-36 GB, and the box has **62.7 GiB** (the "32g" in the profile name is not RAM - corrected after the screenshot), so the table can be cached but the 111 GB file cannot - it is served by page-cache misses from SSD, and the table ranges deliberately get `POSIX_MADV_RANDOM` (read-ahead off) with `MAP_POPULATE` skipped and no `WILLNEED` (`plans/ple-prefetch.md`, F1). That predicts exactly the asymmetry seen: prefill issues thousands of scattered single-page reads per ubatch and starves the cards, while decode does 16 lookups per token and mostly hits what is warm. E017's A/B is the same effect at smaller scale: 35.2 GB table gave pp4096 6017 t/s, 3.7 GB gave 6407 (**+6.5% pp**) with **tg unchanged** (182.14 vs 182.40). See E008b for the measurement that settles it. Caveat: llama-bench may be *amplifying* it (E030) | **Screenshots in `results/user/prefill-ssd-probable-issue/` (gitignored, local-only) support the
-paging story rather than replacing it**: all four GPUs at **26% util** at the same time, **~70 W**
-each, and **load average ~1.2** on a many-core box - so neither the GPUs nor the CPU are working,
-the process is waiting. VRAM 22 of 32 GiB per card, so weights are resident and this is not a GPU
-memory problem. The disk panel shows the root device busy at **~66 MB/s of reads** (`▲` is read; the
-`swap 7.00 GiB` row is the swap *size*, not usage, and no swap-in was observed). The rate itself is
-the useful number: 66 MB/s is nothing for an NVMe device, and at 4 KiB pages that is roughly
-**16k reads/s**, i.e. the device is latency/IOPS-bound on random single-page accesses, which is
-exactly what `MADV_RANDOM` over a scattered n-gram gather produces. That puts F1 back in play with
-a concrete mechanism: prefill knows every token of the ubatch up front, so the row set is
-predictable and `WILLNEED`/`readahead` can coalesce what is now ~16k independent page reads/s.
-Still unresolved and cheap to settle: whether any of it is swap (`vmstat` `si`/`so`, majflt/s),
-which is what E008b now asks for |
-2026-09-18) shift the diagnosis from "table reads" to "box is over-committed": all four GPUs sit at
-**26% util** simultaneously while **load average is ~1.2** and power draw is 69-73 W per card, so
-neither the GPUs nor the CPU are doing work - the process is waiting. VRAM is 22 of 32 GiB per card,
-i.e. weights are resident and this is not a GPU-memory problem. The disk panel shows the root device
-busy with **~66 MB/s of writes** and **swap at 7 GiB**. Reads alone would fit the PLE-table story;
-sustained writes plus 7 GiB of swap means the kernel is pushing anonymous memory out to make room
-for table pages. The table is a CPU tensor by construction (E007: `-ot` is inert for lazy ranges
-over 4 GiB) at ~30-36 GB against 32 GB of RAM, so it cannot be resident and is partly swapped.
-Consequence: F1's `WILLNEED` prefetch can only batch re-reads of pages that are still in the cache;
-if they were evicted to swap, the fix is capacity, not scheduling - smaller table (E029), more RAM,
-or an actual split of the conv across cards, which E007 established does not exist |
-| H13 | select QSA at block level, then expand, as the paper does | **implemented and measured on the dev box (E039): +6.3% tg / +6.8% pp at 164k, +2.3% / +2.0% at 40960, flat at 8192, deep-arm PPL +8e-8, shallow golden corpus bit-identical, ops gate green.** Same-binary A/B through the temporary `Q4EXP_CELL_SEL` gate. What it deletes: the `n_kv` expand gather, both `cont(permute)` copies, the f32 per-cell mask add, top-k over `n_kv` (11 dependent launches, 4x less input now), and `cell_blk` with its O(n_kv) host fill since the expand was its only consumer. Pending: the bench A/B at `-d 131072` on the real model, where the GPU terms are x12 but the host fill stays per-step, so the dummy's percentage need not transfer. Afterwards the gate and the per-cell path come out (the `!blk_bias` fallback is a different thing and stays. **Bench (E040): tg +7.2% and pp +22-23% at 131k, but that delta also contains the rtile decode path and the per-build `n_kv_max` fix, and rtile cannot move prefill, so the pp share is not attributable to H13 without one more run at the same build with `Q4EXP_CELL_SEL=1`** | prefill |
-| H17 | ~~is the QSA selection global or per-device under `-sm tensor`?~~ | **no correctness bug.** `src/llama-model.cpp:511-514` maps `cache_idx_(k|v)_l*` to `SPLIT_AXIS_MIRRORED` ("the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split") and that rule came with upstream's own qwen4exp commit `6c84c7d5d`; the bench load log confirms it (main cache 198.00 MiB logical vs a 49.50 MiB buffer = quartered, indexer cache 24.75 MiB logical vs a 24.75 MiB buffer = whole), so every device sees all cells and the top-k is global, as the bench probe line showed (`nkv=4352`, `gqa=12`). The mirror costs ~384 MiB/card at 131k. **Cost half is open as H17b.** Note also that `-sm tensor` for this arch is a fork-local `tmp:` change: `a8b24dfdf` deletes `case LLM_ARCH_QWEN4EXP: // TODO: fix test-llama-archs` and adds `ggml_build_forward_expand(gf, res_hc)` to pin `hc_init` into layer 0's graph split - so every bench number in this directory was measured with that workaround in place | see H17b |
-| H17b | is the QSA chain replicated into all four device sub-graphs under `-sm tensor`? | `src/llama-model.cpp:512` mirrors the indexer cache, so every device *can* run the whole chain, and `a8b24dfdf` shows the graph is partitioned into per-device sub-graphs with nodes landing in whichever split they are anchored to - the fix there was forcing a node into the first layer's split. If the chain's ~41 nodes per QSA layer are copied into all four sub-graphs, ~3/4 of its work is redundant and "run it once, broadcast the 2051 indices" beats H9 and H13 combined. **My earlier claim that replication is ruled out by wall clock is withdrawn**: it assumed a card here costs what my dev box costs, and if an R9700 is ~2x an RX 9070 then a 4x-replicated chain (~17 ms/token at 131k) also fits the measured 15.5 ms gain. Decisive without a profiler, four arms at `-d 40960 -p 0 -n 64 -r 1` with the other flags unchanged: (`-sm tensor`, `-sm layer`) x (chain on, `Q4EXP_NO_INDEXER=1`). Under `-sm layer` each layer and its chain live on exactly one device, so that gap is the un-replicated baseline; a tensor-mode gap ~4x larger means replication | decode, correctness of cost model |
-| H10 | mmq cutoff tuning for MoE models | **added by the user after E026.** Their RDNA3/4 mmq retune has not fully landed, and the dummy showed pp512 -11.2% at 40k from it while decode was flat. The `mmq` cutoff/selection that decides when a quant matmul takes the tensor-core path is not adjusted for MoE shapes (many small expert GEMMs at large batch), and upstream does not have those changes yet. Track separately from the sparse/QSA line |
-| H9 | cache pooled indexer block keys (coarse cache) | **added by E024, deliberately left undecided.** `build_qsa_top_k` re-gathers the whole raw indexer cache and re-pools it every step: ~76 MB and ~33 graph nodes per QSA layer per step at 40k, about 2x dense attention and ~19x sparse attention post-E020, and unlike the host fix this *is* per layer, so 12x on the real model. Block keys are immutable once a block's `r` tokens are written, so a coarse cache would delete the gather (~21 MB) and the `r` pooling passes (~29 MB). **Why it is not a small change:** block membership is a function of *position*, and `seq_add` / `seq_div` (context shift) rewrite positions, invalidating the coarse cache wholesale - so it needs an O(n_kv) rebuild path anyway, plus the new tensor threaded through `seq_cp`/`seq_keep`/eviction/defrag/`n_pad`/state save-load in `llama_memory_hybrid_idx`. Several hundred lines in the subsystem where bugs are silent. **Measured by E042+E043 (decode-only traces, 131k): the whole family - gather, 4 rect copies, pooling adds, scale, norm, rope - is 11.1 ms/token/GPU = 84% of the chain, 35% of the qsa arm's device time, and it is output-neutral** (block keys are static once a block completes; block start positions never move). E037's 36% was wrong - it excluded norm and rope as "position-dependent", and E025 is obsolete: the prize is now measured. **BUILT in `d8bce4e25` (E044), gate `Q4EXP_POOLED`, default off, bit-identical to the gate-off build on every dev-box test in E044's table; the 4-card A/B is the remaining step.** Shape as designed in [h9-pooled-block-keys.md](h9-pooled-block-keys.md): a mirrored f32 [idx_dim, n_blocks, n_stream] pool tensor inside the existing idx cache, written in the graph that writes the raw keys with existing ops, watermark + recorded-run invalidation, today's chain as the rebuild and the fallback. 491 lines across 6 files, no new kernel, no new file. The invalidation surface turned out to be the wrapper's own seq ops plus one branch in `apply()` - smaller than feared, but the *correctness* traps were elsewhere: an input with no consumer gets no host buffer (SIGSEGV), and the rebuild write-back must target the pool, not the chain tensor it just read (E044 findings 4 and 6). A third trap was operational, not arithmetic: speculative rollback arrives as a checkpoint `state_read`, not a partial `seq_rm` (GDN refuses that), so clearing the run there re-derives everything on nearly every step - fixed by clamping the watermark to the surviving blocks (E045, `90b9ccf9d`). **Open:** the 4-card box shows tg +30% at 131k but **pp -16..-22% at every depth**, unlocalized (needs pool=0 on the same build + a -ub sweep), and the pool taxes 354 MiB/card at ctx 245760, so f16 storage or persisting it in the checkpoint blob are on the table |
-| H14 | ~~is the model dispatch-bound at decode?~~ | **closed by E038: no.** The chain's device time is 12.2 ms/token at 131k against the 15.5 ms/token measured gain from `Q4EXP_NO_INDEXER`, so 79% of the effect is kernels, not launch gaps. The earlier 612-launches/token figure was wrong twice over (3 chain builds per token, and per-call counts normalized across phases). Keep only as a footnote: graphs-off costs ~7% of tg on the dev box (E008) | dead end |
-| H15 | keep the indexer gather and pooling in f16 | **mostly superseded by H9/E044**: in the `CACHED` variant the gather, the pooling, the norm and the rope are gone, so the only f32 traffic left is the pool read under the score matvec. The remaining version of this item is the plan's P3: store the pool as f16, which halves that read (0.59 -> ~0.3 ms/token/GPU) but rounds the cached key, so selection can move last-bit and the golden would need re-baselining. Keep the original note for the `REBUILD`/fallback path, where the gather is still f16 -> f32 | prefill, decode |
-| H16 | the 4-card reduce is NCCL, and it is 22% of device time | E037: `ncclDevKernel_Generic_4` is **163,124 calls, 22.0 s** in the chain-off arm and 22.2 s in the chain-on arm, i.e. 96 collectives per graph build (2 per layer) at **135 us each** for a 2560-wide f32 activation. It is identical with the chain off, so QSA does not cause it, but it is bigger than any single chain term and the user's fork carries a commit about RDNA4 p2p across PCIe - if that path is
-  meant to replace the NCCL collectives, it is not active in this build. **E038 makes it bigger**: 95.5 s
-  at 131k with calls x1.21, so per call 136 -> 485 us even though the payload size is depth-independent -
-  that is peer-wait, i.e. imbalance exposure growing with depth, and it is ~15 ms/token of a ~45 ms/token
-  step, the same order as the whole chain. Ask before chasing: user says not an issue | decode, 4-card |
+### H1 - ~~`-sm tensor` unavailable for qwen4exp forces layer split~~ revised by E005
 
-| H18 | why does `draft-mtp` cost a third of decode throughput on the 4-card box? | user's numbers at ctx 245760, same build either side of the clamp commit: no spec **34.86 t/s** (28.7 ms/token), mtp after `90b9ccf9d` **23.06 t/s** (43.4 ms, accept 0.26), mtp before **21.5 t/s** (46.5 ms, accept 0.23). The arithmetic makes it a fixed-cost problem: `n_max = 6` at 0.26 accepted-per-position is ~2.5 tokens per step, so a step costs ~111 ms, the verify pass is ~28.7 ms of that, leaving **~13.7 ms per draft replay** for a 1-layer draft whose FLOPs are ~1/64 of the target's. Three candidate sources, all host/dispatch side: (a) `common.cpp:1311` and `speculative.cpp:2554` force `n_rs_seq = 0` on the *draft* ctx, so any draft-side rewind is a checkpoint = `llama_state_seq_{get,set}_data_ext` copies per step; (b) every draft token is sampled and read back to host to build the next batch, i.e. 6 sync points per step, on a box E039/E042 already measured as gap-dominated; (c) under `-sm tensor` the meta dispatch cost is per sub-graph, so 6 extra replays carry the overhead of 6 extra layers. Cheapest diagnostics first: scale `--n-draft 1,2,4,8` (linear in count = fixed per-replay, sub-linear = compute), then one rocprofv3 pair of MTP decode vs plain (E042 method) to split device ms from wall ms, then grep their load log for how many caches the draft ctx actually builds. Two things this item also explains: **the VRAM price of the same feature**, since `need_n_rs_seq()` returns `draft.n_max`, so at `n_max = 6` the target's recurrent cache is 7x108 = **756 MiB** (their log) instead of 108 MiB, on top of the pool's 354 MiB/card, with `common_fit_params` refusing to fit under tensor split; and **the limit of the clamp fix**, because qwen4exp is in `llm_arch_supports_rs_rollback`, so a rejection of <= n_max positions arrives as `seq_rm(p_keep, -1)` (clamped, good) while a larger rewind arrives as a `PARTIAL_ONLY` checkpoint restore that deliberately still clears the run - that restore leaves the indexer cells untouched, so the run's own `pos_max` still spans the rejected tokens and cannot bound the cut. The clear is safe by construction (next step is `REBUILD`, which recomputes every row from live cells) but it is untested by the rollback harness, which exercises the `FLAGS_NONE` restore instead. Finally, the 0.23 -> 0.26 acceptance shift means the +7% is not clean evidence for the clamp; and 0.26 acceptance on 6 drafts is a bad trade on its own terms, so `--n-draft 2` is worth a run regardless of the diagnosis | decode, 4-card |
+- This branch *throws* for `-sm tensor` upstream: `llm_arch_supports_sm_tensor` returns false
+  (`src/llama-arch.cpp`) and `llama_model_create` raises `LLAMA_SPLIT_MODE_TENSOR not implemented`
+  (`src/llama-model.cpp:358`). **But the user runs tensor split on the bench box**, so their fork
+  enables it - and merging forward will break their command line until that patch comes along (B4).
+- The upstream guard is test-driven (`// TODO: fix test-llama-archs`), i.e. the blocker is the dummy
+  model, not the backend. This row previously claimed layer split was forced; it was not, and that
+  error cost a detour.
+- **E006: tensor wins tg, as the user expected.** For pp the general rule is the *opposite* - layer
+  usually wins, because layers pipeline across cards and the transfers hide behind inter-layer compute
+  overlap - so this run's layer-loses-pp result is an anomaly, not a rule, and it is now read as a
+  symptom of the CPU split (F3, E007b). The guard stays an obstacle to clear in B4.
 
-## Next runs (ids reserved, flag-only, bench box)
+### H2 - the hyper-connection chain is under-optimised on HIP
 
-| id | change | deciding observation | source |
-|---|---|---|---|
-| ~~E007~~ | ~~drop `-ot per_layer_token_embd=CPU`~~ **killed by the user, confirmed in code** | under `-sm tensor` the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`), so ~30 GB becomes ~30 GB *per card* = ~120 GB of a 128 GB box. Not a tuning question. Replaced by `ple-prefetch.md` |
-| ~~E008~~ | ~~today's config + `GGML_CUDA_DISABLE_GRAPHS=1`~~ **done, answer: no** | capture is active: disabling graphs costs 7% of tg and ~7% of deep pp, so the CPU split does not defeat it. Also bounds total launch-submission cost at ~2.7 ms/token. See E008 |
-| E008b | **promoted to first and widened, because of H11.** During *both* pp and tg, not just decode: `pidstat -d 1` or sampled `/proc/<pid>/stat` field 12 for **major faults/s of the llama process**, plus `iostat -x 1` (`r/s`, `%util`, `aqu-sz`), `vmstat 1` (`si`/`so`, to tell SSD page-cache reads from swap) and `free -h`. No build needed. Thousands of majflt/s in prefill against near zero in decode means the PLE table is the prefill bottleneck and no kernel change will show up until that is fixed. **Fold into the qsa-A redo so it costs nothing** |
-| E007b | ~~repeat the `-sm` pp A/B after dropping `-ot`~~ **deprioritised** | E007 is impossible (mirrored table) and E008 killed the capture chain, so there is no placement change left to re-test pp against | E006 |
-| ~~E009~~ | ~~`GGML_SCHED_DEBUG_REALLOC=1`~~ **done: no** | the hook aborts when it fires and the run finished clean, so same-size realloc is ruled out. Limit: it only sees failed reallocs at unchanged size |
-| ~~E010~~ | ~~`LLAMA_GRAPH_REUSE_DISABLE=1`~~ **done: reuse works** | ~22 ms/step (tg 28.20->17.36; pp512 +19.6 ms per single build). Gives the magnitude class for host graph machinery |
-| E011 | `llama-batched-bench ... -npp 512 -ntg 128 -npl 1,2,4` (**not** `llama-bench`, which has no `-np`; in batched-bench the sweep flag is `-npl`, and `-np` is a separate common arg for sequences to decode) | cleanest discriminator, needs no debug hooks: if aggregate tg scales **super**-linearly with `npl`, per-step host work is being amortised over more tokens and the host path is confirmed. Sub-linear means it is GPU work and the host-path reasoning dies |
-| E012 | `-sm row` as a third point, everything else as E005 | `-sm` has four modes (`none,layer,row,tensor`) and E006 compared only the two endpoints. `row` splits weights across GPUs (parallelized) but keeps KV on the main GPU, so it **decomposes** tensor split into weights-split + KV-split: if row ~ tensor for tg, KV splitting is implicated; if row ~ layer, weight splitting is what was helping. Untested by the user |
-| ~~E015~~ | ~~-nopo 1~~ **done: zero effect** | tg 28.14 vs 28.20, pp 547.5 vs 546.8; CSV confirms it applied. Scheduler op-offload is not the fixed cost, and this does **not** clear the lazy-CPU table - different placement path, which `-nopo` never touches |
-| E016 | **`perf record -g` during a tg-only run**, then `perf report --stdio` as text | flags are exhausted. This measures directly what the CPU does for the ~28 ms/step: allocator/graph work, QSA/PLE input construction, or blocking sync. The last bench measurement I would ask for |
-| E014 | **infeasible as designed, kept for the reasoning.** `-lzm off` was meant to make the table fully resident with no demand paging, but the table is ~30-36 GB on a 32 GB box, so "resident" is not reachable; and `-ot per_layer_token_embd=CPU` is inert anyway because lazy ranges above 4 GiB are forced to the CPU buffer type (`llama-model-loader.cpp:1080-1100`). The feasible variant is E029 |
-| E013 | sweep `-d` (real depth) at fixed `-p`/`-n`, e.g. `-d 512,4096,16384,40960,131072` | **justification corrected**: `-d` does fill the KV (`llama-bench.cpp:2408-2433`), so E005/E008 are single-depth measurements at ~40 k, not shallow ones. What is missing is the *curve*: depth response separates attention/KV cost from per-step fixed cost, and only the curve can say how much of the 35.5 ms is attention. Cheapest way to make H4b's value quantitative at 262 k | E005 |
-| E025 | 2-QSA-layer dummy: `--layers 8` (2 full-attn layers), or 4 layers with `full_attention_interval=2`, then tg slope vs the 1-layer case | **obsolete**: the prize is measured per E042+E043 (11.1 ms/token/GPU at 131k), so H9 no longer waits on this. Would still be nice for scaling checks, but it is no longer a prerequisite |
-| E029 | **row-cut the real table** (the dummy's 5.5/3.7 GB variants are the precedent) so it fits in RAM, then re-measure pp t/s and GPU util | causal test for H11 without touching code: if prefill util climbs toward decode's, the paging was the cost. Needs a conversion-side slice of `per_layer_token_embd.weight`, and it is a ~111 GB write, so only after E008b says it is worth it | E008b |
-| E030 | same prompt length, **real text vs llama-bench's random fill**: compare pp t/s, majflt/s and SSD read rate | harness-artifact control. Random token sequences hash to uniformly scattered n-gram rows, so bench prefill is worst-case locality and can overstate the paging cost relative to real serving | E008b |
-| E028 | memoize the QSA host mapping: keep `cell_blk`/`blk_cells`/`blk_pos` in the memory object, patch the `O(r)` cells a new token touches, let the async H2D carry the rest | **this is P2 after H9 (E044), and half of it is already done**: `CACHED` does not create `blk_pos` at all, so what is left is the `blk_cells` upload (still needed by the top_k expand at `qwen4exp.cpp:708`) and the `O(n_kv)` scan in `try_contiguous`. In the fast state the expand is affine (`base_s + (sel + b_lo)*r + i`), so it can be computed in-graph from per-stream constants, and the scan can be made incremental against the recorded run. Still ~3.4 ms/token of host time at 131k plus ~1.2 MB H2D, per the E043 review |
+- HC replaces every per-layer norm, so it is per-layer and every-token in both modes. Only `_PRE`
+  (gated) and `_POST` (comb=null) are emitted `[x]`; both are f32-only `[v]`; and `rms_norm+mul` fusion
+  was only just enabled (`41abbfd59`). New kernels are usually correct before they are tuned. Bounded
+  by N5.
+
+### H4a - stop paying the indexer + mask-rebuild tax while compaction is unavailable
+
+- Mask rebuild is `fill(-INF)` + `set_rows` + `add` per full-attn layer per ubatch
+  (`src/models/qwen4exp.cpp:735-758`) `[v]` - traffic scaling with context for a mask whose interior the
+  kernel ignores. `:566` already trims the upload to `1/ratio` of cells. Obsolete the moment H4b lands.
+- **Corrected by E024: H4b landed and this tax is small** - the mask tensors are `O(n_kv)` f16
+  (~0.3 MB/layer/step at 40k), while the indexer gather and pooling next to them are ~50 MB.
+  Deprioritised in favour of H9; the per-ubatch cost that matters at prefill is `O(n_blocks x n_tps)`,
+  which is host-side (E021).
+
+### H4b - port the mask compaction to HIP, then flip `n_kv_max` **done by E020**
+
+- Narrowed by the survey to: one warp-ballot kernel (`fattn.cu:10-89`, `WARP_SIZE == 32` which gfx1201
+  has, but `ggml_cuda_pdl_*` are NVIDIA-only), the `#if !defined(GGML_USE_HIP)` compile guards
+  (`:92-96`, `:109-113`, `:133-140`) `[v]`, and the call site (`qwen4exp.cpp:767`) `[v]`.
+- **Updated by E001: flipping the call site first is inert, not a safe first step** - sparse cases
+  already report SUPPORTED and compute dense, so results and cost are unchanged either way. Effect
+  size: `indexer_budget 2048` of 262,144 context, on 12 of 48 layers, pp-only per P4.
+- **Result (E020):** pp512 +23.3% @40k / +58.5% @164k, tg flat on the pre-rtile build (superseded by
+  E043: with rtile + block selection the sparse arm is ~1.4 ms/token/GPU cheaper than dense at 131k
+  decode), numerics match dense to 6e-7. P4's list was short three items: the `__ballot_sync` 64-bit
+  mask signature, the `may_use_sparse` DKQ whitelist, and the fact that RDNA has no FA device code below
+  16 tiles so the tiling must be 1x16 and had to be added to `generate_cu_files.py`.
+
+### H5 - PLE n-gram hashing
+
+- `ple_n_heads = (3-1)*8 = 16` gathers per token from a ~20 M x 2560 table = ~51 B params = 28% of the
+  model, serving one layer, hashed host-side. Superseded in priority by L1/L2.
+
+### H6 - fp32 output preference on RDNA4
+
+- `prefer_f32_output` is forced on for RDNA4 (`ggml-cuda.cu:1512`, `:1514`) `[v]`, and `mmvq.cu:417-492`
+  has an RDNA4-only `nwarps` whitelist `[s]`. Confirmed as real, still unmeasured: a per-model override
+  is a plausible small win.
+
+### H7 - VMM disabled
+
+- `GGML_HIP_NO_VMM` defaults ON, and the `VMM: no` banner is just that flag, not a device query `[s]`.
+  Allocation/fragmentation behaviour differs from a CUDA default - relevant to both the 16 GB box and a
+  4-card split.
+
+### H8 - `GGML_HIP_RCCL=OFF`
+
+- The "rebuild with NCCL" warning is `#ifndef GGML_USE_HIP`, so without RCCL the fallback to internal
+  AllReduce is **silent** `[s]`. Only worth a record once B2 reports the topology.
+
+### H9 - cache pooled indexer block keys (coarse cache) **built, 4-card half-answered**
+
+- **Original question (added by E024):** `build_qsa_top_k` re-gathers the whole raw indexer cache and
+  re-pools it every step - ~76 MB and ~33 graph nodes per QSA layer per step at 40k, about 2x dense
+  attention and ~19x sparse attention post-E020, and unlike the host fix this *is* per layer, so 12x on
+  the real model. Block keys are immutable once a block's `r` tokens are written, so a coarse cache
+  deletes the gather (~21 MB) and the `r` pooling passes (~29 MB). Why it was not a small change: block
+  membership is a function of *position*, and `seq_add` / `seq_div` (context shift) rewrite positions,
+  so it needs an `O(n_kv)` rebuild path anyway plus a new tensor threaded through
+  `seq_cp`/`seq_keep`/eviction/defrag/`n_pad`/state save-load in `llama_memory_hybrid_idx`.
+- **Prize, measured by E042+E043 (decode-only traces at 131k):** the whole family - gather, 4 rect
+  copies, pooling adds, scale, norm, rope - is **11.1 ms/token/GPU**, 84% of the chain, 35% of the qsa
+  arm's device time, and it is output-neutral (block keys are static once a block completes; block start
+  positions never move). E037's 36% was wrong - it excluded norm and rope as "position-dependent" - and
+  E025 is obsolete: the prize is now measured.
+- **Built:** `d8bce4e25` (E044), gate `Q4EXP_POOLED`, default off, bit-identical to the gate-off build on
+  every dev-box test. Shape as designed in [h9-pooled-block-keys.md](h9-pooled-block-keys.md): a
+  mirrored f32 `[idx_dim, n_blocks, n_stream]` pool tensor inside the existing idx cache, written in the
+  graph that writes the raw keys with existing ops, watermark + recorded-run invalidation, today's chain
+  as the rebuild and the fallback. 491 lines across 6 files, no new kernel, no new file.
+- **What the work taught us about invalidation:** the surface is the wrapper's own seq ops plus one
+  branch in `apply()` - smaller than feared - but the correctness traps were elsewhere. An input with no
+  consumer gets no host buffer (NULL `data`, SIGSEGV), and the rebuild write-back must target the pool,
+  not the chain tensor it just read (E044 findings 4 and 6). A third trap was operational rather than
+  arithmetic: speculative rollback arrives as a checkpoint `state_read`, not a partial `seq_rm`, so
+  clearing the run there re-derives everything on nearly every step - fixed by clamping the watermark to
+  the surviving blocks (E045, `90b9ccf9d`).
+- **Open:** the 4-card box shows **tg +30% at 131k** but **pp -16..-22% at every depth**, unlocalized
+  (needs pool=0 on the same build plus a `-ub` sweep), and the pool taxes **354 MiB/card at ctx
+  245760**, so f16 storage is on the table.
+- **Scope:** prefill, decode, 4-card.
+
+### H10 - mmq cutoff tuning for MoE models
+
+- **Added by the user after E026.** Their RDNA3/4 mmq retune has not fully landed, and the dummy showed
+  pp512 -11.2% at 40k from it while decode was flat. The `mmq` cutoff/selection that decides when a
+  quant matmul takes the tensor-core path is not adjusted for MoE shapes (many small expert GEMMs at
+  large batch), and upstream does not have those changes yet. Track separately from the sparse/QSA line.
+
+### H11 - prefill runs the GPUs at 20-30% while decode sits near 100%
+
+- Reported by the user on the bench box, present before *and* after the rebase, so it is not a merge
+  artifact. This is inverted: prefill is the compute-bound phase (512-8192 tokens per ubatch through 48
+  layers of MoE GEMMs) and should be the one saturating the cards, while decode is small-kernel and
+  collective-bound.
+- **Three readings, in the order I would kill them:**
+  1. *The 100% on decode may not be work* - `amd-smi`/`rocm-smi` utilisation counts any resident kernel,
+     so a spin-wait custom/p2p AllReduce reads as busy; E005 measured **9% util during decode** on this
+     same box, which is either the opposite truth or a different sampling window, and both cannot be
+     right.
+  2. *Prefill may be host-serialised between ubatches* - per-ubatch host work exists (`set_input_qsa`
+     bias fill measured at 4-6 ms per ubatch at 25-30k on the dev box, E021; input construction and the
+     QSA mask rebuild), but 512 tokens at pp512@131k is ~1.3 s of wall time, so a few ms of host work
+     cannot hide 70% of the card.
+  3. *Something in the pp path is genuinely GPU-idle* - cross-card sync per layer with tensor split, MoE
+     expert dispatch with a device->host count read forcing a sync, or graph rebuild when ubatch shapes
+     change (E010: one build is ~20-22 ms; pp changes n_kv as the cache grows, so a reuse miss would
+     stall).
+- **Superseded in likelihood by the n-gram streaming hypothesis**, which the arithmetic supports: the hw
+  profile has the PLE table as Q5 in **system RAM** at ~30-36 GB, and the box has **62.7 GiB** (the
+  "32g" in the profile name is not RAM - corrected after the screenshot), so the table can be cached but
+  the 111 GB file cannot - it is served by page-cache misses from SSD, and the table ranges deliberately
+  get `POSIX_MADV_RANDOM` (read-ahead off) with `MAP_POPULATE` skipped and no `WILLNEED`
+  (`ple-prefetch.md`, F1). That predicts exactly the asymmetry: prefill issues thousands of scattered
+  single-page reads per ubatch and starves the cards, while decode does 16 lookups per token and mostly
+  hits what is warm. E017's A/B is the same effect at smaller scale: 35.2 GB table gave pp4096 6017 t/s,
+  3.7 GB gave 6407 (**+6.5% pp**) with **tg unchanged** (182.14 vs 182.40). Caveat: llama-bench may be
+  *amplifying* it (E030).
+- **Screenshots** in `results/user/prefill-ssd-probable-issue/` (gitignored, local-only) support the
+  paging story rather than replacing it: all four GPUs at **26% util** at the same time, **~70 W** each,
+  and **load average ~1.2** on a many-core box, so neither the GPUs nor the CPU are working - the process
+  is waiting. VRAM 22 of 32 GiB per card, so weights are resident and this is not a GPU memory problem.
+  The disk panel shows the root device busy at **~66 MB/s of reads** (`▲` is read; the `swap 7.00 GiB`
+  row is the swap *size*, not usage, and no swap-in was observed). The rate is the useful number: 66
+  MB/s is nothing for an NVMe device, and at 4 KiB pages that is roughly **16k reads/s**, i.e. the device
+  is latency/IOPS-bound on random single-page accesses, exactly what `MADV_RANDOM` over a scattered
+  n-gram gather produces. That puts F1 back in play with a concrete mechanism: prefill knows every token
+  of the ubatch up front, so the row set is predictable and `WILLNEED`/`readahead` can coalesce what is
+  now ~16k independent page reads/s. `[x]` An earlier reading of the same screenshot took the arrow as
+  writes and the swap size as usage, and concluded "box is over-committed"; that version is dropped, but
+  whether any of it is swap is still cheap to settle (`vmstat` `si`/`so`, majflt/s), which is what E008b
+  asks for.
+
+### H12 - put the PLE table in VRAM instead of streaming it **dead on cost/benefit**
+
+- The structural version of H11. The table is 32.8 GiB (Q5_0, 51.2 B params) and 29% of the file, and it
+  is mirrored across cards, so it cannot be placed on GPU as it stands (E007). Split 4 ways it is
+  8.2 GiB per card against ~10 GiB currently free, so it *would* fit - the size is no longer the
+  obstacle, E031 is: once `-lzm on-direct` removed the demand faults, the table costs 1760 bytes of
+  reads per token, which is nothing. Kept as the record of what the streaming was.
+- E014 (resident table, `-lzm off`) is the variant that is now feasible and worth a flag-only run,
+  because 32.8 GiB fits in the box's RAM.
+
+### H13 - select QSA at block level, then expand, as the paper does **implemented**
+
+- Measured on the dev box (E039): **+6.3% tg / +6.8% pp at 164k**, +2.3% / +2.0% at 40960, flat at
+  8192; deep-arm PPL +8e-8, shallow golden corpus bit-identical, ops gate green. Same-binary A/B through
+  the temporary `Q4EXP_CELL_SEL` gate.
+- What it deletes: the `n_kv` expand gather, both `cont(permute)` copies, the f32 per-cell mask add,
+  top-k over `n_kv` (11 dependent launches, 4x less input now), and `cell_blk` with its O(n_kv) host fill
+  since the expand was its only consumer.
+- **Bench (E040):** tg +7.2% and pp +22-23% at 131k, but that delta also contains the rtile decode path
+  and the per-build `n_kv_max` fix, and rtile cannot move prefill, so the pp share is not attributable
+  to H13 without one more run at the same build with `Q4EXP_CELL_SEL=1`.
+- **Leftover:** once the bench conclusion lands, the gate and the per-cell path come out (the `!blk_bias`
+  fallback is a different thing and stays). Also still owed: the selection-set differential (old vs new)
+  and a live multi-seq run on the real checkpoint.
+- **Scope:** prefill.
+
+### ~~H14 - is the model dispatch-bound at decode?~~ closed by E038: no
+
+- The chain's device time is 12.2 ms/token at 131k against the 15.5 ms/token measured gain from
+  `Q4EXP_NO_INDEXER`, so 79% of the effect is kernels, not launch gaps. The earlier 612-launches/token
+  figure was wrong twice over (3 chain builds per token, and per-call counts normalized across phases).
+  Keep only as a footnote: graphs-off costs ~7% of tg on the dev box (E008).
+
+### H15 - keep the indexer gather and pooling in f16 **mostly superseded by H9/E044**
+
+- In the `CACHED` variant the gather, the pooling, the norm and the rope are gone, so the only f32
+  traffic left is the pool read under the score matvec. The remaining version of this item is the plan's
+  P3: store the pool as f16, which halves that read (0.59 -> ~0.3 ms/token/GPU) but rounds the cached
+  key, so selection can move last-bit and the golden would need re-baselining. Keep the original note for
+  the `REBUILD`/fallback path, where the gather is still f16 -> f32.
+- **Scope:** prefill, decode.
+
+### H16 - the 4-card reduce is NCCL, and it is 22% of device time
+
+- E037: `ncclDevKernel_Generic_4` is **163,124 calls, 22.0 s** in the chain-off arm and 22.2 s in the
+  chain-on arm, i.e. 96 collectives per graph build (2 per layer) at **135 us each** for a 2560-wide f32
+  activation. Identical with the chain off, so QSA does not cause it, but it is bigger than any single
+  chain term, and the user's fork carries a commit about RDNA4 p2p across PCIe - if that path is meant to
+  replace the NCCL collectives, it is not active in this build.
+- **E038 makes it bigger:** 95.5 s at 131k with calls x1.21, so per call 136 -> 485 us even though the
+  payload size is depth-independent - that is peer-wait, i.e. imbalance exposure growing with depth, and
+  it is ~15 ms/token of a ~45 ms/token step, the same order as the whole chain.
+- **Do not chase without asking:** the user says NCCL is not an issue.
+- **Scope:** decode, 4-card.
+
+### ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
+
+- `src/llama-model.cpp:511-514` maps `cache_idx_(k|v)_l*` to `SPLIT_AXIS_MIRRORED` ("the qsa indexer has
+  one key head and its projections are mirrored, so its cache cannot be split") and that rule came with
+  upstream's own qwen4exp commit `6c84c7d5d`; the bench load log confirms it (main cache 198.00 MiB
+  logical vs a 49.50 MiB buffer = quartered, indexer cache 24.75 MiB logical vs a 24.75 MiB buffer =
+  whole), so every device sees all cells and the top-k is global, as the bench probe line showed
+  (`nkv=4352`, `gqa=12`). The mirror costs ~384 MiB/card at 131k.
+- Note also that `-sm tensor` for this arch is a fork-local `tmp:` change: `a8b24dfdf` deletes
+  `case LLM_ARCH_QWEN4EXP: // TODO: fix test-llama-archs` and adds
+  `ggml_build_forward_expand(gf, res_hc)` to pin `hc_init` into layer 0's graph split - so every bench
+  number in this directory was measured with that workaround in place.
+- **Cost half is open as H17b.**
+
+### H17b - is the QSA chain replicated into all four device sub-graphs under `-sm tensor`?
+
+- `src/llama-model.cpp:512` mirrors the indexer cache, so every device *can* run the whole chain, and
+  `a8b24dfdf` shows the graph is partitioned into per-device sub-graphs with nodes landing in whichever
+  split they are anchored to - the fix there was forcing a node into the first layer's split. If the
+  chain's ~41 nodes per QSA layer are copied into all four sub-graphs, ~3/4 of its work is redundant and
+  "run it once, broadcast the 2051 indices" beats H9 and H13 combined.
+- **My earlier claim that replication is ruled out by wall clock is withdrawn**: it assumed a card here
+  costs what my dev box costs, and if an R9700 is ~2x an RX 9070 then a 4x-replicated chain (~17
+  ms/token at 131k) also fits the measured 15.5 ms gain.
+- **Decisive without a profiler,** four arms at `-d 40960 -p 0 -n 64 -r 1` with the other flags
+  unchanged: (`-sm tensor`, `-sm layer`) x (chain on, `Q4EXP_NO_INDEXER=1`). Under `-sm layer` each layer
+  and its chain live on exactly one device, so that gap is the un-replicated baseline; a tensor-mode gap
+  ~4x larger means replication.
+- **Scope:** decode, correctness of cost model.
+
+### H18 - why does `draft-mtp` cost a third of decode throughput on the 4-card box?
+
+- Numbers at ctx 245760, same build either side of the clamp commit: no spec **34.86 t/s** (28.7
+  ms/token), mtp after `90b9ccf9d` **23.06 t/s** (43.4 ms, acceptance 0.26), mtp before **21.5 t/s**
+  (46.5 ms, acceptance 0.23).
+- The arithmetic makes it a fixed-cost problem: `n_max = 6` at 0.26 accepted-per-position is ~2.5 tokens
+  per step, so a step costs ~111 ms, the verify pass is ~28.7 ms of that, leaving **~13.7 ms per draft
+  replay** for a 1-layer draft whose FLOPs are ~1/64 of the target's. Three candidate sources, all
+  host/dispatch side:
+  1. `common.cpp:1311` and `speculative.cpp:2554` force `n_rs_seq = 0` on the *draft* ctx, so any
+     draft-side rewind is a checkpoint, i.e. `llama_state_seq_{get,set}_data_ext` copies per step.
+  2. Every draft token is sampled and read back to host to build the next batch - 6 sync points per
+     step, on a box E039/E042 already measured as gap-dominated.
+  3. Under `-sm tensor` the meta dispatch cost is per sub-graph, so 6 extra replays carry the overhead of
+     6 extra layers.
+- **Cheapest diagnostics first:** scale `--n-draft 1,2,4,8` (linear in count = fixed per-replay,
+  sub-linear = compute), then one rocprofv3 pair of MTP decode vs plain decode (E042 method) to split
+  device ms from wall ms, then grep their load log for how many caches the draft ctx actually builds.
+- **The same feature explains part of the VRAM pressure:** `need_n_rs_seq()` returns `draft.n_max`, so at
+  `n_max = 6` the target's recurrent cache is 7x108 = **756 MiB** (their log: `size = 787.99 MiB ... 6
+  rs_seq`) instead of 108 MiB, because `llama_memory-recurrent.cpp:101` allocates
+  `mem_size * (1 + n_rs_seq)`. That is nearly 2x the pool's 354 MiB/card, with `common_fit_params`
+  refusing to fit under tensor split.
+- **And it bounds what the clamp fix buys:** qwen4exp is in `llm_arch_supports_rs_rollback`, so a
+  rejection of `<= n_max` positions arrives as `seq_rm(p_keep, -1)` (clamped, good), while a larger
+  rewind arrives as a `PARTIAL_ONLY` checkpoint restore that deliberately still clears the run - that
+  restore leaves the indexer cells untouched, so the run's own `pos_max` still spans the rejected tokens
+  and cannot bound the cut. The clear is safe by construction (the next step is `REBUILD`, which
+  recomputes every row from live cells) but untested: the rollback harness exercises the `FLAGS_NONE`
+  restore instead.
+- Finally, the 0.23 -> 0.26 acceptance shift means the +7% is not clean evidence for the clamp; and 0.26
+  acceptance on 6 drafts is a bad trade on its own terms, so `--n-draft 2` is worth a run regardless of
+  the diagnosis. Full mechanics in `../../qwen4exp-arch.md` ("the two rollback doors").
+- **Scope:** decode, 4-card.
+
+---
+
+## Next runs (mostly flag-only, bench box)
+
+### ~~E007 - drop `-ot per_layer_token_embd=CPU`~~ killed by the user, confirmed in code
+
+- Under `-sm tensor` the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`), so ~30 GB
+  becomes ~30 GB *per card* = ~120 GB of a 128 GB box. Not a tuning question. Replaced by
+  `ple-prefetch.md`.
+
+### ~~E008 - `GGML_CUDA_DISABLE_GRAPHS=1`~~ done: no
+
+- Capture is active: disabling graphs costs 7% of tg and ~7% of deep pp, so the CPU split does not
+  defeat it. Also bounds total launch-submission cost at ~2.7 ms/token.
+
+### E008b - majflt/s and disk pressure during *both* pp and tg **promoted to first**
+
+- Promoted because of H11, and widened to prefill. `pidstat -d 1` or sampled `/proc/<pid>/stat` field 12
+  for **major faults/s of the llama process**, plus `iostat -x 1` (`r/s`, `%util`, `aqu-sz`), `vmstat 1`
+  (`si`/`so`, to tell SSD page-cache reads from swap) and `free -h`. No build needed.
+- Thousands of majflt/s in prefill against near zero in decode means the PLE table is the prefill
+  bottleneck and no kernel change will show up until that is fixed. **Fold into the qsa-A redo so it
+  costs nothing.**
+
+### ~~E007b - repeat the `-sm` pp A/B after dropping `-ot`~~ deprioritised
+
+- E007 is impossible (mirrored table) and E008 killed the capture chain, so there is no placement change
+  left to re-test pp against. Source: E006.
+
+### ~~E009 - `GGML_SCHED_DEBUG_REALLOC=1`~~ done: no
+
+- The hook aborts when it fires and the run finished clean, so same-size realloc is ruled out. Limit: it
+  only sees failed reallocs at unchanged size.
+
+### ~~E010 - `LLAMA_GRAPH_REUSE_DISABLE=1`~~ done: reuse works
+
+- ~22 ms/step (tg 28.20 -> 17.36; pp512 +19.6 ms per single build). Gives the magnitude class for host
+  graph machinery.
+
+### E011 - `-npl` sweep with `llama-batched-bench`
+
+- `llama-batched-bench ... -npp 512 -ntg 128 -npl 1,2,4` (**not** `llama-bench`, which has no `-np`; in
+  batched-bench the sweep flag is `-npl`, and `-np` is a separate common arg for sequences to decode).
+- Cleanest discriminator, needs no debug hooks: if aggregate tg scales **super**-linearly with `npl`,
+  per-step host work is being amortised over more tokens and the host path is confirmed. Sub-linear
+  means it is GPU work and the host-path reasoning dies.
+
+### E012 - `-sm row` as a third point
+
+- Everything else as E005. `-sm` has four modes (`none,layer,row,tensor`) and E006 compared only the two
+  endpoints. `row` splits weights across GPUs (parallelized) but keeps KV on the main GPU, so it
+  **decomposes** tensor split into weights-split + KV-split: if row ~ tensor for tg, KV splitting is
+  implicated; if row ~ layer, weight splitting is what was helping. Untested by the user.
+
+### ~~E015 - `-nopo 1`~~ done: zero effect
+
+- tg 28.14 vs 28.20, pp 547.5 vs 546.8; CSV confirms it applied. Scheduler op-offload is not the fixed
+  cost, and this does **not** clear the lazy-CPU table - different placement path, which `-nopo` never
+  touches.
+
+### E016 - `perf record -g` during a tg-only run
+
+- Then `perf report --stdio` as text. Flags are exhausted. This measures directly what the CPU does for
+  the ~28 ms/step: allocator/graph work, QSA/PLE input construction, or blocking sync. The last bench
+  measurement I would ask for.
+
+### E014 - `-lzm off` (table resident, no demand paging) **revived**
+
+- `[x]` Was killed on a wrong premise: it said the table is ~30-36 GB on a 32 GB box so "resident" is
+  unreachable, but the box has **62.7 GiB** of RAM (H11, corrected after the screenshot), so it is
+  reachable and now also feasible per E029's sizing. Also still true: `-ot per_layer_token_embd=CPU` is
+  inert, because lazy ranges above 4 GiB are forced to the CPU buffer type
+  (`llama-model-loader.cpp:1080-1100`). The flag that matters is `-lzm`.
+
+### E013 - sweep `-d` at fixed `-p`/`-n`
+
+- e.g. `-d 512,4096,16384,40960,131072`. **Justification corrected:** `-d` does fill the KV
+  (`llama-bench.cpp:2408-2433`), so E005/E008 are single-depth measurements at ~40 k, not shallow ones.
+  What is missing is the *curve*: depth response separates attention/KV cost from per-step fixed cost,
+  and only the curve can say how much of the 35.5 ms is attention. Cheapest way to make H4b's value
+  quantitative at 262 k. Source: E005.
+
+### ~~E025 - 2-QSA-layer dummy~~ obsolete
+
+- `--layers 8` (2 full-attn layers), or 4 layers with `full_attention_interval=2`, then tg slope vs the
+  1-layer case. The prize is measured per E042+E043 (11.1 ms/token/GPU at 131k), so H9 no longer waits
+  on this. Would still be nice for scaling checks, but it is no longer a prerequisite.
+
+### E028 - memoize the QSA host mapping **(this is P2 of the H9 plan, not a flag-only run)**
+
+- Keep `cell_blk`/`blk_cells`/`blk_pos` in the memory object, patch the `O(r)` cells a new token touches,
+  let the async H2D carry the rest. Half of it is already done: `CACHED` does not create `blk_pos` at
+  all, so what is left is the `blk_cells` upload (still needed by the top_k expand at
+  `qwen4exp.cpp:708`) and the `O(n_kv)` scan in `try_contiguous`. In the fast state the expand is affine
+  (`base_s + (sel + b_lo)*r + i`), so it can be computed in-graph from per-stream constants, and the scan
+  can be made incremental against the recorded run. Still ~3.4 ms/token of host time at 131k plus ~1.2 MB
+  H2D, per the E043 review.
+
+### E029 - row-cut the real table
+
+- The dummy's 5.5/3.7 GB variants are the precedent, so it fits in RAM, then re-measure pp t/s and GPU
+  util. Causal test for H11 without touching code: if prefill util climbs toward decode's, the paging was
+  the cost. Needs a conversion-side slice of `per_layer_token_embd.weight`, and it is a ~111 GB write, so
+  only after E008b says it is worth it. Source: E008b.
+
+### E030 - real text vs llama-bench's random fill, same prompt length
+
+- Compare pp t/s, majflt/s and SSD read rate. Harness-artifact control: random token sequences hash to
+  uniformly scattered n-gram rows, so bench prefill is worst-case locality and can overstate the paging
+  cost relative to real serving. Source: E008b.
+
+---
 
 ## Code-level items
 
-| id | thread | anchor |
-| F3 | **mechanism corrected: it is `-lzm`, not `-ot`, that puts the table on the host** | tensor overrides do not apply to lazy-read tensors (warning seen in E011's log), and lazy read forces the CPU buft itself (`src/llama-model-loader.cpp:1080-1086`), so `-ot per_layer_token_embd=CPU` is inert. The consequence stands - the table is on the host, so the gather + H2D + graph split at layer 1 are real - but the flag to change is `-lzm`, which is E014. E008 already showed the split does not defeat graph capture, and E011 bounds all per-token work at ~4-8 ms, so this is now about the ~28 ms/step fixed cost |
-| F1 | **the lazy table is never prefetched, in any load mode**, so there is no way to warm it | `src/llama-mmap.cpp`: the `POSIX_MADV_WILLNEED` loop iterates `ranges_complement(lazy_ranges, ...)` (`:500-502`) - i.e. it prefetches everything *except* the lazy ranges; `MAP_POPULATE` is skipped with the comment "MAP_POPULATE would fault in the lazy ranges too" (`:481`); and the lazy ranges get `POSIX_MADV_RANDOM` (`:508-510`), which turns kernel read-ahead **off** for them. Also `if (numa) { prefetch = 0; }` (`:473`) plus a whole-file `MADV_RANDOM` (`:516-522`). Asked and answered: `-lm none` is not the cause, since no mode warms the table. What is missing is an opt-in pre-warm of the lazy ranges (a background `WILLNEED` during tensor upload), or a `-lzm` variant for "resident but lazy-mapped". With `ple_n_heads = 16` and `MADV_RANDOM`, that is up to ~16 faults per token on a ~30 GB range. **Design options, including the user's two prefetch ideas and why they split by mode: see `ple-prefetch.md`** |  **[superseded by E031: `on-direct` removes the faults entirely rather than prefetching them]** |
-| F2 | `size_label` is cosmetic and derived from the **repo/file name** (`gguf-py/gguf/metadata.py:314-328`), never computed from parameters | it reported `A3B` for a ~6 B-active model and misled this analysis for a full round trip. Derive active params yourself; `llama-bench`'s `model_type` column inherits the label. Related consistency check that *is* trustworthy: the GGUF reports 176.94 B params vs 179.99 B in HF bf16, a ~3.05 B gap consistent with the exporter dropping the 1-layer MTP block (`conversion/qwen4exp.py:21-22`) - one MoE layer plus its attention/embedding weight |
-| F3 | **`-ot per_layer_token_embd=CPU` is now the prime suspect for tg** | it puts a ~30 GB table on a CPU buffer, forcing a host gather + H2D copy + **graph split at layer index 1 every step**, with the n-gram hash host-side regardless (no int64/xor in ggml). E006 showed tg is insensitive to split mode yet ~12-44x above its floor - consistent with a shared serial stall, and a CPU split mid-graph is the obvious candidate. Sharper form: **the split may be what prevents HIP graph capture for the whole graph**, in which case decode degrades to eager per-node submission from one host thread (a few thousand nodes/token -> tens of ms) and the 9% util is the GPUs waiting to be told what to do. Test via E007/E008 before writing code |
-| T1 | implement `ggml_backend_fusion_*` for the CUDA/HIP backend | would unlock `test-fusion` on `ROCm0`, i.e. per-arch fusion counts and a `CUDA.csv` baseline (upstream ships only MTL). Only worth it if N1 (IMROPE fusion gap) or H2 need *counting* rather than timing. It is tooling, not a perf win - P3 died on this. **Demoted by E005**: counting fusions is not the bottleneck question while the box sits at 9% utilisation |
+### F1 - the lazy table is never prefetched, in any load mode
+
+- `src/llama-mmap.cpp`: the `POSIX_MADV_WILLNEED` loop iterates `ranges_complement(lazy_ranges, ...)`
+  (`:500-502`) - it prefetches everything *except* the lazy ranges; `MAP_POPULATE` is skipped with the
+  comment "MAP_POPULATE would fault in the lazy ranges too" (`:481`); and the lazy ranges get
+  `POSIX_MADV_RANDOM` (`:508-510`), which turns kernel read-ahead **off**. Also `if (numa) { prefetch =
+  0; }` (`:473`) plus a whole-file `MADV_RANDOM` (`:516-522`).
+- Asked and answered: `-lm none` is not the cause, since no mode warms the table. What is missing is an
+  opt-in pre-warm of the lazy ranges (a background `WILLNEED` during tensor upload), or a `-lzm` variant
+  for "resident but lazy-mapped". With `ple_n_heads = 16` and `MADV_RANDOM`, that is up to ~16 faults per
+  token on a ~30 GB range.
+- Design options, including the user's two prefetch ideas and why they split by mode: see
+  `ple-prefetch.md`. `[x]` **Superseded by E031: `on-direct` removes the faults entirely rather than
+  prefetching them.**
+
+### F2 - `size_label` is cosmetic and derived from the repo/file name
+
+- `gguf-py/gguf/metadata.py:314-328`, never computed from parameters. It reported `A3B` for a ~6
+  B-active model and misled this analysis for a full round trip. Derive active params yourself;
+  `llama-bench`'s `model_type` column inherits the label.
+- Related consistency check that *is* trustworthy: the GGUF reports 176.94 B params vs 179.99 B in HF
+  bf16, a ~3.05 B gap consistent with the exporter dropping the 1-layer MTP block
+  (`conversion/qwen4exp.py:21-22`) - one MoE layer plus its attention/embedding weight.
+
+### F3 - the PLE table is on the host because of `-lzm`, not `-ot`
+
+- `[x]` Mechanism corrected: tensor overrides do not apply to lazy-read tensors (warning seen in E011's
+  log), and lazy read forces the CPU buft itself (`src/llama-model-loader.cpp:1080-1086`), so
+  `-ot per_layer_token_embd=CPU` is inert.
+- The consequence stands - the table is on the host, so the gather + H2D + graph split at layer 1 are
+  real - but the flag to change is `-lzm`, which is E014. E008 already showed the split does not defeat
+  graph capture, and E011 bounds all per-token work at ~4-8 ms, so this is now about the ~28 ms/step
+  fixed cost.
+- An earlier version of this item held `-ot ...=CPU` to be the prime suspect for tg and wondered whether
+  the mid-graph CPU split prevented capture; both are answered above and by E008/E011.
+
+### T1 - implement `ggml_backend_fusion_*` for the CUDA/HIP backend
+
+- Would unlock `test-fusion` on `ROCm0`, i.e. per-arch fusion counts and a `CUDA.csv` baseline (upstream
+  ships only MTL). Only worth it if N1 (IMROPE fusion gap) or H2 need *counting* rather than timing. It
+  is tooling, not a perf win - P3 died on this.
+- **Demoted by E005:** counting fusions is not the bottleneck question while the box sits at 9%
+  utilisation.
+
+---
 
 ## Hygiene notes
 
-- **`docs/ops.md` / `docs/ops/*.csv` are stale and actively wrong for these ops** `[s]`:
-  they mark `DSV4_HC_*` unsupported on CUDA and Metal while the kernels exist, and
-  `CUDA.csv` has no rows at all for `DSV4_HC*`/`GATED_DELTA_NET`/`LIGHTNING_INDEXER`/`TOPK`.
-  Never cite them as support evidence.
+- **`docs/ops.md` / `docs/ops/*.csv` are stale and actively wrong for these ops** `[s]`: they mark
+  `DSV4_HC_*` unsupported on CUDA and Metal while the kernels exist, and `CUDA.csv` has no rows at all
+  for `DSV4_HC*`/`GATED_DELTA_NET`/`LIGHTNING_INDEXER`/`TOPK`. Never cite them as support evidence.
 - qwen4exp uses `llama_memory_hybrid_idx`, **not** the `dsa`/`msa`/`iswa` cache classes `[s]`.
-- Sparse-ness is expressed *as the mask*; compaction is what makes a mask cheaper to
-  iterate. No separate sparse kernel exists in ggml-cuda `[s]`.
-- `FLASH_ATTN_EXT` has **6 known numeric failures at hsk=192/hsv=128** (gqa 8/16, permuted
-  K/V views, err up to 0.0298 vs 0.0005 tol) `[v]`. Not our shape - do not chase it, but do
-  not mistake it for a regression you introduced when re-running the FA suite.
-- Empirical FA support at our shape: **hsk/hsv 256/256 is 142/142 supported on `ROCm0`**
-  (f16/q4_0/q8_0 KV) `[v]`. Zero support: 96/64, 128/64, 192/192, 64/128 - never assume a
-  mismatched DK/DV pair works.
+- Sparse-ness is expressed *as the mask*; compaction is what makes a mask cheaper to iterate. No separate
+  sparse kernel exists in ggml-cuda `[s]`.
+- `FLASH_ATTN_EXT` has **6 known numeric failures at hsk=192/hsv=128** (gqa 8/16, permuted K/V views, err
+  up to 0.0298 vs 0.0005 tol) `[v]`. Not our shape - do not chase it, but do not mistake it for a
+  regression you introduced when re-running the FA suite.
+- Empirical FA support at our shape: **hsk/hsv 256/256 is 142/142 supported on `ROCm0`** (f16/q4_0/q8_0
+  KV) `[v]`. Zero support: 96/64, 128/64, 192/192, 64/128 - never assume a mismatched DK/DV pair works.
+- This file is one heading per item on purpose. The previous table form lost a whole fragment to a
+  mid-cell edit (H11, recovered from `fa67a24e8`) and silently duplicated an id (F3) when a correction
+  was appended instead of replacing. Full rules: `../../record-editing-hygiene.md`.
 
 ## Explicitly out of scope for now
 
-- Vulkan, SYCL, OpenCL, CPU-only paths. Vulkan appears above only as a reference for what a
-  fused kernel looks like.
-- Quality/accuracy tuning (quant selection studies, chat templates, samplers). This branch is
-  about throughput and memory on RDNA4.
-- Upstreaming anything. Local branch; anything that later becomes a PR gets its own discussion
-  with the maintainer first, per `AGENTS.md`.
+- Vulkan, SYCL, OpenCL, CPU-only paths. Vulkan appears above only as a reference for what a fused kernel
+  looks like.
+- Quality/accuracy tuning (quant selection studies, chat templates, samplers). This branch is about
+  throughput and memory on RDNA4.
+- Upstreaming anything. Local branch; anything that later becomes a PR gets its own discussion with the
+  maintainer first, per `AGENTS.md`.
 
 ## Dead ends
 
-| id | what died | why it is still useful |
-|---|---|---|
-| E002 | a synthetic qwen4exp model as a pp/tg baseline | the 19 MB F32 model fits in cache, so pp/tg measure harness overhead, not bandwidth. Killed cheaply and on purpose, which is the point: nobody should treat `tg` 325 t/s as a reference number. Replacement is E004 (config-shaped dummy) or T2-only |
-| P3 | `test-fusion` counts on ROCm0 | the fusion debug API is Metal-only `[v]`; the tool refuses to run rather than returning empty numbers. See T1 if the signal is ever worth building |
+### ~~E002 - a synthetic qwen4exp model as a pp/tg baseline~~ killed cheaply and on purpose
+
+- The 19 MB F32 model fits in cache, so pp/tg measure harness overhead, not bandwidth. The point of
+  keeping this: nobody should treat `tg` 325 t/s as a reference number. Replacement is E004
+  (config-shaped dummy) or T2-only.
+
+### ~~P3 - `test-fusion` counts on ROCm0~~
+
+- The fusion debug API is Metal-only `[v]`; the tool refuses to run rather than returning empty numbers.
+  See T1 if the signal is ever worth building.
