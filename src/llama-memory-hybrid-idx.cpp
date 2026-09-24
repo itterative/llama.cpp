@@ -25,6 +25,13 @@ static bool llama_qsa_pool_enabled() {
     return val != nullptr && atoi(val) != 0;
 }
 
+// keep the pool out of large ubatches, see qsa_pool_get
+static bool llama_qsa_pool_no_prefill() {
+    static const bool val = std::getenv("Q4EXP_POOLED_NO_PREFILL") != nullptr;
+
+    return val;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -337,10 +344,12 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
 
     // the pool is addressed by block index, which is only append-stable in the state the fast path of
     // set_input_qsa handles: one sequence, its used cells a dense run of consecutive positions.
-    // single-token ubatches only: during prefill the graph is rebuilt every chunk anyway, so the pool
-    // saves no derivation, while its extra tensors change the node set often enough to keep forcing
-    // ggml-alloc re-reservations (-3% pp8192 on RX 9070 at d16384)
-    if (!qsa_pool_on || ratio == 0 || n_stream != 1 || ubatch.n_tokens != 1) {
+    // by default every width pools. Q4EXP_POOLED_NO_PREFILL keeps it out of chunked prefill, where the
+    // derivation the pool saves is small next to the expert traffic while the extra tensors leave
+    // ggml-alloc re-reserving the compute buffers on nearly every ubatch (E051: -2.9% pp8192).
+    // 16 is above any speculative verification width, so those steps stay pooled
+    if (!qsa_pool_on || ratio == 0 || n_stream != 1 ||
+            (ubatch.n_tokens >= 16 && llama_qsa_pool_no_prefill())) {
         return res;
     }
 
