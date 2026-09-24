@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-prof.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -1561,7 +1562,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                int32_t rc;
+
+                {
+                    ggml_prof_region prof("spec:draft_decode");
+
+                    rc = llama_decode(ctx_dft, batch);
+                }
+
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1650,7 +1658,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_decode(ctx_dft, batch);
+            int ret;
+
+            {
+                ggml_prof_region prof("spec:draft_decode");
+
+                ret = llama_decode(ctx_dft, batch);
+            }
+
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;

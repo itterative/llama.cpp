@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-prof.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -2287,6 +2288,8 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    ggml_prof_region prof("ckpt:save_tgt");
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
@@ -2326,6 +2329,8 @@ void common_prompt_checkpoint::load_tgt(
     if (data_tgt.empty()) {
         return;
     }
+
+    ggml_prof_region prof("ckpt:load_tgt");
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {

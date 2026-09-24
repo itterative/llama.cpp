@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-prof.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2434,15 +2435,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+        {
+            // counts how many subgraphs a graph was partitioned into: the per-subgraph cost is host
+            // dispatch plus one allreduce, so this is the first number to look at when device work
+            // gets cheaper while a run gets slower
+            ggml_prof_region prof_subgraph("meta:subgraph");
+
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            ggml_prof_region prof_allreduce("meta:allreduce");
+
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;

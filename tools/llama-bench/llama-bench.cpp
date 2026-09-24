@@ -29,6 +29,7 @@
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
+#include "ggml-prof.h"
 #include "llama.h"
 #include "log.h"
 
@@ -2171,66 +2172,10 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-#if defined(__linux__)
-// marker for rocprofv3 --selected-regions: profiles only code between the resume and pause calls. No-op unless
-// the roctx shim is dlopened; the signature is two u64 to match both the v2 struct-arg and plain-id variants.
-struct roctx_decode_region {
-    int32_t (* resume_fn)(uint64_t);
-    int32_t (* pause_fn)(uint64_t);
-
-    static void * load() {
-        // first the main program, in case the profiler preloads the shim, then the usual install paths
-        static const char * candidates[] = {
-            nullptr,
-            "librocprofiler-sdk-roctx.so",
-            "librocprofiler-sdk-roctx.so.0",
-            "librocprofiler-sdk-roctx.so.1",
-            "librocprofiler-sdk-roctx.so.2",
-            "librocprofiler-sdk-roctx.so.3",
-            "/opt/rocm/lib/librocprofiler-sdk-roctx.so",
-            "/opt/rocm/lib/librocprofiler-sdk-roctx.so.0",
-            "/opt/rocm/lib/librocprofiler-sdk-roctx.so.1",
-            "/opt/rocm/lib/librocprofiler-sdk-roctx.so.2",
-            "/opt/rocm/lib/librocprofiler-sdk-roctx.so.3",
-        };
-        for (const char * c : candidates) {
-            void * h = dlopen(c, RTLD_NOW | RTLD_GLOBAL);
-            if (h) {
-                return h;
-            }
-        }
-        return nullptr;
-    }
-
-    static int32_t (* sym(void * h, const char * name))(uint64_t) {
-        return reinterpret_cast<int32_t (*)(uint64_t)>(dlsym(h, name));
-    }
-
-    roctx_decode_region() : resume_fn(nullptr), pause_fn(nullptr) {
-        static void * h = load();
-        static int32_t (* cached_resume)(uint64_t) = h ? sym(h, "roctxProfilerResume") : nullptr;
-        static int32_t (* cached_pause)(uint64_t)  = h ? sym(h, "roctxProfilerPause")  : nullptr;
-        if (cached_resume && cached_pause) {
-            resume_fn = cached_resume;
-            pause_fn  = cached_pause;
-        }
-        if (resume_fn) {
-            resume_fn(0);
-        }
-    }
-
-    ~roctx_decode_region() {
-        if (pause_fn) {
-            pause_fn(0);
-        }
-    }
-};
-#endif
-
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
-#if defined(__linux__)
-    roctx_decode_region roi;
-#endif
+    // under rocprofv3 --selected-regions this profiles only the decode loop
+    ggml_prof_window prof_window;
+
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
