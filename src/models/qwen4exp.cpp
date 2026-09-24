@@ -594,8 +594,8 @@ public:
 
         if (new_rows) {
             res &= new_rows->ne[0]  == (int64_t) pool_cur.n_new;
-            res &= !new_cells || new_cells->ne[0] == (int64_t) ratio;
-            res &= !new_cells || new_cells->ne[1] == (int64_t) pool_cur.n_new;
+            res &= !new_cells || new_cells->ne[0] == (int64_t) ratio*pool_cur.n_new;
+            res &= !new_cells || new_cells->ne[1] == (int64_t) n_stream;
         }
 
         return res;
