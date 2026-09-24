@@ -10,6 +10,9 @@
 
 #include <dlfcn.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 static void * ggml_roctx_lib(void) {
     static void * handle = []() {
         // under rocprofv3 the shim can already be in the global scope, without a loadable path
@@ -92,13 +95,26 @@ static const struct ggml_prof_sink ggml_prof_roctx_sink = {
 
 // registering at load keeps the call sites free of any backend-specific code
 static const bool ggml_prof_roctx_registered = []() {
-    if (!ggml_roctx_lib()) {
-        return false;
+    void * handle = ggml_roctx_lib();
+
+    if (handle) {
+        ggml_prof_register_sink(&ggml_prof_roctx_sink);
     }
 
-    ggml_prof_register_sink(&ggml_prof_roctx_sink);
+    // which half of the handshake is missing is otherwise invisible: without the library there are no
+    // ranges and no windows, and without roctxProfilerResume the ranges work but --selected-regions
+    // records nothing
+    const char * env = getenv("GGML_PROF_REGIONS");
 
-    return true;
+    if (env && atoi(env)) {
+        fprintf(stderr, "[prof] roctx: lib %s, roctxRangePushA %s, roctxProfilerResume %s\n",
+                handle == nullptr                          ? "not found"
+                    : handle == RTLD_DEFAULT               ? "already loaded" : "loaded",
+                handle ? (dlsym(handle, "roctxRangePushA")       ? "present" : "missing") : "-",
+                handle ? (dlsym(handle, "roctxProfilerResume")   ? "present" : "missing") : "-");
+    }
+
+    return handle != nullptr;
 }();
 
 #else
