@@ -11,9 +11,9 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H18 (the MTP tax, now framed as over-drafting), H17b (is the QSA chain 4x
-replicated), E008b (the measurement that decides the whole PLE/prefetch line), the H13 leftovers, the
-E052 MTP-with-pool check, and the H9 leftovers (f16 pool storage, E028 host mapping).
+**Live right now:** H9's prefill question (the pool works, and excluding prefill from it is a workaround
+nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated), E008b
+(the measurement that decides the whole PLE/prefetch line), and the H13 leftovers.
 
 ---
 
@@ -58,21 +58,6 @@ E052 MTP-with-pool check, and the H9 leftovers (f16 pool storage, E028 host mapp
   removed `compiler-rt18` and `libomp18`.
 - **Status:** presumably done - E019 re-baselined the ops gate on 7.1.1 on this box, which required it.
   Close formally on the next clean configure.
-
-### ~~B4 - pull in the bench box's fork changes~~ done, all three were already here
-
-Verified against this checkout rather than assumed:
-
-| item | commit | state |
-|---|---|---|
-| RDNA3/4 mmq tuning | `e6902b597` | in `mmq.cu` (`:248-251` tile choice, `:380-382` unconditional MMQ on RDNA4) |
-| custom AllReduce | `36c3e6d7d` | `allreduce-p2p.cu` (1298 lines), reached as the **internal** option: `ggml-cuda.cu:1076-1138` selects `try_allreduce_{nccl,internal,butterfly}` |
-| `-sm tensor` for qwen4exp | `a8b24dfdf` | `llm_arch_supports_sm_tensor` falls through to `return true` |
-
-The ordering warning that came with this item no longer applies, but one new question does: E037 traced
-`ncclDevKernel_Generic_4` on the bench box, so that build resolves the allreduce selector to **nccl**
-(its `GGML_HIP_RCCL` is presumably ON, unlike the dev box) and never reaches the fork's p2p kernels. See
-H16, which the user has told me not to chase without asking.
 
 ---
 
@@ -160,18 +145,6 @@ H16, which the user has told me not to chase without asking.
   `invalid device ordinal` on HIP, so `-sm layer` split behaviour and split counts stay T2-only here.
 - What *is* usable on 1 card: `-sm tensor` still routes through `ggml-backend-meta.cpp` with
   `n_backends = 1`, which is how the meta-backend crash (E044/E045) was reproduced locally at all.
-
-### ~~N4 - verify `__GFX12__` is actually emitted for gfx1201~~ yes, it is
-
-`/usr/bin/hipcc --offload-arch=gfx1201 -dM -E` over a TU that includes `hip/hip_runtime.h` prints
-`#define __GFX12__ 1` inside the `hip-amdgcn-amd-amdhsa--gfx1201` offload bundle, and
-`vendors/hip.h:215-217` keys `RDNA4` off exactly that. So the device branches are live, and the host-side
-`IS_RDNA4(cc)` claim is not half-tuned.
-
-**Trap that made me report this as a failure for five minutes:** compiling the same probe with `-c` and
-reading it with `nm` shows only the **host** pass symbols (`__device_stub__...`), where `__GFX12__` is
-correctly *not* defined - so the conditional kernel looks absent when it is present in the device bundle.
-Use `-dM -E`, not `-c` + `nm`.
 
 ### N5 - HC inputs are F32-only
 
@@ -281,9 +254,16 @@ Use `-dM -E`, not `-c` + `nm`.
   tensor kept ratcheting. Fixed, confirmed on 4 cards (pp back to -0.5..-0.9%, tg win intact), then
   collapsed to one graph shape and widened to all ubatch widths, with prefill behind
   `Q4EXP_POOLED_NO_PREFILL`. What the pool is for: long-context decode, +30% tg at 131k.
-- **Open:** the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
-  the E052 width change has never been measured where it matters, under `draft-mtp`; and the crossover
-  depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is unexplained.
+- **Open, and the live one:** `Q4EXP_POOLED_NO_PREFILL` is a workaround that works, not an explanation.
+  The user's position is that prefill should not have to be excluded and something else is at play, which
+  is fair: E051 showed pooled prefill neither gaining nor losing once the topology confound was removed,
+  and E052 showed it costing 2.9% with 24+7 re-reservations - but those reservation ms are not additive
+  cost (their bulk is a device sync that would otherwise be counted inside `graph:compute`, see E049's
+  review note), so what actually accounts for the 2.9% is unidentified. Reading it as "pooling prefill is
+  worthless" is a measurement, not a mechanism.
+- Also open: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
+  and the crossover depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is
+  unexplained.
 - **Scope:** prefill, decode, 4-card.
 
 ### H10 - mmq cutoff tuning for MoE models
@@ -390,11 +370,11 @@ Use `-dM -E`, not `-c` + `nm`.
   payload size is depth-independent - that is peer-wait, i.e. imbalance exposure growing with depth, and
   it is ~15 ms/token of a ~45 ms/token step, the same order as the whole chain.
 - **Do not chase without asking:** the user says NCCL is not an issue.
-- **One thing learned while checking B4:** the fork's custom AllReduce is *not* dead code - it is wired as
-  the `internal` option of a selector (`ggml-cuda.cu:1076-1138`, `try_allreduce_{nccl,internal,butterfly}`)
-  - but the box's RCCL kernels in this trace mean that selector resolved to nccl there. So "22% of device
-  time is NCCL" and "the box has a p2p allreduce" are both true and not in conflict; which one runs is a
-  build flag on the bench box, still unrecorded (B2).
+- **Parked by the user (2026-09-24), and the comparison already exists:** RCCL works on the bench box,
+  and the fork's p2p allreduce is *slightly slower* at tg there. So the selector
+  (`ggml-cuda.cu:1076-1138`, `try_allreduce_{nccl,internal,butterfly}`) is live code and both paths have
+  been measured - this is not a missing capability waiting to be found. The user has a suspect for the p2p
+  gap and is not focusing there. Do not reserve a run against H16 without asking.
 - **Scope:** decode, 4-card.
 
 ### ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
@@ -478,6 +458,25 @@ Use `-dM -E`, not `-c` + `nm`.
   `common_speculative`, and `common_perf_print` is called only by `tools/completion` (llama-bench has no
   spec decode, so MTP has to be measured through the server or cli). Closing both is ~30-40 host-side
   lines with nothing ROCm-specific.
+- **Settled by reading instead of measuring (was reserved as E052b):** does MTP use the QSA pool at all?
+  Two halves, both answered from source.
+  - The **target** side: a verify pass is an ordinary trunk forward with `ubatch.n_tokens == n_draft + 1`,
+    and since `bd0b294a8` the pool covers every width below 16 by default. So yes, as the user assumed,
+    and only `Q4EXP_POOLED_NO_PREFILL` at 16+ excludes anything. No run needed to learn that.
+  - The **draft** side: `graph_mtp` calls the same `build_layer_attn`, which takes the QSA path iff
+    `mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0` at `il = n_layer + offset`
+    (`qwen4exp.cpp:989-991`). That tail entry is not the trunk's: `conversion/qwen4exp.py:88` writes
+    `mtp_ratio = ratio if self._mtp_has_indexer() else 0`, keyed on the checkpoint having
+    `model.layers.<mtp_bid>.self_attn.indexer.index_qk_proj.weight`.
+  - So if the real file has no MTP indexer, the draft block runs **dense** attention over the whole shared
+    cache: at 131k that is `131072 x 2 heads x 256 x 2 B x (K+V)` = **268 MB read per replay**, against the
+    target's 2048-cell budget. One layer, but no sparsity at all. Sizing it: ~0.4 ms at ~640 GB/s, so
+    ~3% of the 13.7 ms per-replay gap. Real, scaling with depth, and **not** the tax; do not promote it to
+    a hypothesis on its own.
+  - One command, no GPU, safe on a 111 GB file (metadata pass only): `llama-gguf <file>.gguf r 2>&1 |
+    grep nextn`. Note that E046's lead is now narrower than it read: a working `draft-mtp` run already
+    proves the nextn fusion weights exist, because `graph_mtp` asserts `layer.nextn.eh_proj`, `enorm`,
+    `hnorm` and `hc_head_norm` non-null. What stays unknown is specifically the indexer.
 - **Scope:** decode, 4-card.
 
 ---
@@ -503,6 +502,11 @@ Use `-dM -E`, not `-c` + `nm`.
 - Thousands of majflt/s in prefill against near zero in decode means the PLE table is the prefill
   bottleneck and no kernel change will show up until that is fixed. **Fold into the qsa-A redo so it
   costs nothing.**
+- **User prior (2026-09-24), kept because a prior is not a measurement:** the box is "reading less" than
+  earlier runs, more during prefill and less during decode. So the direction is already believed; what
+  E008b still has to say is whether the prefill read rate is large enough to starve four cards, i.e.
+  whether it is *the* pp bottleneck or an incidental one. The `r/s` and `%util` columns decide that, not
+  the fact that reads happen.
 
 ### ~~E007b - repeat the `-sm` pp A/B after dropping `-ot`~~ deprioritised
 
@@ -592,16 +596,6 @@ Use `-dM -E`, not `-c` + `nm`.
   cost relative to real serving. Source: E008b.
 
 ---
-
-### E052b - does the pooled path actually engage under `draft-mtp` **the case E052 exists for**
-
-- `llama-bench` has no spec decode, so no ubatch ever lands in the 2..15 token band that E052 opened up.
-  Run `tg` at 131k with `--spec-type draft-mtp --n-draft 3`, `Q4EXP_POOLED=0` vs `1`, with `-v`, and count
-  `qsa pool: mode` lines.
-- Decides between three outcomes: verify steps reach the cached path (the change pays), they keep landing on
-  the cold-start rebuild (the width gate is keyed on the wrong thing), or the mode is NONE because the draft
-  and target contexts disagree about the shared memory state.
-- Source: E052.
 
 ## Code-level items
 
