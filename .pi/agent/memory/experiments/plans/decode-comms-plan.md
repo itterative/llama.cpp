@@ -45,6 +45,14 @@ ms/ubatch more host time than `05` and lose 2.25 and 2.70 t/s of decode, i.e. ~2
 host work is not free, but a ms of it is worth well under a ms of step time; the rest overlaps
 device work. P0 replaces this with a per-phase measurement.
 
+**The ~4-5 us constant is now measured independently, and it is 6.3 us.** `tools/peer-probe.cu`
+test5 does 200 sequential single-thread remote stores: 6.33 us per launch+store. NCCL's 37 us over 6
+calls is 6.2 us per call. That is the model confirmed from two directions, and it sets a floor: at
+N=4 a one-shot collective is 4 launches, so ~25 us of host time against NCCL's 37. **The host-side win
+is therefore ~1.5x, about 1% of tg, not the 4x the call-count arithmetic suggested** - which moves the
+justification entirely onto the device side and makes P3 (AR inside the captured graph, where per-AR
+host cost stops existing) the real host lever.
+
 **RCCL is exhausted as a lever.** `04` shows Tree was silently ignored (identical per-call cost to
 Ring), consistent with its `AllReduce | Tree = 0.0/0.0` row in the tuning table. `03` shows FC is
 real and worse. LL and one channel are already auto-selected at 10240 B. `VMM: no` on all four
