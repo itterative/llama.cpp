@@ -258,9 +258,10 @@ the pp result without applying it to the tg result.
 **Numerics: a 0.81% PPL gap, and my explanation of it had the sign backwards.** Same corpus, same flags:
 NCCL 2.6785 +/- 0.048 vs internal 2.7004 +/- 0.049. It is true that the two paths differ in wire
 precision - `ggml-cuda.cu:1019` keeps f32 only below 262144 elements and compresses larger collectives to
-bf16 at `:1036`, while the internal path's bf16 equivalent is the build flag `GGML_HIP_AR_BF16`, not
-defined here (verified in the compile flags), so prefill-sized collectives are bf16 on NCCL and f32 on our
-side; decode-sized ones (2560 elements) are f32 in both. But bf16 loss should make NCCL the *worse* of the
+bf16 at `:1036`, while the internal path's equivalent was then the build flag `GGML_HIP_AR_BF16`, not
+compiled in (verified in the compile flags), so prefill-sized collectives were bf16 on NCCL and f32 on our
+side; decode-sized ones (2560 elements) are f32 in both. That flag is gone as of `e4ff70d82` - the wire is
+now a runtime knob - but the numbers above were taken while it was off. But bf16 loss should make NCCL the *worse* of the
 two and NCCL came out better, so the mechanism is real and explains nothing. What is left is the honest
 reading: 0.0219 against a reported +/- 0.048 per-arm spread over a small corpus is perturbation-level, with
 the prefill rounding difference written into the KV cache, and its sign carries no information at that
@@ -327,9 +328,16 @@ Deliberately left as is, each a decision rather than an oversight:
   out of the scratch-growth path (freeing it there would have quietly switched one-shot off mid-run through
   `pick_by_size`'s null check). Raise `GGML_CUDA_AR_DIRECT_ONESHOT_BYTES` and the reservation grows with it,
   which is the honest coupling.
-- **`GGML_HIP_AR_BF16` stays OFF**, so the internal path moves f32 where NCCL moves bf16 at or above 262144
-  elements. That is probably the whole reason internal+auto measured ~5% below NCCL on pp. Enabling it is a
-  cmake flag plus a pp A/B, not a code change.
+- **The bf16 wire is a runtime knob now, and still defaults to off.** It used to be `GGML_HIP_AR_BF16`, a
+  build flag off by default, which made the internal path move f32 wherever NCCL moved bf16 at or above
+  262144 elements - probably the whole reason internal+auto measured ~5% below NCCL on pp. `GGML_CUDA_AR_DIRECT_BF16=off|nccl|<bytes>`
+  replaces it: `nccl` mirrors NCCL's own element-count predicate, a byte value sets a threshold, and the two
+  bf16 buffers are carved out of `dev_tmp` instead of adding allocations, so it costs nothing while off. Two
+  things to remember about it: it **cannot affect decode while one-shot is active**, because one-shot returns
+  before the decompress and is therefore excluded from compression by construction - so a pp parity run should
+  leave tg identical, which is a free check that the arms differ only where intended; and the `auto` ladder
+  judges its crossover on *uncompressed* bytes, since it runs before the predicate exists, so a 1.5 MiB f32
+  collective goes to `bde` even though its wire is 768 KiB.
 - **The 256 KiB cutoff is unmeasured** (P5). Decode is 10 KB and prefill is 10 MB, so nothing in the
   current configs sits near it; it matters for whatever MTP does, below.
 - **`GGML_CUDA_ALLREDUCE` still defaults to NCCL** on Linux. Flipping it is a decision for a user run.
@@ -363,7 +371,7 @@ inside a graph-captured pipeline.
   spin kernel holding SMs while peers catch up is fine at decode batch 1 and wrong if the AR ever overlaps
   compute on-device.
 - Is the ~10 MB prefill collective worth a two-shot variant, or does it stay on NCCL (or on `bde` with
-  `GGML_HIP_AR_BF16=ON`) permanently?
+  `GGML_CUDA_AR_DIRECT_BF16=nccl`) permanently?
 - Resolved since first written, kept so the wrong reading stays visible: `graph:alloc` and
   `sched:realloc_size` looked like ~123 calls at ~420 ms in the cumulative reports, which would have been
   the largest host cost in a bench run. That was phase attribution again - inside one test window it is 6

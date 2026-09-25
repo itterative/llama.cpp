@@ -200,6 +200,15 @@ visible to either - atomicity is not visibility. Debug anything like it with
 `GGML_CUDA_AR_ONESHOT_PROBE=<n>` (round-trips the real path at init and falls back on mismatch), because
 `llama-bench` mutes `GGML_LOG_INFO` without `-v` and that cost me two rounds.
 
+`GGML_CUDA_AR_DIRECT_BF16=off|nccl|<bytes>` (default off) is the direct pipeline's bf16 wire, replacing the
+old `GGML_HIP_AR_BF16` build flag; `nccl` mirrors the NCCL path's element-count predicate and the two bf16
+buffers are carved out of the existing scratch, so it costs nothing while off. Two things about it:
+`GGML_CUDA_AR_BF16_THRESHOLD` is a **different** knob on the `host_staged` pipeline (exactly 2 devices,
+default `1` = always compress), so read the log line before attributing a result; and the one-shot is
+excluded from compression by construction, so while one-shot is active this knob cannot move decode numbers
+at all - a pp-parity run should leave tg identical, which is a useful free check that your arms differ only
+where you intended.
+
 Origins: `ec16a072f` ("Optimize MOE GEMV kernel for BS > 1.", #20905) added small_k and the RDNA exclusion
 in the same commit - the exclusion came with the feature rather than after measuring RDNA, which is
 consistent with untested rather than lost. Unproven either way, and RDNA3 is unmeasured, which is the other
