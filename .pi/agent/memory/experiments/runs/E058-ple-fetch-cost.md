@@ -1,245 +1,195 @@
-# E058 - what the n-gram fetch costs a decode step, now that on-direct removed the faults
+# E058 - what the n-gram fetch costs a decode step, and the concurrency fix that took 4.2% off it
 
-- date: 2026-09-26 (armed 2026-09-25)
-- machine: bench-4x-r9700-32g (T2), run by the user
+- date: 2026-09-26
+- machine: bench-4x-r9700-32g (T2), every run by the user; the dev box only for calibration and gates
 - tier: T2
-- status: open - the size of the prize is measured, the fadvise arm was confounded, the reuse rate is not
-- parent: E031 (on-direct landed, +37.2% pp512 at 131k), E053 (decode kernel stats),
+- status: done
+- parent: E031 (`-lzm on-direct` landed, +37.2% pp512 at 131k), E053 (decode kernel stats),
   [plans/ple-prefetch.md](../plans/ple-prefetch.md), backlog L1/L2/H11
-- commit: `867f3eed3` (prof counters), `126b7a43b` (the instrumentation), `92586c61f` (uniq/reuse
-  counters). `b9301a5f1` (POSIX_FADV_RANDOM on the reader FDs) was **reverted by reset**, see below. All
-  of it inert without `GGML_PROF_REGIONS=1`, so the build is usable for anything else
-- model: the real Qwen3.8-Flash-Next Q4_K_M
+- commit: `867f3eed3` (prof counters), `126b7a43b` (reader instrumentation), `92586c61f` (uniq/reuse),
+  `8957f3667` (the two knobs), `3f1138bb3` (prefetch on by default). `b9301a5f1` (`POSIX_FADV_RANDOM`)
+  was tried and dropped by reset; recoverable from the reflog
+- model: the real Qwen3.8-Flash-Next Q4_K_M; `models/q4exp-4l.gguf` for gates and calibration
 
-## why now
+## verdict
 
-The user runs `-lzm on-direct` and sees 1-2 MB/s of disk reads during decode. The units are
-unconfirmed and they decide everything: MB/s is 8x Mbps, and the two readings imply a ~20% and a ~90%
-page-cache hit rate. No existing record answers either of the questions that follow:
+The PLE n-gram fetch was **1.42 ms of a 26.32 ms decode token (5.4%)** because a decode step reads 16
+independent 110 B rows and `gather()` put all 16 on **one thread**, so the ~8 cold ones were 8 separate
+queue-depth-1 waits. Issuing `POSIX_FADV_WILLNEED` for every distinct row before waiting on any of them
+takes the gather to **0.5819 ms/call** and tg **38.0 -> 39.6 (+4.2%)**. That is now the default
+(`3f1138bb3`), with `LLAMA_LAZY_PREFETCH=0` to opt out.
 
-1. how much of a decode step is the host-side n-gram fetch, now that it lives in `set_inputs` and not
-   in the graph?
-2. what fraction of the fetched rows are actually cold?
+Attribution does not rest on repetition: each arm's tg gain matches what its own gather delta predicts to
+within 0.3 t/s. Along the way the measurement closed four other proposals - a GPU row cache, a host row
+cache, `POSIX_FADV_RANDOM`, and the worker-count divisor - and corrected the table geometry by 16x.
 
-## what is already known
+## instrumentation
 
-- One trace exists (`results/user/llama-cli-traces/82bc067/llama-cli.log`, under rocprofv3):
-  `graph:set_inputs` 0.6124 ms/call average, max 4.62, against `phase:decode` 47.1054 ms/call, i.e.
-  **1.3%**. Two reasons not to trust it: 27 decode steps only (~40 generated tokens), so the working
-  set was ~640 rows and warm after first touch; and `--kernel-trace --marker-trace` inflates the
-  regions, which that log shows by reporting `graph:compute` 8221 ms total against `phase:decode`
-  1271 ms total. Both cannot be wall time. Its `kernel-stats.log` looks like a different run (the
-  `-o` name says `af1a347`, the directory says `82bc067`, and its call counts imply ~100x more steps
-  than 27), so the two files should not be cross-read.
-- Arithmetic: 16 rows/token (`ple_n_heads = (3-1)*8`) x 1760 B (Q5_0 over 2560 elems) = 28 KB useful
-  per token, 64 KB if every row is its own cold 4 KiB page.
-- `gather()` picks `n_workers = min(n_readers, max(1, n/32))`, so **decode (n = 16) runs on one
-  worker**: 16 serial preads against 32 idle buffered FDs. Prefill (n = 16384 at `-ub 1024`) gets all
-  of them. The divisor is the cheapest lever in this area and it is one line.
-- E031 already removed the mid-graph CPU split: with a reader, `llm_graph_lazy_rows::build` returns an
-  F32 input tensor and there is no `get_rows` node in the graph at all. So the fetch is host work
-  inside `set_inputs`, and nothing synchronizes before it unless `pipeline_parallel`, so it may
-  already overlap the previous step's device work.
+Three regions inside the previously undivided `graph:set_inputs`, so the host fetch path decomposes:
+`input:lazy_staging` (the staging vector grow), `input:lazy_gather` (the whole gather), `input:lazy_h2d`
+(the upload), plus `lazy:sort` and `lazy:prefetch` nested inside the gather. Regions nest per thread and
+totals are **inclusive**, so self time is a subtraction.
 
-## hypothesis
+`ggml_prof_count(name, delta)` (`867f3eed3`) adds named integer counters to the same report, printed
+after the regions in name order. The reader uses them for `/proc/self/io` deltas taken inside `gather()`:
+`rchar` is every byte asked of `pread` including page-cache hits, `read_bytes` is only what storage
+served, so the pair is the miss rate. Taking them in-process is what makes them usable - an external
+sampler cannot exclude model load and cannot separate prefill from decode. Calls are bucketed by row
+count at 1024, so decode (16 rows) and prefill (16384 rows at `-ub 1024`) never mix.
 
-The fetch is not a meaningful share of a decode step. At 1-2 **Mbps** the rate is 1-2 cold pages per
-token out of 16, a ~90% hit rate, and 0.1-0.2 ms of serial latency in a 47 ms step. At 1-2 **MB/s** it
-is ~13 cold pages per token and ~1.3-1.6 ms, i.e. 3-4%.
+`io:uniq_*` / `io:reuse_*` (`92586c61f`) count distinct rows per call and how many of those an earlier
+gather already read. All of it is inert without `GGML_PROF_REGIONS=1`.
 
-Either way the ceiling on *any* n-gram cache, host or GPU, is the whole fetch path: under 1% in the
-first case, ~4% in the second, and less after the reads are parallelised. A GPU row cache and the
-divisor fix are substitutes for the same 4%, and one of them is a line.
+Calibration: on the dummy model `uniq x row_size` = 157,300 B against `rchar` = 160,310 B, the 3,010 B
+difference being ~150 B/call of procfs overhead, and `reuse (256) <= uniq (1430) <= rows (1580)`.
 
-Falsified by: `input:lazy_gather` exceeding ~5% of `phase:decode`, or `io:storage_decode` per row
-running far above the 1760 B stored row size, which would mean readahead amplification after all (at
-the default 128 KiB window that would be 2 MB/token, ~30x the observed rate, so this is not expected).
+## the table geometry, and a wrong turn worth recording
 
-## conditions
+The stored row is **110 B**, one Q3_K block of 256 elements. Two independent readings agree: prefill
+`rchar / uniq` = 1,333,200 / 12,114 = 110.03 B, and decode (1914 - 150 procfs) / 16 = 110.25 B. The
+dummy reports the same "rows of 110 bytes". The size then closes the geometry: 20M n-gram vocab x 16
+heads = 320M rows x 110 B = 35.2 GB = **32.8 GiB**, which is H12's table size.
 
-Same build for every arm, same session. `-n 2000` minimum: the working set grows as 16 rows/token, so
-a short run measures first touch and never reuse.
+Runs 1-3 were analysed assuming a 1760 B row (Q5_K over the 2560-wide `ple_embed_dim`), which is 16x too
+big - and 16 is the head count, so every error lined up with a plausible story:
 
-```sh
-export LD_LIBRARY_PATH=$PWD/build/bin
-M=<model>
+| | inferred from 1760 B | measured by `io:uniq_*` |
+|---|---|---|
+| distinct rows per decode token | ~1 | **16** (`uniq` == `rows` in all eight runs) |
+| distinct rows per prefill ubatch | 756 | **12,114** (1.35x dedup, not 21x) |
+| storage per cold row | ~48 kB | **one 4 kB page** |
 
-# arm 1: baseline, the flags the user already runs. no rocprofv3, no GGML_PROF_DECODE
-GGML_PROF_REGIONS=1 llama-cli -m $M -lm none -sm tensor -fa 1 -lzm on-direct \
-  -ot per_layer_token_embd=CPU -c 131072 -b 2048 -ub 1024 -f <big prompt> -n 2000 \
-  --temp 0 -s 7 -st 2>&1 | tee /tmp/e058-arm1.log
-```
+Two conclusions flipped because of it, in opposite directions: the worker divisor looked dead (one row,
+nothing to parallelise) and is in fact the mechanism, and the readahead-amplification story looked real
+(48 kB per row) and is in fact absent (9.8 pages for 16 rows). **Only the `uniq` counter caught it.** A
+bytes-per-call counter cannot distinguish "few rows, big amplification" from "many rows, no
+amplification", and both fit the same 1-2 MB/s the user had observed by eye.
 
-`GGML_PROF_DECODE` only gates the rocprofv3 capture window, so it does nothing here.
+All 16 heads want different rows, which the index code supports: `mixed % ple_head_vocab_sizes[h] +
+ple_head_offsets[h]` (`qwen4exp.cpp:1314-1323`) puts each head in its own slice, so they cannot collide.
 
-```sh
-# arm 2: residency. same command, but warm the table's byte range into page cache first.
-# OFFS and the row size come from the load line:
-#   add_lazy_reader: ... rows of N bytes at offset OFFS of FILE
-dd if=$M of=/dev/null bs=1M skip=$((OFFS/1048576)) count=$((SIZE/1048576))
-```
+**The correct geometry was already written down.** `plans/qsa-ple-in-prefill-and-decode.md:43` says
+"16 rows of 110 bytes per token = 1760 B", and the error was reading that as *one* 1760 B row. Three runs
+were analysed on it before a counter contradicted it, so the lesson is to check a derived per-token byte
+total against the per-access count whenever the mechanism turns on accesses rather than bytes.
 
-Arm 2 is the clean residency test. `-lzm off` is **not**: with no reader the gather goes back to being
-a `ggml_get_rows` CPU op inside the graph, so that arm would measure the split E031 removed rather
-than residency. (This retracts a suggestion made before the code was read.)
+## runs 1-4: sizing the cost
 
-## results
+Same command, `-f prompt.md -st`, default sampling, so each run generated different text.
 
-Three runs on the bench box, same command, same model, `-f prompt.md -st`, no `-n` limit. Runs 1 and 2 are
-build `126b7a43b`, run 2 adding `GGML_PROF_DECODE=1`; run 3 is the fadvise arm `b9301a5f1`. Raw logs:
-`results/user/llama-cli-traces/126b7a4/llama-cli.log`, `.../llama-cli-1.log`, and
-`results/user/llama-cli-traces/b9301a5/llama-cli.log`.
-
-| | run 1 | run 2 | run 3 (fadvise) |
-|---|---|---|---|
-| generation / prompt | 38.3 / 1289.6 t/s | 38.3 / 1293.3 t/s | 37.8 / 1268.8 t/s |
-| decode gathers | 4437 | 2702 | 3982 |
-| `input:lazy_gather` | 1.2423 ms/call | 1.1834 ms/call | **1.9953 ms/call** |
-| `lazy_gather` max | 9.70 ms | 27.72 ms | **123.62 ms** |
-| `graph:set_inputs` | 1.4503 ms/call | 1.4221 ms/call | 2.2059 ms/call |
-| `phase:decode` | not enabled | 7.4786 ms/call | 7.7767 ms/call |
-| `io:rows_decode` | 16/call | 16/call | 16/call |
-| `io:rchar_decode` | 1.90 kB/call | 1.92 kB/call | 1.91 kB/call |
-| `io:storage_decode` | 30.44 kB/call | 26.53 kB/call | **47.37 kB/call** |
-| `io:rows_prefill` | 16.37k/call | 16.37k/call | 16.37k/call |
-| `io:rchar_prefill` | 1.33 MB/call | 1.33 MB/call | 1.33 MB/call |
-| `io:storage_prefill` | 391.58 kB/call | 42.93 kB/call | **36.15 MB/call** |
-| `lazy:sort` total | 20.24 ms | 19.97 ms | 20.61 ms |
-| `input:lazy_staging` total | 27.25 ms | 26.95 ms | 26.99 ms |
-| `input:lazy_h2d` total | 20.40 ms | 18.76 ms | 24.05 ms |
-
-### the size of the prize
+| | run 1 | run 2 | run 3 (`b9301a5f1`) | run 4 (`92586c61f`) |
+|---|---|---|---|---|
+| tg / pp | 38.3 / 1289.6 | 38.3 / 1293.3 | 37.8 / 1268.8 | 37.8 / 1292.7 |
+| decode gathers | 4437 | 2702 | 3982 | 2820 |
+| `input:lazy_gather` | 1.2423 ms | 1.1834 ms | 1.9953 ms | 1.5976 ms |
+| gather max | 9.70 ms | 27.72 ms | 123.62 ms | 51.77 ms |
+| `graph:set_inputs` | 1.4503 ms | 1.4221 ms | 2.2059 ms | 1.8301 ms |
+| `phase:decode` | not enabled | 7.4786 ms | 7.7767 ms | 7.8199 ms |
+| `io:rchar_decode` | 1.90 kB | 1.92 kB | 1.91 kB | 1.91 kB |
+| `io:storage_decode` | 30.44 kB | 26.53 kB | 47.37 kB | 40.02 kB |
+| `io:storage_prefill` | 391.58 kB | 42.93 kB | 36.15 MB | 2.71 MB |
 
 `phase:decode` wraps all of `llama_decode` for a batch at or under the limit (`llama-context.cpp:1734`),
-so it is the host side of a step only. The arithmetic closes:
+so it is the **host side of a step only**: `set_inputs` 1.42 + decode's `graph:compute` ~5.6 + ~0.46 =
+7.48 ms, against a 26.11 ms token wall. The other ~18.6 ms is the sync, the logits read and sampling after
+`llama_decode` returns. Quoting `gather / phase:decode` = 15.8% would overstate the share 3.5x; the
+honest figure is gather over the token wall, 4.5-6.0% across these runs.
 
-    set_inputs 1.42 + graph:compute(decode) ~5.6 + rest of llama_decode ~0.46 = 7.48 ms = phase:decode
-    token wall = 1 / 38.3 t/s                                                 = 26.11 ms
+Prefill is ~99.9% warm whenever the cache holds: run 2 read 12,114 distinct rows per ubatch for 42.93 kB
+of storage, about ten cold pages. Run 3 is the exception at 36.15 MB (73% cold) and it also hit a GPU
+hang, so its cache had been dropped - which is why its fadvise result is not attributable, see below.
 
-The missing ~18.6 ms/token is the sync, the logits read and sampling after `llama_decode` returns. So
-`phase:decode` is 28% of the generation wall (20.18 s of ~71.7 s), and quoting `lazy_gather / phase:decode`
-= 15.8% would overstate the prize by 3.5x. The honest share is
+The user's "1-2 MB/s during decode" was MB/s and it reproduces: run 4 read 112.87 MB over ~74.6 s of
+generation = 1.51 MB/s.
 
-**`input:lazy_gather` = 1.18 ms of a 26.11 ms token = 4.5%**, and it is exposed: `set_inputs` runs before
-the enqueue, at which point the device has already drained against the previous step's sync. Recovering
-all of it is 38.3 -> ~40.1 t/s. That is the whole prize, and it is 8x the 1.3% the earlier rocprofv3
-trace hinted at, because that run was 27 steps long and warm.
+## run 5: the four-arm A/B (`8957f3667`)
 
-### 16 requested rows are ~1 distinct row
+Interleaved on one binary, one pass each. `--temp 0` was tried first and **made the model loop**, and
+`-s <seed>` did not reproduce across runs, so the arms generated different text - 2863 to 4747 decode
+steps. Per-call normalization is what makes them comparable.
 
-`io:rchar_decode` is 1.90-1.92 kB/call against a 1760 B stored row (Q5_K over 2560 elems; 32.8 GiB over
-20M rows = 1761 B). Subtract the ~150 B/call of procfs overhead measured on the dummy model and what is
-left is 1754 B, i.e. **exactly one row**: the 16 `ple_n_heads` indices collapse to one distinct row and
-`read_range`'s coalescing turns that into one pread plus 15 memcpys of 10 kB. Prefill collapses harder:
-16384 requested rows -> 1.33 MB = **756 distinct rows per 1024-token ubatch**, identical in all three runs
-as it must be for the same prompt.
+| arm | decode calls | rows | uniq | rchar | storage | cold pages | gather | **us/cold page** | gather min | tg |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A baseline | 2863 | 16.26 | 16.26 | 1914 B | 33.39 kB | 8.15 | 1.4181 ms | **174** | 0.05 | 38.0 |
+| B `PREFETCH=1` | 4747 | 16.15 | 16.15 | 1902 B | 30.49 kB | 7.44 | **0.5819 ms** | **78** | 0.06 | **39.6** |
+| C `WORKERS=8` | 4096 | 16.18 | 16.18 | 1907 B | 29.86 kB | 7.29 | 0.7929 ms | 109 | **0.29** | 39.1 |
+| D both | 4373 | 16.17 | 16.17 | 1905 B | 26.41 kB | 6.45 | 0.7148 ms | 111 | 0.31 | 39.2 |
 
-Not explained: `qwen4exp.cpp:1314-1323` builds 2 n-gram orders x 8 heads with per-head
-`ple_head_vocab_sizes` and `ple_head_offsets`, which should give 2 distinct rows, not 1. The counters are
-calibrated - on the dummy, `uniq x row_size` = 157,300 B against `rchar` 160,310 B, the difference being
-the procfs overhead - so the collapse is real and not an accounting artifact. `io:uniq_*` (`92586c61f`)
-now measures it directly instead of inferring it from rchar.
+Controls held. `uniq == rows` in every arm, and `rchar` is within 0.6% (1902-1914 B) because it is
+structurally 16 x 110 B plus procfs regardless of *which* rows. Prefill counters are **byte-identical
+across all four arms** (`rchar` 33.33M, `rows` 409.30k, `uniq` 302.86k, `reuse` 91.64k) because
+`prompt.md` is the same, and prompt rate is 1292.0 / 1290.1 / 1292.3 / 1292.2 t/s - within 0.15%, so no
+arm costs anything at prefill. Only cold-ness drifted, 26.4-33.4 kB/call, so it is divided out: latency
+per cold page falls **174 -> 78 us** in B, a 2.2x concurrency win against a cache-state spread of 1.27x.
 
-### ~48 kB of storage per cold row, and prefill and decode are different populations
+B's 0.5819 ms includes the nested `lazy:prefetch` 0.1207 ms, so its read self-time is 0.4612 ms = 62 us
+per cold page. C and D show a hard floor at `gather min` 0.29/0.31 ms against A/B's 0.05/0.06 ms - that
+is the cost of spawning 7 threads per token, and it is why C loses despite reading as fast as B.
 
-Storage per distinct row is ~48 kB in run 3 for both buckets: prefill 36.15 MB / 756 = 47.8 kB, decode
-47.37 kB / ~1. The same cold-row size fits runs 1-2 prefill, where 756 rows cost 42.93 kB (run 2: ~10 cold
-pages, **98.7% hit**) and 391.58 kB (run 1: ~95 cold pages, 87% hit).
+tg accounting, from A's 26.316 ms/token:
 
-So with a warm page cache, **prefill's rows are essentially all hits and decode's single row is cold
-60-100% of the time**: runs 1-2 decode at 26-30 kB/call against a ~48 kB cold row implies a ~40% hit rate,
-run 3 at 47.37 kB implies ~0%. They are different row populations - the rows prefill warms are not the
-rows decode asks for. That constrains every cache proposal, and it is why `io:reuse_*` is the next
-measurement: only decode's own history can feed a decode cache.
+| arm | gather saving | predicted | measured |
+|---|---|---|---|
+| B | 0.836 ms | 25.480 ms -> 39.25 t/s | **39.6** |
+| C | 0.625 ms | 25.691 ms -> 38.92 t/s | 39.1 |
+| D | 0.703 ms | 25.613 ms -> 39.04 t/s | 39.2 |
 
-Run 3 also demonstrates how sensitive this is to cache state: prefill storage fell 9x from run 1 to run 2
-on byte-identical requests, purely because run 2 reused run 1's page cache.
+Every arm lands within ~0.3 t/s of its own prediction, so the gain is the gather and nothing else.
 
-### the fadvise arm: prediction falsified, run confounded, commit reverted
+Prefetch cost 0.1207 ms/call for 16 rows on the bench box (7.5 us per `fadvise` that starts real
+readahead, against 0.75 us when the page is already cached, which is what prefill's ~9 ms per 12,114-row
+ubatch implies).
 
-`b9301a5f1` added `posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM)` to each reader FD, on the reasoning that
-`llama-mmap.cpp:552` already advises `POSIX_MADV_RANDOM` over the lazy ranges while the descriptors the
-reader opens itself never got the hint. Predicted: `io:storage_decode` <= 4 kB/call, `lazy_gather`
-<= 0.3 ms if the row had been hitting, `rchar` unchanged as the control.
+## closed
 
-Observed: storage **up** (decode 26.53 -> 47.37 kB/call, prefill 42.93 kB -> 36.15 MB/call), gather **up**
-1.1834 -> 1.9953 ms/call, tail up 27.72 -> 123.62 ms, generation 38.3 -> 37.8 t/s. The control held
-exactly (`rchar` 1.92 -> 1.91 kB/call, `rows` 16/call), so the patch changed nothing about what is asked.
+- **Any row cache, host or GPU.** The misses are **compulsory first touches**, not evictions: 2820 tokens
+  introduced 33.2k distinct rows = **133 MB of pages**, a trivial working set on a 62.7 GiB box, so
+  nothing is being squeezed out. `io:reuse_decode` is 27.7-34.1% and those rows are *already free* via
+  the page cache, which is why storage is 26-33 kB/call and not the 64 kB/call of 16 cold pages. A cache
+  can only re-capture what the kernel already captures, and a page-cache hit is ~1-2 us. The feasibility
+  work in `ple-prefetch.md` (constant shapes so capture survives, `ggml_set_rows` already in tree from
+  H9, Q5 storage at 1.76 GB per million rows) stands, but there is nothing for it to win.
+- **`POSIX_FADV_RANDOM`.** 9.8 pages for 16 rows means at most one page per row, so there is no readahead
+  amplification to remove. Run 3's higher numbers were its cold cache: `storage_prefill / rchar_prefill`
+  went 0.032x -> 27x on byte-identical requests, which fadvise cannot cause. Dropped without an A/B.
+- **The `n/32` worker divisor.** Alive again once `uniq` showed 16 distinct rows, then measured: it works
+  (174 -> 109 us/page) but pays ~0.29 ms/token of thread spawn, so prefetch dominates it. The knob stays
+  for tuning; the default formula is unchanged.
+- **`lazy_staging`, `lazy_h2d`, `lazy:sort`.** 27-30 ms, 19-24 ms and 20 ms total over a ~75-120 s run.
+  The staging max of 4.4 ms is the one-time zero-fill of a 16.8 MB grow at `-ub 1024` (16384 rows x 256
+  elems x 4 B), not a per-step cost. The upload is async, so `lazy_h2d` is enqueue time.
+- **`-lzm off` as a residency test.** With no reader the gather becomes a `ggml_get_rows` CPU op inside
+  the graph again, so that arm measures the split E031 removed rather than residency.
 
-**Not attributable to the patch.** `io:storage_prefill / io:rchar_prefill` went from 0.032x to 27x on
-byte-identical requests, and `POSIX_FADV_RANDOM` cannot un-warm a page cache. Run 3 read the same 756 rows
-per ubatch that run 2 read for 42.93 kB and paid 36.15 MB for them, so the cache was cold. The run also
-hit a GPU hang (RCCL without p2p), which is how a restart drops the cache. The arms differ in cache state
-by ~800x and the fadvise effect is not separable from it. Reverted by reset to `7cdef26eb`; recover as
-`b9301a5f1` from the reflog if the A/B below wants it back.
+## open
 
-Two hypotheses survive for a cache-normalized A/B: (a) it was all cache state and fadvise is neutral;
-(b) fadvise RANDOM genuinely costs, because a 1760 B row straddles a page boundary and without a readahead
-window it takes two synchronous page reads instead of one, and at prefill a sorted 756-row gather loses
-the neighbouring rows the window would have brought in for free. (b) matters because E031's +37.2% pp512
-was measured with readahead on. Such an A/B must interleave arms within one session, or drop caches before
-each arm (`echo 1 > /proc/sys/vm/drop_caches`), and use p2p so it does not hang.
-
-Worth having before that A/B, because a ~48 kB per-cold-row granularity smells like large folios or a
-stripe rather than readahead: kernel version, the filesystem holding the model, and that device's
-`read_ahead_kb`. If the granularity is folio-sized, readahead tuning is the wrong lever entirely and
-residency is the only one.
-
-## what to read off the table
-
-| field | meaning |
-|---|---|
-| `input:lazy_gather` ms/call vs `phase:decode` ms/call | the share of a decode step the fetch takes |
-| `io:rchar_decode / io:rows_decode` | bytes asked per row. 1760 = every row distinct, less = duplicates coalesced by `read_range` |
-| `io:storage_decode / io:rows_decode` | cold bytes per row. 0 = all warm, ~4096 = every row a cold page |
-| `io:storage_decode / io:rchar_decode` | the miss rate, which is the number the MB/s-vs-Mbps question was proxying |
-| `input:lazy_staging` at prefill | the zero-fill on a staging grow (336 MB at `-ub 2048`) |
-| `input:lazy_h2d` | the F32 upload: 10240 B/row against 1760 stored |
-| `lazy:sort` | the index sort; matters at n = 16384, expected negligible at n = 16 |
-
-## decision table
-
-| observation | conclusion | fix it points at |
-|---|---|---|
-| gather < 1% of decode | the fetch is not the cost | close L1/L2, build nothing |
-| miss rate low | the page cache already does the job | close L1/L2, build nothing |
-| miss rate high AND arm 2 cuts gather a lot | cold reads, residency is the lever | a cache is justified; run the index trace next |
-| miss rate high AND arm 2 changes nothing | the cost is syscall/dequant, not I/O | the `n/32` divisor, not a cache |
-| `lazy_staging` dominates prefill | zero-fill on grow | `reserve`, not a cache |
-| `lazy_h2d` dominates | the F32 upload | upload Q5 rows and dequantize on device, not a cache |
-
-Only the third row leads to a cache, which is the reason to measure before designing one.
-
-**Where this landed:** no row, because the table did not anticipate the combination that appeared. The
-gather is 4.5% of the token wall (not < 1%), and the miss rate is high for decode but ~1% for prefill,
-which is not one "miss rate" but two. Three rows are closed as measured and dead: the `n/32` divisor
-(decode reads ~1 distinct row, so there is nothing to parallelise), `lazy_staging` (27 ms total over a
-~117 s run, its 4.4 ms max being the one-time 168 MB zero-fill), and `lazy_h2d` (19-24 ms total, and the
-set is async so it is enqueue time). `lazy:sort` is 20 ms total. What remains is the cache row, and it now
-turns on `io:reuse_decode` rather than on arm 2.
+- **The tail.** `lazy_gather` max is 28.97 / 30.29 / 30.41 / 30.63 ms across the four A/B arms - one row
+  read costing more than a whole token's budget, in every arm including the fixed one, and 51.77-123.62 ms
+  in runs 3-4. Prefetch cut the mean 59% and barely touched the max. Whatever that is, it is not
+  queue-depth-1 latency, and it is the irregular-tg signature backlog L1 predicted.
+- **`meta:subgraph` is now the biggest host-side number**: 97 dispatches and ~5.4 ms per decode step,
+  essentially all of decode's `graph:compute` and ~21% of the token wall, which is 3.4x the *fixed*
+  gather. `meta:allreduce` adds ~1.4 ms/step. Comms thread, not PLE.
+- **Warm-cache cost of the new default.** When rows are already cached, prefetch is pure overhead: the
+  dev box measured gather 0.1194 -> 0.1687 ms/call (+41%) with it on. On the bench box that is ~0.12 ms
+  of a 25.3 ms token, ~0.5%, against +4.2% when the table cannot stay cached. `LLAMA_LAZY_PREFETCH=0`
+  opts out. Whether a size threshold is worth the magic number is untested.
+- **Why `-s <seed>` does not reproduce** across runs with `-sm tensor`. The likely cause is
+  non-deterministic 4-card reduction order moving the last bits of the logits, not the sampler. If so, no
+  llama-cli run on this box can be text-matched and every A/B has to normalize per call. Unconfirmed.
 
 ## notes
 
-- The two `/proc/self/io` reads inside `gather` add ~150 B to `rchar` per call, measured on the dummy
-  model. That is ~8% of a 1.9 kB decode call, so the miss rate is understated by that much - and
-  subtracting it is what makes `rchar` come out at exactly one 1760 B row.
-- The `uniq`/`reuse` pass is a linear scan of the sorted pairs plus one hash insert per distinct row,
-  inside `input:lazy_gather`: ~1 us at decode (n = 16) and ~50 us at prefill (n = 16384, 756 distinct).
-  Negligible at decode, worth remembering when reading prefill gather times.
-- `lazy_seen` is process-wide and never evicted, so a very long run grows it. Inert unless profiling.
-- `meta:subgraph` is the largest host-side number in these traces and has nothing to do with PLE: 97
-  dispatches and 5.5 ms per decode step, which is essentially all of decode's `graph:compute` (5.6 ms) and
-  **21% of the 26.11 ms token wall**, 4.7x the n-gram gather. `meta:allreduce` adds 1.4 ms/step. Whether
-  that 5.5 ms is exposed depends on how 4-card dispatch paces against device execution, which these
-  regions cannot show. Belongs to the comms thread; recorded here so it is not lost.
-- `/proc/self/io` is Linux. Elsewhere `lazy_self_io` returns false and the io counters stay absent, while
-  `rows`/`uniq`/`reuse` still work.
-- The counters are process-wide, not per reader, so a model with more than one lazy tensor mixes them.
-  qwen4exp has one (`ple_layer_ids = [2]`).
-- Bucketing is by row count at 1024, so an MTP verify of 64 tokens x 16 rows still lands in `decode`.
-  Run 2's `rows_decode` total (43.97k over 2702 calls = 16.27/call) shows ~46 two-token steps, so MTP does
-  fire occasionally without a draft model on the command line.
-- If a cache does get built: it is constant-shape and therefore capture-safe (always upload
-  `ple_n_heads` rows, always scatter all slots, hits rewrite identical bytes), `ggml_set_rows` is
-  already in tree from H9, and storing it Q5 rather than F32 makes 1M rows 1.76 GB/card instead of
-  10 GB. That is the feasibility answer, and it is not the same as the justification.
+- The two `/proc/self/io` reads inside `gather` add ~150 B/call to `rchar`, ~8% of a decode call, so the
+  miss rate is understated by that much. Subtracting it is what makes `rchar` come out at 16 x 110 B.
+- `lazy_seen` is process-wide and never evicted, so decode's reuse figure includes rows *prefill* read.
+  Decode-only reuse is at most the measured 27.7-34.1%, which only strengthens the cache conclusion.
+- Cold pages are derived as `storage / 4096`. If the device granularity is not 4 kB the absolute count is
+  off, but every arm ran on the same device, so the ratios hold.
+- `/proc/self/io` is Linux; elsewhere `lazy_self_io` returns false and the io counters stay absent while
+  `rows`/`uniq`/`reuse` still work. The counters are process-wide, not per reader, so a model with more
+  than one lazy tensor mixes them; qwen4exp has one (`ple_layer_ids = [2]`).
+- Run 3 is kept even though it is not attributable: it is the only observation of a cold-cache prefill
+  (73% cold, 36.15 MB per ubatch) and of the 123.62 ms gather tail.
+- Raw logs are `.log` under `results/user/`, uncommitted by PROTOCOL 8 and regenerateable from the command
+  in each file's first line.

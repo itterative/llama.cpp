@@ -21,20 +21,33 @@ host-side. What that does to this plan:
   written, and the `--load-mode mmap+mlock` A/B with it.
 - **The VRAM cache got more feasible and less justified.** Feasible: `ggml_set_rows` is in tree (H9),
   constant shapes are achievable so graph capture survives, and Q5 storage makes 1M rows 1.76 GB/card
-  instead of 10 GB. Less justified: the ceiling is now arithmetic - 16 rows x 1760 B = 28 KB/token, so an
-  all-cold decode pays ~1.6 ms of a 47 ms step - and `gather()` reads decode's 16 rows on **one worker**
-  (`n_workers = min(n_readers, max(1, n/32))`), so most of that 1.6 ms is recoverable with one line
-  instead of a subsystem. E058 decides which.
+  instead of 10 GB. Less justified: the ceiling is now arithmetic, and `gather()` reads decode's rows on
+  **one worker** (`n_workers = min(n_readers, max(1, n/32))` = 1 at n = 16), so most of it is recoverable
+  with one line instead of a subsystem. E058 decided: the line, not the subsystem.
 
-**E058 ran (2026-09-26).** The gather is **4.5% of the token wall** (1.18 ms of 26.11 ms at 38.3 t/s),
-not the ~10% this note's ceiling allowed and not the 1.3% the one earlier trace hinted at. Two of the
-assumptions above were wrong in ways that matter: a decode step requests 16 rows but reads **one** distinct
-row of 1760 B, so "16 faults per token" was 16x too high; and a cold row costs **~48 kB of storage**, not
-4 kB, so the byte side was ~12x too low. Those roughly cancel in the total, which is why the ceiling landed
-close. What does not cancel is the split: prefill's 756 distinct rows per 1024-token ubatch are ~99%
-page-cache hits while decode's one row is cold 60-100% of the time, so "(a) alone - warm the table" cannot
-be judged from a prefill-heavy run, and the (b) VRAM row cache would be fed only by decode's own history.
-Whether that history repeats is `io:reuse_decode` (`92586c61f`), and it is the last open question here.
+**E058 ran and closed this (2026-09-26).** The stored row is **110 B** (one Q3_K block of 256 elems), not
+the 1760 B assumed above, so a decode step reads **16 distinct rows** - one per head, since
+`ple_head_offsets` gives each head its own slice - and a 1024-token prefill ubatch reads 12,114. The
+gather was **1.4181 ms of a 26.32 ms token (5.4%)**, and the mechanism was exactly the one-worker point
+above: ~8 of the 16 rows are cold, so it was 8 serial queue-depth-1 waits at 174 us each. Issuing
+`POSIX_FADV_WILLNEED` for every distinct row before waiting on any takes it to **0.5819 ms** and tg
+**38.0 -> 39.6 (+4.2%)**, and that is now the default (`3f1138bb3`).
+
+What that leaves of this plan:
+
+- **(a) warm the table** - not the lever. The misses are compulsory first touches, not evictions: 2820
+  tokens introduced 33.2k distinct rows = 133 MB of pages on a 62.7 GiB box. Prefill's rows are ~99.9%
+  warm and decode's are not because they are different populations, not because anything got squeezed out.
+- **(b) the VRAM row cache** - closed, and not by feasibility. `io:reuse_decode` is 27.7-34.1% and those
+  rows are already served by the page cache for ~1-2 us, which is why storage is 26-33 kB/call rather than
+  the 64 kB/call that 16 cold pages would cost. A cache can only re-capture what the kernel already
+  captures.
+- **Step 3, the index-log + offline hit-rate study** - no longer needed to decide the cache; the reuse
+  counter answered it inside runs that were happening anyway.
+- **What survives is the tail:** `lazy_gather` max is 28.97-30.63 ms in every arm including the fixed one,
+  so a single row read can still cost more than a whole token's budget. That is the irregular tg this plan
+  predicted, and prefetch cutting the mean 59% while barely moving the max says it is not queue-depth
+  latency.
 
 Killed: **E007** (put the table in VRAM). Reason, from code not taste - under `-sm tensor`
 the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`,
