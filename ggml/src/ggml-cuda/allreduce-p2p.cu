@@ -270,16 +270,16 @@ static __global__ void ggml_cuda_ar_oneshot_kernel(ggml_cuda_ar_os_args a) {
     }
 }
 
-// GGML_CUDA_AR_ONESHOT_DEBUG=1: dump every pointer the first collective passes
-// to the kernel, with what the runtime thinks each one is. The box reported a
-// write fault at a low VA, so this is what pins down which of the four it was.
+// GGML_CUDA_AR_ONESHOT_DEBUG=1: dump every pointer the first two collectives pass
+// to the kernel, with what the runtime thinks each one is. Needs verbose logging
+// in the app (llama-bench: -v 3), which is why a debug session on this path was
+// briefly printing to stderr instead.
 static void ggml_cuda_ar_os_dump_ptr(const char * what, const void * ptr) {
     hipPointerAttribute_t at = {};
     const hipError_t e = hipPointerGetAttributes(&at, ptr);
 
-    fprintf(stderr, "[ar-os]   %-22s %p  err=%d type=%d dev=%d managed=%d devptr=%p\n", what, ptr,
-            (int) e, (int) at.type, at.device, (int) at.isManaged, at.devicePointer);
-    fflush(stderr);
+    GGML_LOG_INFO("[ar-os]   %-22s %p  err=%d type=%d dev=%d managed=%d devptr=%p\n", what, ptr,
+                  (int) e, (int) at.type, at.device, (int) at.isManaged, at.devicePointer);
 }
 
 static void ggml_cuda_ar_launch_oneshot(
@@ -321,8 +321,8 @@ static void ggml_cuda_ar_launch_oneshot(
 
         static const bool dbg = getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr;
         if (dbg && gen <= 2) {
-            fprintf(stderr, "[ar-os] dev %d gen %u nunits %d slot %zu tmp %zu\n",
-                    p->devices[i], gen, nunits, slot_bytes, p->tmp_bytes);
+            GGML_LOG_INFO("[ar-os] dev %d gen %u nunits %d slot %zu tmp %zu\n",
+                          p->devices[i], gen, nunits, slot_bytes, p->tmp_bytes);
             ggml_cuda_ar_os_dump_ptr("self",  a.self);
             ggml_cuda_ar_os_dump_ptr("dst",   a.dst);
             for (int j = 0; j < n; ++j) {
@@ -400,14 +400,13 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
     }
 
     if (getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr) {
-        fprintf(stderr, "[ar-os] pre-launch: n=%d ne=%d tmp=%zu slot=%zu inbox=%zu\n",
-                n, (int) ne, p->tmp_bytes, 2 * p->tmp_bytes, (size_t) n * 2 * 2 * p->tmp_bytes);
+        GGML_LOG_INFO("%s: pre-launch: n=%d ne=%d tmp=%zu slot=%zu inbox=%zu\n", __func__, n, (int) ne,
+                      p->tmp_bytes, 2 * p->tmp_bytes, ggml_cuda_ar_os_bytes(p, p->tmp_bytes));
         for (int i = 0; i < n; ++i) {
             const std::string tag = "dev" + std::to_string(p->devices[i]);
             ggml_cuda_ar_os_dump_ptr((tag + " dev_tmp").c_str(),  p->dev_tmp[i]);
             ggml_cuda_ar_os_dump_ptr((tag + " os_inbox").c_str(), p->os_inbox[i]);
         }
-        fflush(stderr);
     }
 
     ggml_cuda_ar_launch_oneshot(p, work_data, GGML_TYPE_F32, ne, compute, streams);
@@ -464,12 +463,9 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
         std::chrono::steady_clock::now() - t1).count() / (double) iters;
 
     if (ok) {
-        // stderr, not GGML_LOG_INFO: llama-bench mutes INFO unless verbose is on, and
-        // this is the only measurement of one round trip over the real links.
-        fprintf(stderr, "[ar-os] probe ok over %d GPUs: %.1f us pipelined per collective, %.1f us\n"
-                        "        with a full device wait each round; %d KB payload, sum %.1f identical\n",
-                n, thr_us, lat_us, (int) (ne * 4 / 1024), expect);
-        fflush(stderr);
+        GGML_LOG_INFO("%s: probe ok over %d GPUs: %.1f us pipelined per collective, %.1f us with a full "
+                      "device wait each round; %d KB payload, sum %.1f identical\n",
+                      __func__, n, thr_us, lat_us, (int) (ne * 4 / 1024), expect);
     } else {
         GGML_LOG_ERROR("%s: probe FAILED, expected sum %.1f; dropping to algo=auto\n", __func__, expect);
         p->algo = GGML_CUDA_AR_ALGO_AUTO;
