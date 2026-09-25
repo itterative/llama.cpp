@@ -160,7 +160,63 @@ half the step has no kernel resident at all, which is a host-bound symptom. So:
   ~30-call path still lands at ~64 us/call, i.e. above NCCL.
 - `-sm layer` is off the table (user decision).
 
-## 8. Open questions
+## 8. Implementation status (2026-09-25)
+
+P2 landed in `ggml/src/ggml-cuda/allreduce-p2p.cu`, opt-in, default untouched.
+
+**One deliberate deviation from the legacy sketch, and it removes P1.** The wire unit is
+NCCL-LL-shaped rather than doorbell-shaped: each 8-byte store carries 4 bytes of payload plus a
+4-byte generation tag in the *same* atomic word. A reader therefore sees either the old unit or the
+new one, so there is no flag array, no arrival counter, no `__threadfence_system()` anywhere, and no
+separate wait phase - the read loop is the wait. **That deletes the plan's top risk item**: the
+posted-write-ordering assumption never comes up, because there is no flag that could overtake data.
+Inboxes are double-buffered by generation parity (proof sketch in the code comment: a peer's g+2 push
+is enqueued after its g+1 kernel, which needed my g+1 push, which is after my g kernel finished).
+
+What is in: `GGML_CUDA_AR_DIRECT_ALGO=oneshot`, one kernel per device per collective, inactive shards
+zeroed inside the push instead of a `cudaMemsetAsync`, no `data_ready` events recorded on this path,
+`GGML_CUDA_AR_ONESHOT_PROBE=<iters>` running the real path over the real links at init and dropping
+to `auto` if the sum is wrong, and a co-resident 16 x 256 grid.
+
+What was **not** verifiable locally, because this box has one GPU: peer-pointer dereference across
+the root complex, that a remote posted write becomes visible to a local volatile load at all, the
+spin's forward progress, and any timing. The probe is the first thing to run for exactly that
+reason. The spin has a 2e8-iteration bound that prints and contributes zero - chosen deliberately
+over hanging the box, which means a failure looks like a loud log line plus wrong numerics rather
+than a wedge.
+
+Two bugs found by re-reading rather than by testing, both would have been box-only failures: the
+inbox was `cudaMalloc`'d uninitialized so a random tag could equal generation 1 (now zeroed, tag 0
+means never-written), and the spin load was not `volatile` so the compiler could hoist it out of the
+wait loop (would have hung or read stale data).
+
+### Test recipe on the bench box
+
+```sh
+git pull   # file is existing, so no cmake -B needed, but reconfigure is harmless
+export LD_LIBRARY_PATH=$PWD/build/bin
+
+# 1. probe only: does the LL unit survive the root complex, and what is one round trip worth
+GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot \
+GGML_CUDA_AR_ONESHOT_PROBE=200 \
+  build/bin/llama-cli -m <model> -p hi -n 1 -ngl 99 -sm tensor 2>&1 | grep -i "ar-oneshot\|probe"
+
+# 2. correctness: golden must be unchanged vs the -sm tensor reference 263113.7846
+GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot \
+  build/bin/llama-perplexity -m <model> -ngl 99 -lm none -sm tensor -fa 1 -f <golden-corpus> 2>&1 | grep "Final estimate"
+
+# 3. perf: same arms as the five-arm sweep, so us/call is directly comparable to NCCL's 37.0
+GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot GGML_PROF_REGIONS=1 \
+Q4EXP_POOLED=1 GGML_FATTN_RDNA_RTILE=1 GGML_CUDA_MMVQ_RDNA4_SMALL_K=1 Q4EXP_SPARSE_FA=0 \
+  build/bin/llama-bench -m <model> -lm none -sm tensor -fa 1 -lzm on-direct -ot per_layer_token_embd=CPU \
+  -d 4096,131072 -p 0 -n 128 -r 3 -b 2048 -ub 1024 -o md
+```
+
+Bar from section 2: `meta:allreduce` at or under ~20 us/call (NCCL is 37.0, butterfly 127.1), and tg
+at or above 33.48 / 29.61. Expect the probe's `us per collective` to be a few us if the round-trip
+theory holds; if it comes back at 40-60 us, the peer wait dominates and P2 is not the lever.
+
+## 9. Open questions
 
 - Does P2's device win survive if the four ranks are only loosely synchronized by the ARs
   themselves? A spin kernel that keeps SMs busy while peers catch up is fine at decode batch 1 and
