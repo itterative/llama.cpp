@@ -5,6 +5,19 @@ dev box. Read [runs/E044-h9-pool-implementation.md](../runs/E044-h9-pool-impleme
 six places where this design was wrong and what the validation matrix actually covers; the numbers
 below are kept as written at design time.
 
+Since then, three changes to the shape policy, all recorded elsewhere:
+
+- **REBUILD is gone** (`8206d79d8`, [runs/E051](../runs/E051-collapse-rebuild-into-cached.md)): variant 2
+  below is now CACHED with `wm = 0`, and the scores read the `set_rows` result, so there is one pooled
+  topology and the write->read edge is real instead of relying on node order.
+- **Widths** (`bd0b294a8`, [runs/E052](../runs/E052-pool-covers-multi-token-ubatches.md)): every width
+  pools by default, `Q4EXP_POOLED_NO_PREFILL` opts wide ubatches out.
+- **Reservation** ([runs/E056](../runs/E056-pooled-reserve-shape.md)): the full-cache context answers
+  `qsa_pool_get` with the pooled worst case (`wm = 0`, `n_new = n_bid = ceil(n_kv/ratio)`), so
+  `sched_reserve` measures the shape the runtime builds, and a run shorter than one block pools a single
+  masked row instead of falling back. That removes the per-ubatch re-reservation that made pooled prefill
+  cost 13-20% on 4 cards, and `Q4EXP_POOLED_NO_PREFILL` is no longer needed to protect prefill.
+
 Source of truth for the numbers: E043 review of E042 (runs/E043-review-of-e042.md, verbatim). All
 per-token-per-GPU figures use the reviewed divisor 1540 (385 tokens x 4 GPUs).
 

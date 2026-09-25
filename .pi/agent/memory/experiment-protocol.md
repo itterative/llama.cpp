@@ -77,8 +77,18 @@ ldd build/bin/llama-bench | grep -E 'lib(ggml|llama)\.so\.0 '
 
 Device filter is exactly `ROCm0`, and a filter that matches nothing *passes silently*. Same trap for
 feature gates: an equal result between two arms means nothing until something proves the new path
-ran - print or grep one line only the live path emits (e.g. `block key pool = 1`, `qsa pool: mode = 2`).
-Two separate times this produced a false "identical, so it is safe".
+ran - print or grep one line only the live path emits. For the qsa pool that line is
+`qsa pool: mode = 1`, and it is `LLAMA_LOG_DEBUG`: it needs `-v`/`--verbose`, so without it an arm that
+never pooled is indistinguishable from one that did. (`mode = 2`/REBUILD is gone since E051; only
+NONE=0 and CACHED=1 exist.) Two separate times this produced a false "identical, so it is safe".
+
+**The standard golden gate is vacuous for anything gated on a single sequence.** `llama-perplexity`
+derives `n_seq = max(1, n_batch/n_ctx)`, so the golden command (`-c 512 -b 2048`) runs **4 sequences per
+batch** and `qsa_pool_get` answers NONE for all of them. E044/E049/E051/E052 all cite `263113.6984` as
+the pool's gate; in E056 both of those arms measured 0 mode lines, i.e. pool-off vs pool-off. Gates that
+do engage it: the sparse corpus at `-c 8192 -b 2048` (n_seq=1), `-b 256 -c 2048`, the rollback harness,
+and a greedy `llama-cli -c 4096 -n 2500 -st` text diff. `-c` also has to satisfy
+`2*n_ctx <= corpus tokens`, so the 3428-token golden corpus cannot run below `-c 1714`.
 
 ## Region profiling inside the process (`02d963eb0`)
 
