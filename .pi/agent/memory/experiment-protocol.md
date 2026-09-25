@@ -82,6 +82,10 @@ ran - print or grep one line only the live path emits. For the qsa pool that lin
 never pooled is indistinguishable from one that did. (`mode = 2`/REBUILD is gone since E051; only
 NONE=0 and CACHED=1 exist.) Two separate times this produced a false "identical, so it is safe".
 
+Seeing the line once is still not proof for the steps that matter: the mode is chosen per ubatch from
+the *cache state*, so a run with an mrope image in it never answers CACHED at all, and a text-only warmup
+can look pooled for a session that never pooled a real step (E057).
+
 **The standard golden gate is vacuous for anything gated on a single sequence.** `llama-perplexity`
 derives `n_seq = max(1, n_batch/n_ctx)`, so the golden command (`-c 512 -b 2048`) runs **4 sequences per
 batch** and `qsa_pool_get` answers NONE for all of them. E044/E049/E051/E052 all cite `263113.6984` as
@@ -89,6 +93,15 @@ the pool's gate; in E056 both of those arms measured 0 mode lines, i.e. pool-off
 do engage it: the sparse corpus at `-c 8192 -b 2048` (n_seq=1), `-b 256 -c 2048`, the rollback harness,
 and a greedy `llama-cli -c 4096 -n 2500 -st` text diff. `-c` also has to satisfy
 `2*n_ctx <= corpus tokens`, so the 3428-token golden corpus cannot run below `-c 1714`.
+
+**Every gate we own feeds *dense* text, which is a weaker property than "single sequence".** Position,
+cell and rank index space coincide only while the used cells step one position at a time, so golden,
+sparse corpus, greedy decode and the rollback harness are all blind to the QSA index-space bug class
+(E057: a 3-image conversation aborted a real server while every one of those gates was green). The shape
+gate for it is `experiments/tools/qsa-posgap-harness.cpp`: it feeds `seqN` / `pinN` (N cells sharing one
+position, i.e. what mrope writes) / `gapN` (jump the position line, i.e. what an mrope *draft* cache
+looks like) to one plain context and fingerprints the final logits, so a wrong block number moves the
+number instead of passing silently. Run it in both pool arms.
 
 ## Region profiling inside the process (`02d963eb0`)
 

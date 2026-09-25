@@ -11,10 +11,12 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
+**Live right now:** H20/H21/H22 (what E057's fix left open: the pool never engages for a session with
+an image, `qsa_pool_get` promises more than the fast path verifies, and whether the vision path pays
+H19's ratchet), H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
 with the pool off), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated),
 E008b (the measurement that decides the whole PLE/prefetch line), and the H13 leftovers. H9's prefill
-question is closed by E056.
+question is closed by E056, H9's correctness under mrope by E057.
 
 ---
 
@@ -605,7 +607,44 @@ question is closed by E056.
 - **Scope:** every tool, both split modes, and probably not qwen4exp-specific once the node-count
   difference is named - any arch whose host inputs scale with n_kv ratchets the same way, it only takes
   one early mismatch to start it.
-- Would become **E057**.
+
+### H20 - give vision sessions the pool: pool block keys in rank/cell space, not position space
+
+- **Found by E057.** `qsa_pool_get` requires the used run to be dense in position
+  (`llama-memory-hybrid-idx.cpp:379-388`), and an mrope image pins `nx*ny` cells to one position, so
+  **the pool never engages for any session that contains an image**, in either context, and only
+  re-engages once those cells leave the run. E044..E056's `+32.6% tg` therefore does not apply to
+  vision chat at all, and nothing in the gate suite could show it: every existing gate feeds text
+  whose positions step once per cell.
+- **Why rank space is poolable.** Rank order equals append order for mrope (image cells share `t`
+  and sort by `(y, x)`, the next text token's `t` is above the whole image), so a rank-space block
+  number is append-stable exactly like a position-space one, and E057 made the general path read and
+  write in rank space already. What has to change is the pool's own keying (`b_lo`, `wm`, the
+  `qsa_run` record) plus whatever assumes `blk_cells` columns are position buckets.
+- **Cost if not done:** a holed or pinned run also loses the pooled reservation. E057 measured 19-21
+  `sched:realloc_size` at ~120 ms per 7.5k-cell run against 0 for dense, which is H19's ratchet (and
+  the count disagrees with wall time there, see H22).
+
+### H21 - `qsa_pool_get` promises on an endpoint test that `set_input_qsa` does not honour
+
+- **Found by E057.** The pool decision is made from endpoints (`p1 == p0 + (j1-1-j0)`), the fast
+  path additionally verifies every cell. A run with both duplicates and jumps can satisfy the first
+  and fail the second, and then the build-time promise is `CACHED` while the runtime falls back to
+  the general path. E057 made that state safe (row/cell 0 are named before the erase) but it costs a
+  graph rebuild per 256-cell bucket, because each rebuild answers with a new `n_new`.
+- **Fix shape:** carry a "verified through" cell index in the `qsa_run` record so the promise and
+  the verify test the same thing incrementally, instead of making `qsa_pool_get` walk all cells (it
+  also runs from `can_reuse`, i.e. once per ubatch).
+
+### H22 - is the vision path really paying ~120 ms per re-reserve? (bench reading, blocks on nothing)
+
+- **Open question from E057**, which could not settle it: on the dev box a `pin512` or `gap512` run
+  at 7.5k cells counted 19-21 `sched:realloc_size` rows totalling ~2.5 s, while the wall time moved
+  by 0.2 s (16.76 s dense vs 16.96 s pinned). Either the region accounting is inflated (PROTOCOL 5
+  warns: inclusive totals, unlocked counters) or the cost hides behind the device queue.
+- **Why it matters:** on 4 cards a re-reserve measured ~300 ms, so the same 20 events per 7.5k cells
+  would be ~6 s per turn of vision chat. Decide with `GGML_PROF_REGIONS=1` plus wall time on one
+  real 3-image conversation, not with more local reps.
 
 ---
 
