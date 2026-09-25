@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 // Env-var helper for the N-GPU direct-P2P pipeline (runs on HIP and CUDA;
 // allreduce-host.cu keeps its own copy of the same helper for its CUDA-only
@@ -262,6 +263,17 @@ static __global__ void ggml_cuda_ar_oneshot_kernel(ggml_cuda_ar_os_args a) {
     }
 }
 
+// GGML_CUDA_AR_ONESHOT_DEBUG=1: dump every pointer the first collective passes
+// to the kernel, with what the runtime thinks each one is. The box reported a
+// write fault at a low VA, so this is what pins down which of the four it was.
+static void ggml_cuda_ar_os_dump_ptr(const char * what, const void * ptr) {
+    hipPointerAttribute_t at = {};
+    const hipError_t e = hipPointerGetAttributes(&at, ptr);
+
+    GGML_LOG_INFO("[ar-os]   %-22s %p  err=%d type=%d dev=%d managed=%d devptr=%p\n", what, ptr,
+                  (int) e, (int) at.type, at.device, at.isManaged, at.devicePointer);
+}
+
 static void ggml_cuda_ar_launch_oneshot(
         ggml_cuda_ar_pipeline_direct * p,
         void                        ** work_data,
@@ -298,6 +310,21 @@ static void ggml_cuda_ar_launch_oneshot(
         }
 
         ggml_cuda_set_device(p->devices[i]);
+
+        static const bool dbg = getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr;
+        if (dbg && gen == 1) {
+            GGML_LOG_INFO("[ar-os] dev %d gen %u nunits %d slot %zu tmp %zu\n",
+                          p->devices[i], gen, nunits, slot_bytes, p->tmp_bytes);
+            ggml_cuda_ar_os_dump_ptr("self",  a.self);
+            ggml_cuda_ar_os_dump_ptr("dst",   a.dst);
+            for (int j = 0; j < n; ++j) {
+                if (j == i) continue;
+                const std::string tag = "to[dev" + std::to_string(p->devices[j]) + "]";
+                const std::string fag = "from[dev" + std::to_string(p->devices[j]) + "]";
+                ggml_cuda_ar_os_dump_ptr(tag.c_str(), a.to[j]);
+                ggml_cuda_ar_os_dump_ptr(fag.c_str(), a.from[j]);
+            }
+        }
 
         switch (work_type) {
             case GGML_TYPE_F32: ggml_cuda_ar_oneshot_kernel<float, 1><<<GGML_CUDA_AR_OS_BLOCKS, GGML_CUDA_AR_OS_THREADS, 0, streams[i]>>>(a); break;
