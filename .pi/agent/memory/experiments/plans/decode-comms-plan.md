@@ -255,13 +255,18 @@ What was wrong: run6's +7.2% and +8.1% came from separate sequential runs at `-r
 that table also showed 3% from nothing, which was right there as the noise floor and I used it to clear
 the pp result without applying it to the tg result.
 
-**Numerics: not parity, and the gap is bigger than reduction order can explain.** Same corpus, same
-flags, NCCL 2.6785 +/- 0.048 vs internal 2.7004 +/- 0.049 - +0.81%, whereas reassociating a float sum
-should move PPL by well under 0.01%. The likely cause is not the one-shot: NCCL compresses collectives at
-or above 262144 elements to bf16 (`ggml-cuda.cu:1035-1040`), which is lossy, and the internal path keeps
-f32 unless `GGML_HIP_AR_BF16` is compiled in. If that is right, the internal arm is the more accurate of
-the two. Test: rerun both arms with `-b 64 -ub 64` (163840 elements, below NCCL's bf16 threshold) so both
-use f32 end to end; if the two converge, the gap is NCCL's wire format.
+**Numerics: a 0.81% PPL gap, and my explanation of it had the sign backwards.** Same corpus, same flags:
+NCCL 2.6785 +/- 0.048 vs internal 2.7004 +/- 0.049. It is true that the two paths differ in wire
+precision - `ggml-cuda.cu:1019` keeps f32 only below 262144 elements and compresses larger collectives to
+bf16 at `:1036`, while the internal path's bf16 equivalent is the build flag `GGML_HIP_AR_BF16`, not
+defined here (verified in the compile flags), so prefill-sized collectives are bf16 on NCCL and f32 on our
+side; decode-sized ones (2560 elements) are f32 in both. But bf16 loss should make NCCL the *worse* of the
+two and NCCL came out better, so the mechanism is real and explains nothing. What is left is the honest
+reading: 0.0219 against a reported +/- 0.048 per-arm spread over a small corpus is perturbation-level, with
+the prefill rounding difference written into the KV cache, and its sign carries no information at that
+sample size. The test that would make it evidence is a bigger corpus, or the `-b 64 -ub 64` pair where both
+arms are f32 end to end - not because f32 ought to win, but because agreement there would show the wire
+format is the whole difference.
 
 Liveness of the ladder is confirmed on the box: `algo=auto (one-shot <= 256 KiB, then butterfly, bde >=
 1024 KiB)`. Do not use `run7-auto.log` for performance - it was captured with `-v 3`, and the logging
