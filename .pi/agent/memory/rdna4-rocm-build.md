@@ -165,18 +165,28 @@ re-baseline before comparing.
 The gain is flat in depth, unlike the pool's, so the two are additive: the pool removes work that grows with
 context, small_k removes per-matmul reduction work that does not.
 
-### 4-card decode collectives: use the in-tree one-shot, not RCCL
+### 4-card decode collectives: the in-tree one-shot beats RCCL by ~2.5% at depth
 
 ```sh
-GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot \
-  build/bin/llama-bench ... -sm tensor ...
+GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal build/bin/llama-bench ... -sm tensor ...
 ```
 
-+7.2% / +8.1% tg128 (d4096 / d131072) over the NCCL default on the real model, pp unchanged, host cost per
-collective 15.2 -> 5.3 us. Needs all three variables: `GGML_CUDA_P2P` because peer access is gated on that
-name being *present* (`ggml-cuda.cu:606`, so `=0` also enables it), `GGML_CUDA_ALLREDUCE=internal` because
-Linux defaults to NCCL, and the algo because `auto` does not pick one-shot yet. Details, measurements and
-the three defects it took: [experiments/plans/decode-comms-plan.md](experiments/plans/decode-comms-plan.md).
+Paired at r=10: tg128 30.97 vs NCCL 30.20 at d131072 (**+2.5%**) and a tie at d4096, with host cost per
+collective 14.8 -> 6.3 us (0.82 ms per step, which is the +2.5% at depth). pp unchanged. Needs both
+variables: `GGML_CUDA_P2P` because peer access is gated on that name being *present*
+(`ggml-cuda.cu:606`, so `=0` also enables it), and `GGML_CUDA_ALLREDUCE=internal` because Linux defaults
+to NCCL; `algo=auto` now reaches one-shot itself below `GGML_CUDA_AR_DIRECT_ONESHOT_BYTES` (256 KiB).
+Details, measurements and the three defects it took:
+[experiments/plans/decode-comms-plan.md](experiments/plans/decode-comms-plan.md).
+
+Do not trust unpaired r=3 tg on this box: an early reading of the same change looked like +7-8% and the
+paired run halved it. And PPL against NCCL differs (+0.81%, 2.6785 -> 2.7004) which is probably NCCL's
+lossy bf16 compression of large collectives rather than this kernel - unresolved.
+
+There is no RCCL tuning left to do, in case that tempts anyone: `Tree` is silently ignored
+(`AllReduce | Tree = 0.0/0.0` in its own tuning table), `FC` is accepted and slower, LL plus one channel
+are already chosen at 10240 B, and `VMM: no` on all four cards rules out cuMem/symmetric windows.
+`RCCL_USE_AMD_SMI_LIB=1 NCCL_CUMEM_ENABLE=1` makes the collective cheaper and the run 9x slower.
 
 There is no RCCL tuning left to do, in case that tempts anyone: `Tree` is silently ignored
 (`AllReduce | Tree = 0.0/0.0` in its own tuning table), `FC` is accepted and slower, LL plus one channel are
