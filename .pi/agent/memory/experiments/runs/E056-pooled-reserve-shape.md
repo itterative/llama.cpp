@@ -1,9 +1,9 @@
 # E056 - reserving the pooled qsa shape removes the prefill re-reservation churn
 
 - date: 2026-09-25
-- machine: dev-rx9070-16g (T1). T2 evidence is the user's pre-existing `run8` logs, re-read here.
-- tier: T1
-- status: done (T2 confirmation planned, command block at the bottom)
+- machine: dev-rx9070-16g (T1) + bench-4x-r9700-32g (T2, run by the user)
+- tier: T1+T2
+- status: done
 - parent: E049 (mechanism), E051 (d1 landed, d2 tried and reverted), E052 (width policy)
 - commit: `b811339d6` (the code); the raw output below is deliberately **not committed** - it is in a
   stash, see `raw`
@@ -116,22 +116,58 @@ git checkout 4e9f11d67 -- .pi/agent/memory/experiments/results/E056-pooled-reser
 - `abc/` - the same without sparse FA/rtile (pp ~640, which is the dense-FA level, not a regression)
 - `gates/` - every gate above, and `re-reserve-census.txt`
 - `../E056-pooled-reserve.patch` - the change as measured, now `b811339d6`
+- T2, the user's run of the command block: `results/user/h9-d2-8be59fb/` (that directory has its own
+  `.gitignore`, so it is local by construction)
 - T2 motivation, the user's pre-existing logs, still in the worktree:
   `results/user/p2p-improvements/run8-sparse-fa.log` and `run8-sparse-fa-noprefillpool.log`
 
 ## verdict
 
-**accepted on T1.** The churn is gone (0 re-reserves in every pooled arm), the reservation costs
-0.08 MiB, pp is at parity with the pool off, tg keeps its +4.3%, and every numeric gate is
-bit-identical. `Q4EXP_POOLED_NO_PREFILL` is no longer needed to protect prefill; arm C dominates arm
-B on this box.
+**accepted, on T1 and T2.** The churn is gone on both boxes (0 re-reserves in every pooled arm), the
+pooled reservation is *smaller* than the historic one at 131k, pp is at parity or better with the pool
+off, tg keeps the pool's +32.6% at depth, and every numeric gate is bit-identical.
+`Q4EXP_POOLED_NO_PREFILL` has no remaining job: arm C dominates arm B on both boxes (2 fewer
+re-reserves per pass, +1.8% pp at 131k, same tg), and prefill now leaves the pool warm, so the first
+decode step does not re-derive all 34816 blocks.
 
-Not yet shown: what pooled prefill is worth on the real model at depth, which is the only reason to
-prefer C over B beyond the two re-reserves. See the T2 block.
+## T2 results (bench box, 4 cards)
+
+Run by the user on 2026-09-25 from `8be59fb38` (the code of `b811339d6`): the command block below, 2
+interleaved passes x `-r 3`, `-d 131072 -p 8192 -n 128 -ub 1024 -b 2048`, real Q4_K-M weights over 4
+GPUs. Raw: `results/user/h9-d2-8be59fb/` - that directory carries its own `.gitignore`, so it is never
+committed.
+
+| arm | pp8192 @ d131072, pass 1 then pass 2 | tg128 | re-reserves / invocation | pp reservation |
+| --- | --- | --- | --- | --- |
+| A pool off | 1423.78 ± 7.69, 1425.67 ± 9.12 | 24.77, 24.69 | 0 | 2353.85 MiB, 6775/1358 |
+| B `NO_PREFILL` | 1436.33 ± 8.10, 1428.98 ± 9.17 | 32.47, 32.71 | 2 (~57 ms) | 2353.85 MiB, 6775/1358 |
+| C pooled (**new**) | 1454.65 ± 6.71, 1463.35 ± 5.80 | 32.85, 32.74 | **0** | **2319.04 MiB**, 6825/1372 |
+
+- **The churn is gone on 4 cards.** C has no `sched:realloc_*` region in any table, against run8's 19-133
+  per test for the same configuration and the same depth.
+- **The prediction was right in delta and wrong in level.** Within run8, pooling prefill cost -13.4%
+  (1299.60 vs 1501.24); within run9 it is +1.8% (C vs B). That 15-point swing is the churn. But arm B
+  itself moved from 1501.24 to 1432.7 between the two sessions, so "recover to ~1500" was a
+  cross-session claim and does not hold - only the within-session one does. A and B reserve identically
+  (2353.85 MiB, 6775 nodes), so B's runtime prefill is untouched by this change and that shift is
+  session noise, not the patch.
+- **Pooled prefill at 131k is a small win, under the protocol's 5% bar:** C vs B +1.8%, C vs A +2.4%,
+  from 6 alternating samples per arm. The ordering is clean (both C samples above both B above both A)
+  and the within-arm spread is <= 0.6%, but at this magnitude it is suggestive, not a result.
+- **Where the pp win sits:** `graph:set_inputs` is 90.8 ms/call in C against 125.9 in A on the pp table,
+  because the pooled variant never creates `blk_pos` - I32 `[4*n_blocks*n_stream]`, 557 KB per ubatch at
+  131k. That is E028/P2's prize, collected for free by the pool, and it is host-side, so it never shows
+  up in a device trace.
+- **The pooled reservation is 34.8 MiB smaller** than the historic one at this context (2319.04 vs
+  2353.85), not larger: dropping `blk_pos` and the whole-cache rope outweighs the write chain. The dev
+  box's +0.08 MiB is the same trade at a fifth of the context.
+- **tg confirms why the pool exists:** +32.6% over pool off (32.80 vs 24.73 median), matching E045's
+  +30.1%. B and C are the same workload in this benchmark (llama-bench drives no spec decode) and differ
+  by 0.6%, i.e. nothing.
 
 ## notes
 
-**What run8 says the churn costs on 4 cards.** Same session, same flags except the pool width gate:
+**What run8 said the churn costs on 4 cards.** Same session, same flags except the pool width gate:
 pp8192 1780.78 (pooled prefill) vs 2229.91 (`NO_PREFILL`) at d4096, 1299.60 vs 1501.24 at d131072.
 Converting to ms/ubatch (1024 tokens) gives +116 ms at d4096 and +106 ms at d131072 - a *fixed*
 per-ubatch penalty, depth-independent, which is the signature of host cost rather than device work.
@@ -140,7 +176,9 @@ and the pooled arm's `graph:compute` is *smaller* (22.2 s vs 57.5 s) because the
 moves into `graph:alloc`'s synchronize, exactly as the E049 review argued. The part that does not
 move back is the lost host/device overlap: `graph:set_inputs` is ~95 ms/ubatch there, and that is
 the size of the penalty. Predicted recovery on the bench box: pp8192 @ d4096 1780 -> ~2230, @ d131072
-1300 -> ~1500.
+1300 -> ~1500. **That prediction was half right and is corrected by the T2 results above:** the delta
+recovered (+15 points between the pooled and unpooled arms), but the absolute level did not, because
+comparing run8 to run9 is a cross-session comparison and arm B alone moved -4.6% between them.
 
 **Why E051's d2 attempt failed and this one did not.** It keyed the worst case on the *cell state*
 (its record describes deleting the `nu == 0` test, which then asserted on `cells.pos_get()` of an
@@ -179,7 +217,7 @@ and the per-block positions). ~40 lines in `set_input_qsa`, and it would make th
 independent. Not done: it costs the general path a pool write it cannot use, and it needs a
 multi-sequence gate that does not exist yet.
 
-## T2 to run (bench box, 4 cards)
+## T2 command as run (kept for reproduction)
 
 ```sh
 # same flags as run8, three arms, interleaved. -r 3 minimum, one depth per invocation
@@ -197,7 +235,5 @@ done; done
 grep -c "sched:realloc" run9-C-*.err   # expect 0; run8 had 19-133 per test
 ```
 
-Deciding metric: `sched:realloc_*` counts (expect 0 in C) and pp8192 C vs B. If C beats B at d131072
-by more than the noise floor, pooled prefill is a real win at depth and `Q4EXP_POOLED_NO_PREFILL`
-should be dropped; if it is a wash, C is still the better default (2 fewer re-reserves per pass, and
-prefill leaves the pool warm so the first decode step does not re-derive all 32768 blocks).
+Deciding metric: `sched:realloc_*` counts (expect 0 in C) and pp8192 C vs B. Answered above: 0 in C,
+and C is +1.8% over B at d131072, so `Q4EXP_POOLED_NO_PREFILL` can go.

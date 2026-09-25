@@ -256,7 +256,7 @@ question is closed by E056.
 - The "rebuild with NCCL" warning is `#ifndef GGML_USE_HIP`, so without RCCL the fallback to internal
   AllReduce is **silent** `[s]`. Only worth a record once B2 reports the topology.
 
-### H9 - cache pooled indexer block keys (coarse cache) **shipped as a long-context decode feature**
+### H9 - cache pooled indexer block keys (coarse cache) **shipped; prefill no longer excluded (E056)**
 
 - **Original question (added by E024):** `build_qsa_top_k` re-gathers the whole raw indexer cache and
   re-pools it every step - ~76 MB and ~33 graph nodes per QSA layer per step at 40k, about 2x dense
@@ -299,12 +299,19 @@ question is closed by E056.
   reservation after all, and what it cost on 4 cards is a fixed ~110 ms per prefill ubatch of lost
   host/device overlap (run8: pp8192 1781 vs 2230), not device work. `Q4EXP_POOLED_NO_PREFILL` is now
   optional.
-- **Open:** whether pooled prefill *gains* anything on the real model at depth - the dev box says neutral,
-  E038's 71 s of 430 s at 131k says there is something to get, and the churn was hiding both. E056's
-  record carries the bench-box command block. Also open: states that are not one dense sequence
-  (multi-seq under `--kv-unified`, an interior `seq_rm`) still build the historic graph and so still
-  churn against a pooled reservation; closing that means making the general path build the pooled
-  topology too (~40 lines in `set_input_qsa`, which already computes the per-block cells and positions).
+- **Answered on 4 cards (E056's T2 run):** pooled prefill at d131072 gives pp8192 1454.65/1463.35 against
+  1436.33/1428.98 with prefill excluded and 1423.78/1425.67 pool-off, i.e. **+1.8% / +2.4%**. Under the
+  protocol's 5% bar, but cleanly ordered across 6 alternating samples, and the mechanism shows up in the
+  host numbers rather than the device ones: the pooled variant never creates `blk_pos` (I32
+  `[4*n_blocks*n_stream]`, 557 KB per ubatch at 131k), so `graph:set_inputs` runs 90.8 ms/call against
+  125.9. That is E028/P2's prize arriving for free. The reservation is also **34.8 MiB smaller**
+  (2319.04 vs 2353.85 MiB), and tg is +32.6% over pool-off, matching E045. So
+  `Q4EXP_POOLED_NO_PREFILL` has no job left.
+- **Still open:** states that are not one dense sequence (multi-seq under `--kv-unified`, an interior
+  `seq_rm`) build the historic graph and so churn against a pooled reservation; closing that means making
+  the general path build the pooled topology too (~40 lines in `set_input_qsa`, which already computes
+  the per-block cells and positions). And whether `Q4EXP_POOLED` should now default on - parity plus a
+  bench number were the two conditions the plan set, and both are met.
 - Also open: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
   and the crossover depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is
   unexplained.
