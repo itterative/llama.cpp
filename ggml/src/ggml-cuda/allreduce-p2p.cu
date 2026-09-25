@@ -58,12 +58,16 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
 // The meta-backend calls this between per-device graph_compute calls, never
 // inside a graph capture, so the event handshakes are not captured.
 //
-// GGML_HIP_AR_BF16 (build flag, off by default): compress F32 tensors to bf16
-// before the round loop, run every round on the bf16 buffer (half the bytes),
-// decompress once after the last round. F16/BF16 tensors skip it (already 2
-// bytes/elem). GGML_CUDA_AR_DIRECT_BF16_THRESHOLD (default 1 MiB) skips
-// compression for F32 tensors below that size, where the extra compress/
-// decompress launches outweigh the halved transfer; 0 = always compress.
+// GGML_CUDA_AR_DIRECT_BF16 (default "off", i.e. exact): reduce large F32 tensors
+// over a bf16 wire, like the NCCL path does. "nccl" reuses that path's element
+// count heuristic, a byte value uses that threshold instead (0 = off, the
+// default). The
+// payload is compressed before the round loop, every round moves half the bytes,
+// and it is decompressed once after the last round; the two bf16 buffers are
+// carved out of dev_tmp, so compression costs no extra allocation. F16/BF16
+// tensors skip it (already 2 bytes/elem), and so does the one-shot: compression
+// would cost it two launches per device per collective, and its whole cost model
+// is launch count.
 // ---------------------------------------------------------------------------
 
 enum ggml_cuda_ar_algo {
@@ -95,14 +99,11 @@ struct ggml_cuda_ar_pipeline_direct {
     // device's compute stream (ctx->stream()); there is no dedicated AR stream.
     void *   dev_tmp[GGML_CUDA_MAX_DEVICES];
 
-#if defined(GGML_HIP_AR_BF16)
-    // Half-sized bf16 working buffers, used for F32 tensors when compression is
-    // active: dev_bf16 holds the compressed running sum, dev_tmp_bf16 is the
-    // bf16 counterpart of dev_tmp.
-    void *   dev_bf16[GGML_CUDA_MAX_DEVICES];
-    void *   dev_tmp_bf16[GGML_CUDA_MAX_DEVICES];
-    size_t   bf16_threshold;     // F32 tensors below this skip compression; 0 = always
-#endif
+    // bf16 wire policy (GGML_CUDA_AR_DIRECT_BF16), per call below. Compression
+    // carves dev_tmp in half rather than adding buffers: tmp_bytes is sized for
+    // the F32 payload, which is exactly 2x what the bf16 one needs.
+    int      bf16_mode;          // 0 = off, 1 = NCCL heuristic, 2 = bf16_bytes
+    size_t   bf16_bytes;         // bf16_mode 2: compress F32 tensors at/above this
 
     // One event per device (cudaEventDisableTiming). data_ready[i] = "device
     // i's work buffer is safe for peers to read"; recorded at entry and after
@@ -132,6 +133,20 @@ struct ggml_cuda_ar_pipeline_direct {
 // only ever sees 10 KB collectives.
 static size_t ggml_cuda_ar_os_bytes(const ggml_cuda_ar_pipeline_direct * p) {
     return (size_t) p->n_devices * 2 * 2 * p->os_bytes;
+}
+
+// Half of the per-device scratch, rounded up so a bf16 split of dev_tmp leaves
+// both halves 16-byte aligned (the one-shot reads its slots as 8-byte units).
+static size_t ggml_cuda_ar_tmp_half(size_t bytes) {
+    const size_t half = (bytes + 1) / 2;
+    return (half + 15) & ~(size_t) 15;
+}
+
+// dev_tmp holds either one F32 tensor or, with compression enabled, two bf16
+// halves. Only the F32 case is single-sized, so turning the wire on costs nothing
+// while it is off.
+static size_t ggml_cuda_ar_tmp_size(const ggml_cuda_ar_pipeline_direct * p, size_t bytes) {
+    return p->bf16_mode ? 2 * ggml_cuda_ar_tmp_half(bytes) : bytes;
 }
 
 // In-place add dst[i] += src[i], summed in float, written back as T. Peer data
@@ -363,6 +378,27 @@ static ggml_cuda_ar_algo ggml_cuda_ar_pick_by_size(
 }
 
 static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t need_bytes);
+
+// Whether a collective runs on the bf16 wire. Mirrors the element-count predicate
+// of the NCCL path (ggml_backend_cuda_comm_allreduce_nccl), which the round-based
+// algorithms match byte for byte at N=4 (bde and ring both move 2*(N-1)/N*size).
+// NCCL's thresholds were tuned for NCCL, whose small-message path also switches
+// protocol, so they are a sane default here rather than a crossover measured on
+// this stack.
+static bool ggml_cuda_ar_use_bf16(const ggml_cuda_ar_pipeline_direct * p, ggml_type t,
+                                  int64_t ne, size_t nbytes) {
+    if (t != GGML_TYPE_F32 || p->bf16_mode == 0) {
+        return false;
+    }
+    if (p->bf16_mode == 2) {
+        return nbytes >= p->bf16_bytes;
+    }
+
+    const int n = p->n_devices;
+    return !((n <= 2 && ne <  32768) ||
+             (n == 3 && ne < 131072) ||
+             (n >= 4 && ne < 262144));
+}
 
 // GGML_CUDA_AR_ONESHOT_PROBE=<iterations>: run the one-shot over the real links
 // before any model work. Each device seeds every element with (rank+1), so the
@@ -820,22 +856,37 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
 
     // Initial per-device scratch size, NOT a cap -- anything larger grows on
     // demand (ggml_cuda_ar_ensure_tmp). Too low costs a few warmup growths, too
-    // high wastes VRAM. Scratch is dev_tmp + dev_bf16 + dev_tmp_bf16 = 2x this
-    // per device, times N devices, competing with KV cache.
+    // high wastes VRAM. Scratch is one dev_tmp per device, 2x this once the bf16
+    // wire is enabled (it needs two half-width buffers), times N devices, competing
+    // with KV cache.
     p->tmp_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DIRECT_TMP_BYTES", 16 * 1024 * 1024);
     if (p->tmp_bytes < 1024 * 1024) {
         p->tmp_bytes = 1024 * 1024;
     }
 
-#if defined(GGML_HIP_AR_BF16)
-    p->bf16_threshold = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DIRECT_BF16_THRESHOLD", 1 * 1024 * 1024);
-#endif
+    // off (default) | nccl (reuse the NCCL path's element counts) | <bytes>
+    p->bf16_mode  = 0;
+    p->bf16_bytes = 0;
+    if (const char * v = getenv("GGML_CUDA_AR_DIRECT_BF16")) {
+        if (strcmp(v, "nccl") == 0) {
+            p->bf16_mode = 1;
+        } else if (strcmp(v, "off") != 0 && strcmp(v, "0") != 0) {
+            char * end = nullptr;
+            const unsigned long long bytes = strtoull(v, &end, 10);
+            if (end != v && *end == '\0') {
+                p->bf16_mode  = 2;
+                p->bf16_bytes = (size_t) bytes;
+            } else {
+                GGML_LOG_WARN("%s: unknown GGML_CUDA_AR_DIRECT_BF16 '%s'; using off\n", __func__, v);
+            }
+        }
+    }
 
-    // algo=auto crossover, compared against the per-round working bytes (post-
-    // bf16). Below it the AR is latency-bound and butterfly's log2(N) rounds
-    // win; above it it is bandwidth-bound and bde's ~25% fewer bytes moved at
-    // N=4 win. 1 MiB sits just past the measured butterfly/bde crossover
-    // (~512-640 KiB at N=4).
+    // algo=auto crossover, compared against the tensor's own bytes (a bf16 round
+    // loop therefore runs at half these wire bytes). Below it the AR is latency-
+    // bound and butterfly's log2(N) rounds win; above it it is bandwidth-bound and
+    // bde's ~25% fewer bytes moved at N=4 win. 1 MiB sits just past the measured
+    // butterfly/bde crossover (~512-640 KiB at N=4).
     p->auto_ring_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DIRECT_AUTO_RING_BYTES", 1 * 1024 * 1024);
 
     // One-shot is a latency trick, so it is only chosen for small collectives.
@@ -871,9 +922,10 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
             return nullptr;
         }
 
-        if (cudaMalloc(&p->dev_tmp[i], p->tmp_bytes) != cudaSuccess) {
+        const size_t tmp_alloc = ggml_cuda_ar_tmp_size(p, p->tmp_bytes);
+        if (cudaMalloc(&p->dev_tmp[i], tmp_alloc) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaMalloc for tmp failed (%zu bytes) on device %d\n",
-                           __func__, p->tmp_bytes, p->devices[i]);
+                           __func__, tmp_alloc, p->devices[i]);
             ggml_cuda_ar_pipeline_direct_free(p);
             return nullptr;
         }
@@ -888,21 +940,6 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
                 return nullptr;
             }
         }
-
-#if defined(GGML_HIP_AR_BF16)
-        if (cudaMalloc(&p->dev_bf16[i], p->tmp_bytes / 2) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaMalloc for dev_bf16 failed (%zu bytes) on device %d\n",
-                           __func__, p->tmp_bytes / 2, p->devices[i]);
-            ggml_cuda_ar_pipeline_direct_free(p);
-            return nullptr;
-        }
-        if (cudaMalloc(&p->dev_tmp_bf16[i], p->tmp_bytes / 2) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaMalloc for dev_tmp_bf16 failed (%zu bytes) on device %d\n",
-                           __func__, p->tmp_bytes / 2, p->devices[i]);
-            ggml_cuda_ar_pipeline_direct_free(p);
-            return nullptr;
-        }
-#endif
     }
 
     // Ring order: identity by default, measurement-based reordering when the
@@ -968,6 +1005,17 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
         }
     }
 
+    // Always logged, so a run's log proves which wire dtype it used instead of
+    // leaving "no line" to mean "off".
+    if (p->bf16_mode == 1) {
+        GGML_LOG_INFO("%s: bf16 wire: on, NCCL heuristic (F32 at/above 32768/131072/262144 "
+                      "elements for N<=2/3/>=4)\n", __func__);
+    } else if (p->bf16_mode == 2) {
+        GGML_LOG_INFO("%s: bf16 wire: on, F32 at/above %zu bytes\n", __func__, p->bf16_bytes);
+    } else {
+        GGML_LOG_INFO("%s: bf16 wire: off\n", __func__);
+    }
+
     ggml_cuda_ar_oneshot_probe(p);
 
     if (p->algo == GGML_CUDA_AR_ALGO_RING) {
@@ -1009,14 +1057,6 @@ void ggml_cuda_ar_pipeline_direct_free(ggml_cuda_ar_pipeline_direct * p) {
         if (p->os_inbox[i]) {
             (void)cudaFree(p->os_inbox[i]);
         }
-#if defined(GGML_HIP_AR_BF16)
-        if (p->dev_bf16[i]) {
-            (void)cudaFree(p->dev_bf16[i]);
-        }
-        if (p->dev_tmp_bf16[i]) {
-            (void)cudaFree(p->dev_tmp_bf16[i]);
-        }
-#endif
         if (p->data_ready[i]) {
             (void)cudaEventDestroy(p->data_ready[i]);
         }
@@ -1036,16 +1076,6 @@ static void ggml_cuda_ar_free_tmp_buffers(ggml_cuda_ar_pipeline_direct * p) {
         // os_inbox is deliberately absent here: it is sized off os_bytes and
         // allocated once, so growth must not take it away (a freed inbox would
         // silently turn one-shot off mid-run via pick_by_size's null check).
-#if defined(GGML_HIP_AR_BF16)
-        if (p->dev_bf16[i]) {
-            (void) cudaFree(p->dev_bf16[i]);
-            p->dev_bf16[i] = nullptr;
-        }
-        if (p->dev_tmp_bf16[i]) {
-            (void) cudaFree(p->dev_tmp_bf16[i]);
-            p->dev_tmp_bf16[i] = nullptr;
-        }
-#endif
     }
 }
 
@@ -1071,6 +1101,7 @@ static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t nee
     }
 
     const size_t want = need_bytes;
+    const size_t size = ggml_cuda_ar_tmp_size(p, want);
 
     // Prior AR work reads these buffers across devices, so drain everything
     // before freeing to avoid a cross-device use-after-free.
@@ -1084,12 +1115,7 @@ static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t nee
 
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
-        bool ok = cudaMalloc(&p->dev_tmp[i], want) == cudaSuccess;
-#if defined(GGML_HIP_AR_BF16)
-        // bf16 buffers are half-width (2 bytes/elem vs F32's 4).
-        ok = ok && cudaMalloc(&p->dev_bf16[i],     want / 2) == cudaSuccess;
-        ok = ok && cudaMalloc(&p->dev_tmp_bf16[i], want / 2) == cudaSuccess;
-#endif
+        const bool ok = cudaMalloc(&p->dev_tmp[i], size) == cudaSuccess;
         if (!ok) {
             (void) cudaGetLastError();
             GGML_LOG_ERROR("%s: failed to grow direct-P2P AR scratch to %zu MiB on device %d; "
@@ -1590,29 +1616,20 @@ bool ggml_cuda_ar_allreduce_direct(
         }
     }
 
-    // GGML_HIP_AR_BF16: the round loops operate on work_data/work_tmp, so the
-    // code is identical either way. F32 tensors at/above the threshold compress
-    // to the bf16 scratch (half the bytes moved); F16/BF16 (already 2
-    // bytes/elem) always take the uncompressed path.
-    bool use_bf16_compress = false;
-#if defined(GGML_HIP_AR_BF16)
-    use_bf16_compress = t == GGML_TYPE_F32 && nbytes >= p->bf16_threshold && !oneshot;
-#endif
-    const ggml_type work_type  = use_bf16_compress ? GGML_TYPE_BF16 : t;
+    // Compression runs the whole round loop on half-width data, so the code below
+    // is identical either way. The one-shot is excluded: it returns before the
+    // decompress below, and its cost model is launches per collective.
+    const bool      use_bf16_compress = !oneshot && ggml_cuda_ar_use_bf16(p, t, ne, nbytes);
+    const ggml_type work_type         = use_bf16_compress ? GGML_TYPE_BF16 : t;
+    const size_t    work_split        = ggml_cuda_ar_tmp_half(p->tmp_bytes);
 
     void * work_data[GGML_CUDA_MAX_DEVICES];
     void * work_tmp [GGML_CUDA_MAX_DEVICES];
     for (int i = 0; i < n; ++i) {
-#if defined(GGML_HIP_AR_BF16)
-        work_data[i] = use_bf16_compress ? p->dev_bf16[i]     : tensors[i]->data;
-        work_tmp [i] = use_bf16_compress ? p->dev_tmp_bf16[i] : p->dev_tmp[i];
-#else
-        work_data[i] = tensors[i]->data;
-        work_tmp [i] = p->dev_tmp[i];
-#endif
+        work_data[i] = use_bf16_compress ? p->dev_tmp[i] : tensors[i]->data;
+        work_tmp [i] = use_bf16_compress ? (char *) p->dev_tmp[i] + work_split : p->dev_tmp[i];
     }
 
-#if defined(GGML_HIP_AR_BF16)
     if (use_bf16_compress) {
         static const to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         for (int i = 0; i < n; ++i) {
@@ -1622,7 +1639,6 @@ bool ggml_cuda_ar_allreduce_direct(
             CUDA_CHECK(cudaGetLastError());
         }
     }
-#endif
 
     // Record each device's compute-stream progress as data_ready: the meta-
     // backend queues each device's subgraph on its compute stream and calls us
@@ -1680,7 +1696,6 @@ bool ggml_cuda_ar_allreduce_direct(
         ggml_cuda_ar_allreduce_direct_butterfly(p, backends, work_data, work_tmp, work_type, ne);
     }
 
-#if defined(GGML_HIP_AR_BF16)
     if (use_bf16_compress) {
         static const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         for (int i = 0; i < n; ++i) {
@@ -1690,7 +1705,6 @@ bool ggml_cuda_ar_allreduce_direct(
             CUDA_CHECK(cudaGetLastError());
         }
     }
-#endif
 
     return true;
 }
