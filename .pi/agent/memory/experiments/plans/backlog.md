@@ -66,35 +66,49 @@ question is closed by E056, H9's correctness under mrope by E057.
 
 ## Likely bottlenecks (this is where the effort should go)
 
-### L1 - is the Q5 n-gram table actually resident? **handed to E058**
+### L1 - is the Q5 n-gram table actually resident? **answered by E058: partly, and not the part decode needs**
 
-- `-lzm auto` lazy-reads any tensor over 4 GiB (`src/llama-model-loader.cpp:1088-1100`) `[v]`, so a
-  ~33 GB table is served from the page cache on demand, not held in RAM. Whether it *stays* cached is the
-  open question: the user observes 1-2 MB/s of reads during decode and the units are unconfirmed, which
-  brackets the hit rate between ~20% and ~90%.
-- **Next:** E058 measures it directly. `126b7a43b` reports `/proc/self/io` deltas around `gather()`
-  through the new prof counters, bucketed decode vs prefill, so `io:storage / io:rchar` is the miss rate
-  with no external sampler and no model-load contamination.
+- Measured over three bench-box runs: with a warm page cache **prefill's 756 distinct rows per
+  1024-token ubatch are ~99% hits** (`io:storage_prefill` 42.93 kB against 1.33 MB requested), while
+  **decode's one distinct row per token is cold 60-100% of the time** (`io:storage_decode` 26-47 kB/call
+  against a ~48 kB cold row). They are different row populations, so what prefill warms does nothing for
+  decode.
+- A cold row costs **~48 kB of storage, not 4 kB**: 36.15 MB / 756 rows at prefill and 47.37 kB / ~1 row
+  at decode agree on that granularity, which smells like large folios or a stripe rather than readahead.
+  Kernel version, the model's filesystem and that device's `read_ahead_kb` are still unknown and would
+  explain it - and if the granularity is folio-sized, readahead tuning is the wrong lever entirely.
+- The user's "1-2 MB/s during decode" was MB/s and it reproduces: 135.08 MB over ~117 s = 1.16 MB/s.
 - **Retracted:** the `-lzm off` A/B. With no reader the gather becomes a `ggml_get_rows` CPU op inside
   the graph again, so that arm measures the split E031 removed rather than residency. The clean arm keeps
-  `on-direct` and warms the table's byte range with `dd` first (E058 arm 2).
+  `on-direct` and warms the table's byte range with `dd` first.
+- **Next:** `io:reuse_decode` (`92586c61f`) - whether decode's rows repeat across steps. If they do not,
+  no cache of any size or placement can help, and the only levers left are residency and latency hiding.
 
-### L2 - PLE placement is *suspected* of costing tg **handed to E058, ceiling now arithmetic**
+### L2 - PLE placement is *suspected* of costing tg **answered by E058: 4.5% of the token wall, exposed**
 
 - Stale as written: under `-lzm on-direct` there is no `ggml_get_rows` node at all.
   `llm_graph_lazy_rows::build` returns an F32 input tensor, the host pre-gathers and dequantizes, and
   `set_rows` uploads it, so the fetch moved out of the graph and into `graph:set_inputs`.
-- **The ceiling is arithmetic now, not suspicion:** 16 rows x 1760 B = 28 KB/token useful, 64 KB if every
-  row is a cold page, so an all-cold decode pays ~1.6 ms of a 47 ms step (~4%). The one existing trace
-  puts `graph:set_inputs` at 0.6124 ms/call against `phase:decode` 47.1054 ms/call = 1.3%, but it ran 27
-  steps under rocprofv3, so it is a hint and not a measurement.
-- **The cheap lever this exposed:** `gather()` picks `n_workers = min(n_readers, max(1, n/32))`, so
-  decode's 16 rows are read **serially on one worker** while 32 buffered FDs idle. If E058 shows cold
-  reads, that divisor is most of the prize for one line, and it competes with a GPU cache rather than
-  needing one.
-- **Next:** E058, which also decides the VRAM cache question in `ple-prefetch.md`. Placing the table on
-  GPU is still impossible (mirrored, ~30 GB/card); a *partial* row cache is feasible but its prize is
-  bounded by the ~4% above.
+- **Measured, not suspected:** `input:lazy_gather` is 1.18-1.24 ms/call against a 26.11 ms token wall
+  (38.3 t/s) = **4.5%**, and it is exposed, because `set_inputs` runs before the enqueue and after the
+  previous step's sync. It is 86% of `graph:set_inputs`. Recovering all of it is 38.3 -> ~40.1 t/s. Do not
+  quote 1.18/7.48 = 15.8%: `phase:decode` (`llama-context.cpp:1734`) wraps only `llama_decode`, which is
+  the host side of a step, and the other ~18.6 ms/token is the sync, the logits read and sampling.
+- **16 requested rows are ~1 distinct row** (`io:rchar_decode` 1.91 kB/call minus ~150 B of procfs
+  overhead = one 1760 B row), so the host also does 15 redundant 10 kB memcpys per token and uploads
+  164 kB of F32 for 10 kB of distinct data. Cheap today (`lazy_h2d` 19-24 ms over a ~117 s run, and the
+  set is async) but 16x redundant, and at prefill it is 168 MB per ubatch for 7.7 MB of distinct rows.
+- **Dead, as measured:** the `n/32` divisor (decode reads ~1 distinct row, so there is nothing to
+  parallelise), `lazy_staging` (27 ms total, its 4.4 ms max being the one-time 168 MB zero-fill) and
+  `lazy:sort` (20 ms total).
+- **The `POSIX_FADV_RANDOM` arm was confounded by a cold page cache and reverted**; storage rose 27x at
+  prefill on byte-identical requests, which fadvise cannot cause. `b9301a5f1` is recoverable from the
+  reflog for a cache-normalized interleaved A/B. See E058.
+- **Still open, the tail:** `lazy_gather` max was 27.72 ms warm and 123.62 ms cold, so one row read can
+  cost more than a whole token's 26.11 ms budget. That is the irregular-tg signature this item predicted.
+- **Still open, and bigger than PLE:** `meta:subgraph` is 97 dispatches and 5.5 ms per decode step,
+  essentially all of decode's `graph:compute` and **21% of the token wall**, 4.7x the n-gram gather, with
+  `meta:allreduce` adding 1.4 ms/step. Comms thread, not PLE.
 
 ### L3 - 10-of-512 expert routing on HIP **routing is fine; E053 redirected this row**
 

@@ -26,6 +26,16 @@ host-side. What that does to this plan:
   (`n_workers = min(n_readers, max(1, n/32))`), so most of that 1.6 ms is recoverable with one line
   instead of a subsystem. E058 decides which.
 
+**E058 ran (2026-09-26).** The gather is **4.5% of the token wall** (1.18 ms of 26.11 ms at 38.3 t/s),
+not the ~10% this note's ceiling allowed and not the 1.3% the one earlier trace hinted at. Two of the
+assumptions above were wrong in ways that matter: a decode step requests 16 rows but reads **one** distinct
+row of 1760 B, so "16 faults per token" was 16x too high; and a cold row costs **~48 kB of storage**, not
+4 kB, so the byte side was ~12x too low. Those roughly cancel in the total, which is why the ceiling landed
+close. What does not cancel is the split: prefill's 756 distinct rows per 1024-token ubatch are ~99%
+page-cache hits while decode's one row is cold 60-100% of the time, so "(a) alone - warm the table" cannot
+be judged from a prefill-heavy run, and the (b) VRAM row cache would be fed only by decode's own history.
+Whether that history repeats is `io:reuse_decode` (`92586c61f`), and it is the last open question here.
+
 Killed: **E007** (put the table in VRAM). Reason, from code not taste - under `-sm tensor`
 the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`,
 `GGML_BACKEND_SPLIT_AXIS_MIRRORED`, because "its conv is mirrored, so every device runs the
