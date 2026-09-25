@@ -169,12 +169,38 @@ the E018 golden corpus (3428 tokens) can never reach the depth gate - use
 `tools/sparse-corpus.md` with `-c 8192` for any sparse-path check. H4a stays live: sparse
 scans the mask, it does not stop the model from rebuilding it.
 
-Immediate next steps: **B4 - the fork diff** (MMQ fixes, custom AllReduce, and the user's own
-`sm tensor` enablement, which the upstream guard blames on `test-llama-archs` - our harness is now
-the thing that could satisfy it) remains the top code action and is still blocked on getting the
-diff here. Prerequisites the user accepted: re-baseline `test-backend-ops` on 7.1.1. Deferred by
-the user: B0 rpath, a RelWithDebInfo/frame-pointer build for local `perf`, and N4
-(`__GFX12__` emitted for gfx1201?).
+## H9 block-key pool state (E044 -> E056)
+
+`Q4EXP_POOLED=1` (still env-gated, default off) makes the QSA indexer pool each block key once, when
+the block completes, instead of re-deriving all of them every step. Worth **+4..7% tg** on the dev
+dummies and **+30% tg @131k** on 4 cards. Three shape rules came out of the prefill work and are the
+part to remember:
+
+- **One pooled topology.** REBUILD was collapsed into CACHED with `wm = 0` (`8206d79d8`), and the
+  scores read the `set_rows` result, so the write->read dependency is a graph edge and not node order.
+- **The reservation must measure the shape the runtime builds.** `sched_reserve` runs through a
+  full-cache context with no cells, so `qsa_pool_get` used to answer NONE there and ggml-alloc dropped
+  the worst-case budget on the first pooled ubatch, then re-reserved on every ubatch after it (E049's
+  ratchet). Fixed in E056 by keying the worst case on `llama_memory_hybrid_idx_context::is_update` -
+  the context kind, not the cell state - and by pooling one masked row when a run is shorter than a
+  block, which is what the tools' 1-token warmup decodes. 0 re-reserves, +0.08 MiB of reservation.
+- **A re-reserve costs ~25 ms here and ~300 ms on 4 cards**, mostly the device drain plus the lost
+  host/device overlap, so on the bench box it is worth ~110 ms per prefill ubatch (run8: pp8192 1781
+  pooled-prefill vs 2230 with prefill excluded). Cheap to detect: `GGML_PROF_REGIONS=1` and look for
+  `sched:realloc_size` / `sched:realloc_buft`.
+
+`Q4EXP_POOLED_NO_PREFILL` still exists but is no longer needed to protect prefill. What still builds
+the historic graph, and so still churns against a pooled reservation: more than one sequence in the
+cells, or a non-dense run (an interior `seq_rm`). Reaching that needs `--kv-unified` with >1 slot.
+
+## Next steps
+
+Top code action is the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
+measured at +2.5% tg at depth, with three loose ends left. H9's open item is the E056 T2 run (does
+pooled prefill pay on the real model at 131k once the churn is gone). B4 (the fork diff) and N4 were
+dropped in the backlog sweep; `test-backend-ops` still needs a 7.1.1 re-baseline before it can serve
+as a correctness gate.
+
 
 ## Related memories
 

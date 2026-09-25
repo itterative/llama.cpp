@@ -287,16 +287,29 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   tensor kept ratcheting. Fixed, confirmed on 4 cards (pp back to -0.5..-0.9%, tg win intact), then
   collapsed to one graph shape and widened to all ubatch widths, with prefill behind
   `Q4EXP_POOLED_NO_PREFILL`. What the pool is for: long-context decode, +30% tg at 131k.
-- **Open, and the live one:** `Q4EXP_POOLED_NO_PREFILL` is a workaround that works, not an explanation.
-  The user's position is that prefill should not have to be excluded and something else is at play, which
-  is fair: E051 showed pooled prefill neither gaining nor losing once the topology confound was removed,
-  and E052 showed it costing 2.9% with 24+7 re-reservations - but those reservation ms are not additive
-  cost (their bulk is a device sync that would otherwise be counted inside `graph:compute`, see E049's
-  review note), so what actually accounts for the 2.9% is unidentified. Reading it as "pooling prefill is
-  worthless" is a measurement, not a mechanism.
+- **Resolved (E056):** the reservation now measures the pooled shape. `qsa_pool_get` answers the pooled
+  worst case (`wm = 0`, `n_new = n_bid = ceil(n_kv/r)`) when the context is a full-cache one - keyed on
+  `is_update`, the same flag that already fakes `ns_ubatch` for reservation, not on the cell state, which
+  is what made E051's attempt fail - and a run shorter than one block pools a single masked row instead of
+  falling back to the historic chain, because the tools' 1-token warmup was enough to drop the pooled
+  budget and restart the ratchet. Result on the dev box, sparse FA + rtile, 3 interleaved passes:
+  **0 re-reserves** in every pooled arm (was 24+7), reservation +0.08 MiB, pp8192 702.43 vs 702.08
+  pool-off, tg128 35.86 vs 34.38, all nine numeric gates bit-identical. So the E052 `-2.9%` was the
+  reservation after all, and what it cost on 4 cards is a fixed ~110 ms per prefill ubatch of lost
+  host/device overlap (run8: pp8192 1781 vs 2230), not device work. `Q4EXP_POOLED_NO_PREFILL` is now
+  optional.
+- **Open:** whether pooled prefill *gains* anything on the real model at depth - the dev box says neutral,
+  E038's 71 s of 430 s at 131k says there is something to get, and the churn was hiding both. E056's
+  record carries the bench-box command block. Also open: states that are not one dense sequence
+  (multi-seq under `--kv-unified`, an interior `seq_rm`) still build the historic graph and so still
+  churn against a pooled reservation; closing that means making the general path build the pooled
+  topology too (~40 lines in `set_input_qsa`, which already computes the per-block cells and positions).
 - Also open: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
   and the crossover depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is
   unexplained.
+- **Separate bug found on the way (E056):** `llama-cli -c 4096 -n 2500` on `q4exp-4l` re-reserves **13
+  times with `Q4EXP_POOLED=0`** (2 of them on a node-count change), and `llama-perplexity -b 256 -c 2048`
+  120 times in both arms. Nothing to do with H9; at ~300 ms a re-reserve on 4 cards it is worth its own id.
 - **Scope:** prefill, decode, 4-card.
 
 ### H10 - mmq cutoff tuning for MoE models
