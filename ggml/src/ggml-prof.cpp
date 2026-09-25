@@ -6,8 +6,9 @@
 #include <cstring>
 
 // region names are expected to be literals: the pointer is kept, not copied
-#define GGML_PROF_MAX_REGIONS 64
-#define GGML_PROF_MAX_DEPTH   32
+#define GGML_PROF_MAX_REGIONS  64
+#define GGML_PROF_MAX_COUNTERS 32
+#define GGML_PROF_MAX_DEPTH    32
 
 struct ggml_prof_region_stat {
     const char * name;
@@ -19,6 +20,15 @@ struct ggml_prof_region_stat {
 
 static ggml_prof_region_stat ggml_prof_regions[GGML_PROF_MAX_REGIONS];
 static int                   ggml_prof_n_regions = 0;
+
+struct ggml_prof_counter_stat {
+    const char * name;
+    uint64_t     total;
+    uint64_t     count;
+};
+
+static ggml_prof_counter_stat ggml_prof_counters[GGML_PROF_MAX_COUNTERS];
+static int                    ggml_prof_n_counters = 0;
 
 static const struct ggml_prof_sink * ggml_prof_sink = nullptr;
 
@@ -76,6 +86,39 @@ int ggml_prof_enabled(void) {
     return ggml_prof_regions_enabled() ? 1 : 0;
 }
 
+static int ggml_prof_counter_idx(const char * name) {
+    for (int i = 0; i < ggml_prof_n_counters; ++i) {
+        if (ggml_prof_counters[i].name == name || strcmp(ggml_prof_counters[i].name, name) == 0) {
+            return i;
+        }
+    }
+
+    if (ggml_prof_n_counters >= GGML_PROF_MAX_COUNTERS) {
+        return -1;
+    }
+
+    const int i = ggml_prof_n_counters++;
+
+    ggml_prof_counters[i] = { name, 0, 0 };
+
+    return i;
+}
+
+void ggml_prof_count(const char * name, uint64_t delta) {
+    if (!ggml_prof_regions_enabled()) {
+        return;
+    }
+
+    const int idx = ggml_prof_counter_idx(name);
+
+    if (idx < 0) {
+        return;
+    }
+
+    ggml_prof_counters[idx].total += delta;
+    ggml_prof_counters[idx].count += 1;
+}
+
 void ggml_prof_region_begin(const char * name) {
     if (!ggml_prof_regions_enabled()) {
         return;
@@ -126,6 +169,14 @@ void ggml_prof_region_end(void) {
     }
 }
 
+// unit agnostic magnitude, so byte counters stay readable
+static void ggml_prof_fmt(uint64_t v, char * buf, size_t len) {
+    if      (v >= 1000000000ULL) { snprintf(buf, len, "%.2fG", v*1e-9); }
+    else if (v >= 1000000ULL)    { snprintf(buf, len, "%.2fM", v*1e-6); }
+    else if (v >= 1000ULL)       { snprintf(buf, len, "%.2fk", v*1e-3); }
+    else                         { snprintf(buf, len, "%llu", (unsigned long long) v); }
+}
+
 void ggml_prof_report(const char * title) {
     fprintf(stderr, "[prof] %s: %d regions\n", title ? title : "regions", ggml_prof_n_regions);
 
@@ -158,6 +209,42 @@ void ggml_prof_report(const char * title) {
 
     for (int i = 0; i < ggml_prof_n_regions; ++i) {
         ggml_prof_regions[i] = { ggml_prof_regions[i].name, 0, 0, UINT64_MAX, 0 };
+    }
+
+    if (ggml_prof_n_counters > 0) {
+        fprintf(stderr, "[prof] counters\n");
+
+        // name order, so a counter and the one it gets divided by stay adjacent
+        const ggml_prof_counter_stat * corder[GGML_PROF_MAX_COUNTERS];
+        int                            cord_n = 0;
+
+        for (int i = 0; i < ggml_prof_n_counters; ++i) {
+            int j = cord_n++;
+
+            while (j > 0 && strcmp(corder[j-1]->name, ggml_prof_counters[i].name) > 0) {
+                corder[j] = corder[j-1];
+                j--;
+            }
+
+            corder[j] = &ggml_prof_counters[i];
+        }
+
+        for (int i = 0; i < cord_n; ++i) {
+            const ggml_prof_counter_stat * c = corder[i];
+
+            char tot[16];
+            char avg[16];
+
+            ggml_prof_fmt(c->total, tot, sizeof(tot));
+            ggml_prof_fmt(c->count ? c->total / c->count : 0, avg, sizeof(avg));
+
+            fprintf(stderr, "[prof]   %-28s %8llu calls %12s total %10s/call\n",
+                    c->name, (unsigned long long) c->count, tot, avg);
+        }
+    }
+
+    for (int i = 0; i < ggml_prof_n_counters; ++i) {
+        ggml_prof_counters[i] = { ggml_prof_counters[i].name, 0, 0 };
     }
 }
 
