@@ -307,14 +307,25 @@ question is closed by E056.
   125.9. That is E028/P2's prize arriving for free. The reservation is also **34.8 MiB smaller**
   (2319.04 vs 2353.85 MiB), and tg is +32.6% over pool-off, matching E045. So
   `Q4EXP_POOLED_NO_PREFILL` has no job left.
+- **Default flipped on in `9111adf2c`**, and `Q4EXP_POOLED_NO_PREFILL` is deleted with it: parity plus a
+  bench number were the two conditions the plan set, and E056's T2 run met both. Verified after the flip,
+  on the dev box: the sparse corpus at `-c 8192 -b 2048` and the `-b 256 -c 2048` gate both reproduce
+  their recorded pool-on values (267035.3875, 266571.9557) with no env set, the cache logs
+  `block key pool = 1` and 49 `qsa pool: mode = 1` lines where E056 saw 49, and `Q4EXP_POOLED=0` still
+  gives `block key pool = 0` with zero mode lines and the same PPL. The other seven gates were not re-run:
+  E056 already diffed all nine pool-off vs pool-on on the same build, and a default flip cannot change
+  what either side computes.
+- **The tradeoff the flip accepts:** E050 measured the pool as *negative* for tg below ~32k (-3.7% at
+  d4096, ~0 at d16384, +2.6% at d40960, +30.1% at d131072), so short-context decode pays a little for a
+  feature it does not use. Those numbers predate the reservation fix and the flip, and E013's `-d` sweep
+  is the run that would re-draw the crossover. The branch targets 262k, which is why this is acceptable.
 - **Still open:** states that are not one dense sequence (multi-seq under `--kv-unified`, an interior
   `seq_rm`) build the historic graph and so churn against a pooled reservation; closing that means making
   the general path build the pooled topology too (~40 lines in `set_input_qsa`, which already computes
-  the per-block cells and positions). And whether `Q4EXP_POOLED` should now default on - parity plus a
-  bench number were the two conditions the plan set, and both are met.
-- Also open: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
-  and the crossover depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is
-  unexplained.
+  the per-block cells and positions).
+- Also open, and now on every run's bill: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage
+  (H15/P3) went from "on the table" to "the default's cost"; and the crossover depth where pooling stops
+  paying is unexplained.
 - **Separate bug found on the way (E056):** `llama-cli` and `llama-perplexity` re-reserve 13 and 120
   times per run **with `Q4EXP_POOLED=0`**, same ratchet, different first trigger. Nothing to do with H9;
   promoted to **H19** with the named tensor and the evidence.

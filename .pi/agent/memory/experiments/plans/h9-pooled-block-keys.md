@@ -1,7 +1,7 @@
 # H9 design - persist pooled indexer block keys at write time
 
-Status: **built in `d8bce4e25`** behind `Q4EXP_POOLED` (default off), validated bit-identical on the
-dev box. Read [runs/E044-h9-pool-implementation.md](../runs/E044-h9-pool-implementation.md) for the
+Status: **built in `d8bce4e25`, on by default since `9111adf2c`** (`Q4EXP_POOLED=0` is the opt-out),
+validated bit-identical on the dev box. Read [runs/E044-h9-pool-implementation.md](../runs/E044-h9-pool-implementation.md) for the
 six places where this design was wrong and what the validation matrix actually covers; the numbers
 below are kept as written at design time.
 
@@ -11,12 +11,13 @@ Since then, three changes to the shape policy, all recorded elsewhere:
   below is now CACHED with `wm = 0`, and the scores read the `set_rows` result, so there is one pooled
   topology and the write->read edge is real instead of relying on node order.
 - **Widths** (`bd0b294a8`, [runs/E052](../runs/E052-pool-covers-multi-token-ubatches.md)): every width
-  pools by default, `Q4EXP_POOLED_NO_PREFILL` opts wide ubatches out.
+  pools. The `Q4EXP_POOLED_NO_PREFILL` opt-out that shipped with it is **deleted** (`9111adf2c`).
 - **Reservation** ([runs/E056](../runs/E056-pooled-reserve-shape.md)): the full-cache context answers
   `qsa_pool_get` with the pooled worst case (`wm = 0`, `n_new = n_bid = ceil(n_kv/ratio)`), so
   `sched_reserve` measures the shape the runtime builds, and a run shorter than one block pools a single
   masked row instead of falling back. That removes the per-ubatch re-reservation that made pooled prefill
-  cost 13-20% on 4 cards, and `Q4EXP_POOLED_NO_PREFILL` is no longer needed to protect prefill.
+  cost 13-20% on 4 cards. E056's T2 run then measured pooled prefill as slightly *positive* (+1.8% over
+  excluding it, +2.4% over pool off) with a reservation 34.8 MiB smaller, so the default flipped to on.
 
 Source of truth for the numbers: E043 review of E042 (runs/E043-review-of-e042.md, verbatim). All
 per-token-per-GPU figures use the reviewed divisor 1540 (385 tokens x 4 GPUs).
@@ -110,7 +111,7 @@ Three graph variants, chosen at build time, honest to can_reuse:
    head adds + a one-block write (~launch overheads). Expected ~2.3 ms vs 13.2 today.
 2. rebuild-read + write-back: first graph after a gen bump. Runs today's full chain AND writes all
    n_bid rows back via one set_rows. Cost = today's 11.1 ms + ~1 ms, ONCE per invalidation.
-3. recompute-read, no cache: the general/multi-seq path (or Q4EXP_POOLED unset) - today's graph,
+3. recompute-read, no cache: the general/multi-seq path (or Q4EXP_POOLED=0) - today's graph,
    no cache involvement at all. The cached path is only ever enabled for the contiguous
    single-sequence fast state, because the general path's block ids are renumbered per ubatch and
    are not append-stable (llama-memory-hybrid-idx.cpp group machinery).
@@ -162,8 +163,8 @@ selection-overlap test below.
 - Does not fuse norm+rope into the matvec (the bespoke-kernel recommendation 2) - H9 first; the
   kernel later runs 1 new block per 4 tokens instead of 32768.
 - Does not fix F8 (FA half-count ambiguity) - re-measure separately.
-- Env gate `Q4EXP_POOLED` (default OFF until parity and A/B bench land, then ON), same style as
-  Q4EXP_SPARSE_FA / Q4EXP_CELL_SEL.
+- Env gate `Q4EXP_POOLED`: **flipped to on** in `9111adf2c` once parity and the A/B bench landed, as
+  planned. Same style as Q4EXP_SPARSE_FA / Q4EXP_CELL_SEL, which are still opt-in.
 
 ## Implementation order
 
@@ -220,4 +221,4 @@ Files touched by P1:
 3. Rebuild-on-invalid path (variant 2), fallback = today's chain (variant 3), cached path gated to
    the contiguous single-seq fast state.
 4. Pooled values not persisted in state files for v1; rebuild on load.
-5. Gate Q4EXP_POOLED default OFF -> ON after parity + bench.
+5. ~~Gate Q4EXP_POOLED default OFF -> ON after parity + bench.~~ done, `9111adf2c`.

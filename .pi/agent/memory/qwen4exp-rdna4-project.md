@@ -169,12 +169,12 @@ the E018 golden corpus (3428 tokens) can never reach the depth gate - use
 `tools/sparse-corpus.md` with `-c 8192` for any sparse-path check. H4a stays live: sparse
 scans the mask, it does not stop the model from rebuilding it.
 
-## H9 block-key pool state (E044 -> E056)
+## H9 block-key pool state (E044 -> on by default)
 
-`Q4EXP_POOLED=1` (still env-gated, default off) makes the QSA indexer pool each block key once, when
-the block completes, instead of re-deriving all of them every step. On 4 cards at 131k it is worth
-**+32.6% tg** and, since E056, **+2.4% pp** over pool-off (+1.8% over excluding prefill). Three shape
-rules came out of the prefill work and are the part to remember:
+`Q4EXP_POOLED` (**on by default since `9111adf2c`**; `=0` is the opt-out) makes the QSA indexer pool each
+block key once, when the block completes, instead of re-deriving all of them every step. On 4 cards at
+131k it is worth **+32.6% tg** and, since E056, **+2.4% pp** over pool-off (+1.8% over excluding prefill).
+Three shape rules came out of the prefill work and are the part to remember:
 
 - **One pooled topology.** REBUILD was collapsed into CACHED with `wm = 0` (`8206d79d8`), and the
   scores read the `set_rows` result, so the write->read dependency is a graph edge and not node order.
@@ -189,18 +189,25 @@ rules came out of the prefill work and are the part to remember:
   pooled-prefill vs 2230 with prefill excluded). Cheap to detect: `GGML_PROF_REGIONS=1` and look for
   `sched:realloc_size` / `sched:realloc_buft`.
 
-`Q4EXP_POOLED_NO_PREFILL` has no job left: with the reservation fixed, pooling prefill measures slightly
-positive and is cheaper on the host, because the pooled variant never creates `blk_pos` (I32
-`[4*n_blocks*n_stream]`, 557 KB per ubatch at 131k), which is where `graph:set_inputs` spends 125.9 ms
-pool-off and 90.8 ms pooled. The pooled reservation is also 34.8 MiB *smaller* at that context. What still
-builds the historic graph, and so still churns against a pooled reservation: more than one sequence in the
-cells, or a non-dense run (an interior `seq_rm`). Reaching that needs `--kv-unified` with >1 slot.
+`Q4EXP_POOLED_NO_PREFILL` is **deleted** (`9111adf2c`, with the default flip): with the reservation fixed,
+pooling prefill measures slightly positive and is cheaper on the host, because the pooled variant never
+creates `blk_pos` (I32 `[4*n_blocks*n_stream]`, 557 KB per ubatch at 131k), which is where
+`graph:set_inputs` spends 125.9 ms pool-off and 90.8 ms pooled. The pooled reservation is also 34.8 MiB
+*smaller* at that context. What still builds the historic graph, and so still churns against a pooled
+reservation: more than one sequence in the cells, or a non-dense run (an interior `seq_rm`). Reaching that
+needs `--kv-unified` with >1 slot.
+
+Two things the default flip changes that no numeric gate catches: the pool's **354 MiB/card at ctx
+245760** is now paid by every qwen4exp run (H15/P3's f16 storage is the fix, and it just got more
+relevant), and a plain `llama-bench` on this branch is no longer comparable to a pre-`9111adf2c` number
+unless that number set `Q4EXP_POOLED` explicitly - same trap as E055's `855a65544`.
 
 ## Next steps
 
 Top code action is the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
-measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end (E056 T2); what is
-left on it is a default flip for `Q4EXP_POOLED` and the general-path shape. H19 is the non-pool
+measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
+what is left on it is the general-path shape and the VRAM tax that default now makes everyone pay. H19 is
+the non-pool
 reservation ratchet. B4 (the fork diff) and N4 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
 

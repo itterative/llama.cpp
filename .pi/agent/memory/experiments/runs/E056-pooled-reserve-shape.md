@@ -130,6 +130,12 @@ off, tg keeps the pool's +32.6% at depth, and every numeric gate is bit-identica
 re-reserves per pass, +1.8% pp at 131k, same tg), and prefill now leaves the pool warm, so the first
 decode step does not re-derive all 34816 blocks.
 
+**Follow-up (`9111adf2c`):** on the strength of this record the default flipped - `Q4EXP_POOLED` is now on
+unless set to 0, and `Q4EXP_POOLED_NO_PREFILL` is deleted. Re-verified after the flip: the two
+pool-engaging PPL gates reproduce their recorded values with no env set, `block key pool = 1` and 49
+`mode = 1` lines appear where this record saw 49, and `Q4EXP_POOLED=0` still disables it. The other seven
+gates were not re-run, because this record already diffed all nine across the same two code paths.
+
 ## T2 results (bench box, 4 cards)
 
 Run by the user on 2026-09-25 from `8be59fb38` (the code of `b811339d6`): the command block below, 2
