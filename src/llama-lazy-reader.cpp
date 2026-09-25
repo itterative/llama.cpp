@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 llama_lazy_reader::llama_lazy_reader(const std::string & path, size_t offs, enum ggml_type type,
@@ -83,9 +85,16 @@ static bool lazy_self_io(uint64_t & rchar, uint64_t & storage) {
 // a gather of at most this many rows is decode or a speculative verify, above it is prefill
 static const int64_t LAZY_IO_DECODE_MAX_ROWS = 1024;
 
+// rows an earlier gather already read, so the reuse rate falls out of the counters. process-wide and
+// never evicted, which is fine because it is inert unless profiling and a run touches few rows
+static std::mutex                  lazy_seen_lock;
+static std::unordered_set<int32_t> lazy_seen;
+
 void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) const {
-    uint64_t     rchar0 = 0, storage0 = 0;
-    const bool   io = ggml_prof_enabled() && lazy_self_io(rchar0, storage0);
+    const bool prof = ggml_prof_enabled() != 0;
+
+    uint64_t   rchar0 = 0, storage0 = 0;
+    const bool io = prof && lazy_self_io(rchar0, storage0);
 
     std::vector<std::pair<int32_t, int32_t>> pairs;
     pairs.reserve(n);
@@ -98,6 +107,27 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
         ggml_prof_region prof_sort("lazy:sort");
 
         std::sort(pairs.begin(), pairs.end());
+    }
+
+    // pairs is sorted, so the distinct rows and the ones an earlier gather saw are one linear pass
+    int64_t n_uniq = 0, n_reuse = 0;
+
+    if (prof) {
+        std::lock_guard<std::mutex> lock(lazy_seen_lock);
+
+        for (int64_t i = 0; i < n; ) {
+            int64_t j = i + 1;
+            while (j < n && pairs[j].first == pairs[i].first) {
+                ++j;
+            }
+
+            n_uniq++;
+            if (!lazy_seen.insert(pairs[i].first).second) {
+                n_reuse++;
+            }
+
+            i = j;
+        }
     }
 
     const int n_workers = (int) std::min<int64_t>(files.size(), std::max<int64_t>(1, n / 32));
@@ -130,15 +160,20 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
         t.join();
     }
 
-    if (io) {
-        uint64_t rchar1 = 0, storage1 = 0;
+    if (prof) {
+        const bool dec = n <= LAZY_IO_DECODE_MAX_ROWS;
 
-        if (lazy_self_io(rchar1, storage1)) {
-            const bool dec = n <= LAZY_IO_DECODE_MAX_ROWS;
+        ggml_prof_count(dec ? "io:rows_decode"  : "io:rows_prefill",  (uint64_t) n);
+        ggml_prof_count(dec ? "io:uniq_decode"  : "io:uniq_prefill",  (uint64_t) n_uniq);
+        ggml_prof_count(dec ? "io:reuse_decode" : "io:reuse_prefill", (uint64_t) n_reuse);
 
-            ggml_prof_count(dec ? "io:rows_decode"    : "io:rows_prefill",    (uint64_t) n);
-            ggml_prof_count(dec ? "io:rchar_decode"   : "io:rchar_prefill",   rchar1 - rchar0);
-            ggml_prof_count(dec ? "io:storage_decode" : "io:storage_prefill", storage1 - storage0);
+        if (io) {
+            uint64_t rchar1 = 0, storage1 = 0;
+
+            if (lazy_self_io(rchar1, storage1)) {
+                ggml_prof_count(dec ? "io:rchar_decode"   : "io:rchar_prefill",   rchar1 - rchar0);
+                ggml_prof_count(dec ? "io:storage_decode" : "io:storage_prefill", storage1 - storage0);
+            }
         }
     }
 
