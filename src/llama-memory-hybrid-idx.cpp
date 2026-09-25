@@ -571,10 +571,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool one_seq = n_seq_present <= 1;
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
         bool oor = false;
 
-        bool dup = false;
+        // the block cut lands on the position line, which only works while that line steps once per
+        // used cell: an mrope image pins many cells to one position, and a cache that never saw the
+        // image cells (the draft skips embedding batches) has a jump where it jumped the position over
+        bool sparse = false;
 
         bool ranked = false;
 
@@ -590,8 +592,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
             grp_slots.clear();
             grp_bid  .clear();
 
-            oor = false;
-            dup = false;
+            oor    = false;
+            sparse = false;
+
+            int64_t prev = -1;
 
             for (int64_t j = 0; j < n_kv; ++j) {
                 if (cells.is_empty(j)) {
@@ -600,6 +604,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
                 const int64_t pb  = idx/r;
+
+                sparse |= prev >= 0 && idx != prev + 1;
+                prev    = idx;
 
                 if (pb >= n_blocks) {
                     oor = true;
@@ -629,8 +636,6 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                 const uint64_t bit = uint64_t(1) << (idx%r);
 
-                dup |= (grp_slots[g] & bit) != 0;
-
                 cell_grp[j]   = g;
                 grp_slots[g] |= bit;
 
@@ -646,8 +651,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         //     positions, where the block mapping is arithmetic - verified in a single pass, this
         //     skips the group machinery and the second walk over the cells
         auto try_contiguous = [&](void) -> bool {
-            // a run with one cell per position cannot repeat a slot bit, so the ranked (mrope
-            //     duplicate) branch below is unreachable whenever this one applies
+            // a run that steps once per cell has no duplicate and no jump, so the ranked branch
+            //     below is unreachable whenever this one applies
             if (!blk_bias || !one_seq) {
                 return false;
             }
@@ -773,10 +778,17 @@ void llama_memory_hybrid_idx::set_input_qsa(
             const bool fast = try_contiguous();
 
             if (!fast) {
+            // a run whose endpoints agree but whose interior does not makes try_contiguous bail after
+            //     it wrote part of the mapping, so start the general path from a clean block list
+            n_bid = 0;
+            std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+
             group_cells();
 
-            // mrope repeats one position across an image, so rank cells instead of using the position
-            if (dup && ubatch->is_pos_2d() && one_seq) {
+            // rank cells instead of using their position: rank space is dense over the used cells and
+            //     keeps the position order, so both the duplicates mrope writes and the jumps a cache
+            //     skips over become addressable, and rank < n_kv can never run past the block window
+            if ((sparse || oor) && ubatch->is_pos_2d() && one_seq) {
                 order.clear();
                 order.reserve(n_kv);
 
@@ -1002,6 +1014,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
         if (run_fast) {
             qsa_runs[ratio] = { run_j0, run_p0, run_j1, run_b_lo, run_wm };
         } else {
+            // the pooled graph reads its rows and gathers its cells on every step, so a run that broke
+            // after the build still has to name them: row 0 / cell 0 are in range, and the keys they
+            // write are dropped with the watermark below
+            if (dst_new_rows) {
+                std::fill(dst_new_rows, dst_new_rows + pool.n_new, 0);
+            }
+
+            if (dst_new_cells) {
+                std::fill(dst_new_cells, dst_new_cells + r*pool.n_new, 0);
+            }
+
+            if (dst_new_pos) {
+                std::fill(dst_new_pos, dst_new_pos + 4*pool.n_new, 0);
+            }
+
             qsa_runs.erase(ratio);
         }
 
