@@ -67,6 +67,13 @@ anything - it defines the tiers, the naming, and the rules.
    the repo root when tools are run from there. Two crashes were 14.6 GB before anyone looked
    (E020). Check `df` and `ls gpucore.*` after any `HSA_STATUS_ERROR_EXCEPTION`.
 
+6. **A `llama-cli` A/B on the bench box cannot be text-matched.** `--temp 0` makes this model loop, and
+   `-s <seed>` did not reproduce across runs with `-sm tensor` - probably 4-card reduction order moving
+   the last logit bits, unconfirmed. So each arm generates different text and touches different rows, and
+   run length varies too (E058's four arms ran 2863 to 4747 decode steps). Normalize per call, and use the
+   deterministic part of the workload as the control: in E058 prefill's counters came out byte-identical
+   across all four arms while decode's differed.
+
 ## Status (as of 2026-09-17, refreshed after E018)
 
 Scaffolding built: PROTOCOL, INDEX, E001 (harness viability, `blocked` by the traps
@@ -234,13 +241,14 @@ what is left on it is vision - H20 (pool nothing while an image is in the run), 
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
 bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
 VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
-reservation ratchet. **E058 ran**: the n-gram fetch is **4.5% of the decode token wall** (1.18 ms of
-26.11 ms at 38.3 t/s) and exposed, so that is the whole prize. A decode step requests 16 rows but reads
-**one** distinct 1760 B row, cold 60-100% of the time, while prefill's 756 distinct rows per ubatch are
-~99% page-cache hits - different populations, so prefill's warming does nothing for decode. The
-worker-divisor fix is dead (one row, nothing to parallelise) and a `POSIX_FADV_RANDOM` arm was confounded
-by a cold cache and reverted. What is left is `io:reuse_decode` (`92586c61f`): whether decode's rows
-repeat across steps, which decides whether any cache can help. B4 (the fork diff) and N4
+reservation ratchet. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+(1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
+on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
+before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also
+closed the cache question: the misses are compulsory first touches of a 133 MB working set, and the
+27.7-34.1% that do repeat are already free via the page cache, so no row cache host or GPU can win.
+What is left there is the tail (`lazy_gather` max 29-31 ms in every arm, so one row read can exceed a
+token's budget) and the ~0.5% the prefetch costs when a table does stay cached. B4 (the fork diff) and N4
 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
 
