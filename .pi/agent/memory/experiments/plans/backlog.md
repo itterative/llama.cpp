@@ -397,7 +397,7 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `REBUILD`/fallback path, where the gather is still f16 -> f32.
 - **Scope:** prefill, decode.
 
-### H16 - the 4-card reduce is NCCL, and it is 22% of device time **34% in decode per E053, still parked**
+### H16 - the 4-card reduce: RCCL is exhausted, the in-tree p2p path is the live question **un-parked by measurement, see [plans/decode-comms-plan.md](decode-comms-plan.md)**
 
 - E037: `ncclDevKernel_Generic_4` is **163,124 calls, 22.0 s** in the chain-off arm and 22.2 s in the
   chain-on arm, i.e. 96 collectives per graph build (2 per layer) at **135 us each** for a 2560-wide f32
@@ -408,11 +408,19 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   payload size is depth-independent - that is peer-wait, i.e. imbalance exposure growing with depth, and
   it is ~15 ms/token of a ~45 ms/token step, the same order as the whole chain.
 - **Do not chase without asking:** the user says NCCL is not an issue.
-- **Parked by the user (2026-09-24), and the comparison already exists:** RCCL works on the bench box,
-  and the fork's p2p allreduce is *slightly slower* at tg there. So the selector
-  (`ggml-cuda.cu:1076-1138`, `try_allreduce_{nccl,internal,butterfly}`) is live code and both paths have
-  been measured - this is not a missing capability waiting to be found. The user has a suspect for the p2p
-  gap and is not focusing there. Do not reserve a run against H16 without asking.
+- ~~Parked by the user (2026-09-24)~~ **measured 2026-09-25, five arms, `results/user/llama-bench/82bc067c3/0[3-6]*.log`
+  and `99-*.log`.** The old note that "p2p is slightly slower" is now `p2p is ~7% slower and it is
+  explainable`: NCCL Ring 37 us/call host and 33.48 tg, our direct-p2p butterfly 127 us/call and 31.23.
+  The cost is linear in API calls at ~4-5 us each, and the copy/event path issues ~30 per collective
+  against NCCL's 6. So the gap is mechanism, not capability, and the fix has a shape (one fused kernel per
+  device per collective, push and reduce in one launch) that is *not* what the current code or the legacy
+  one-shot sketch does. Full plan: [decode-comms-plan.md](decode-comms-plan.md).
+- **RCCL itself has nothing left.** `NCCL_ALGO=Tree` was silently ignored (identical per-call cost to
+  Ring; its `AllReduce` row is `0.0/0.0` in RCCL's own tuning table), `NCCL_ALGO=FC` is accepted and is
+  133 us/call and 8% slower, LL and one channel are already auto-selected at 10240 B, and `VMM: no` on all
+  four devices means cuMem/symmetric windows - the only one-shot NCCL could offer - cannot exist here.
+  `RCCL_USE_AMD_SMI_LIB=1 NCCL_CUMEM_ENABLE=1` is a **hazard, not a knob**: the collective got cheaper
+  (40 us/call) and tg fell to 3.60. Do not re-run that pair.
 - **Scope:** decode, 4-card.
 
 ### ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
