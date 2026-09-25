@@ -321,6 +321,12 @@ which is most likely noise at that corpus size - see the sign problem above.
 
 Deliberately left as is, each a decision rather than an oversight:
 
+- **The inbox is sized off the cutoff, not off `tmp_bytes`.** It was: `4 x 16 MiB = 256 MiB` per GPU, 1 GiB
+  across four cards, for a path the same ladder restricts to messages of 256 KiB and under. Now
+  `n x 2 parities x 2 wire bytes x os_bytes` = 4 MiB per GPU, allocated once at init and deliberately left
+  out of the scratch-growth path (freeing it there would have quietly switched one-shot off mid-run through
+  `pick_by_size`'s null check). Raise `GGML_CUDA_AR_DIRECT_ONESHOT_BYTES` and the reservation grows with it,
+  which is the honest coupling.
 - **`GGML_HIP_AR_BF16` stays OFF**, so the internal path moves f32 where NCCL moves bf16 at or above 262144
   elements. That is probably the whole reason internal+auto measured ~5% below NCCL on pp. Enabling it is a
   cmake flag plus a pp A/B, not a code change.
