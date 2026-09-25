@@ -92,12 +92,14 @@ static bool lazy_self_io(uint64_t & rchar, uint64_t & storage) {
 // a gather of at most this many rows is decode or a speculative verify, above it is prefill
 static const int64_t LAZY_IO_DECODE_MAX_ROWS = 1024;
 
-// env: LLAMA_LAZY_PREFETCH - ask for every distinct row before waiting on any of them
+// env: LLAMA_LAZY_PREFETCH - ask for every distinct row before waiting on any of them. on by default:
+// the rows are scattered, so reading them serially makes each cold one a separate queue-depth-1 wait.
+// set to 0 to skip it, which is slightly cheaper when the table is small enough to stay cached
 static int llama_lazy_prefetch() {
     static const int val = []() {
         const char * env = std::getenv("LLAMA_LAZY_PREFETCH");
 
-        return env != nullptr ? atoi(env) : 0;
+        return env == nullptr || atoi(env) != 0 ? 1 : 0;
     }();
 
     return val;
