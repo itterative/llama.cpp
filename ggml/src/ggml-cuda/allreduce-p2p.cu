@@ -70,6 +70,7 @@ enum ggml_cuda_ar_algo {
     GGML_CUDA_AR_ALGO_RING      = 1,
     GGML_CUDA_AR_ALGO_AUTO      = 2,
     GGML_CUDA_AR_ALGO_BDE       = 3,
+    GGML_CUDA_AR_ALGO_ONESHOT   = 4,
 };
 
 struct ggml_cuda_ar_pipeline_direct {
@@ -107,7 +108,14 @@ struct ggml_cuda_ar_pipeline_direct {
     // each round's phase-2 add, waited on before a peer's next-round copy. The
     // ping-pong (phase-1 reads one buffer, phase-2 writes the other) needs no
     // within-round barrier; this carries the cross-round dependency.
+    // Unused by the one-shot path, which has no cross-round dependency.
     cudaEvent_t data_ready[GGML_CUDA_MAX_DEVICES];
+
+    // One-shot path: per-device inbox, n slots x 2 generation parities x 2 bytes
+    // of wire per byte of payload (LL tag). Allocated with the same growth path
+    // as dev_tmp so the slot layout is a pure function of tmp_bytes.
+    void *   os_inbox[GGML_CUDA_MAX_DEVICES];
+    unsigned os_generation;      // host-side tag, +1 per collective
 
     // Butterfly/bde pairing: pairs_in_round[r][2k+0..1] = (a, b), log2(N) rounds.
     int      n_rounds;
@@ -129,6 +137,256 @@ static __global__ void ggml_cuda_ar_direct_add_kernel(
     for (int i = tid; i < count; i += nt) {
         dst[i] = (T) (((float) dst[i]) + ((float) src[i]));
     }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot AllReduce: ONE kernel launch per device per collective.
+//
+// The copy-based algorithms above issue ~4 API calls per device per round, so
+// at N=4 a collective costs ~30 host calls against NCCL's 6 -- measured 127 us
+// vs 37 us of host time per call on 4x R9700. Host cost is linear in API calls
+// at ~4-5 us each, so anything that wants to beat NCCL has to get under 6.
+//
+// Wire unit is 8 bytes: 4 bytes of payload plus a 4 byte generation tag in the
+// same store. An aligned 64-bit store is atomic, so a reader sees either the
+// old unit or the new one -- no flag array, no arrival counter, no system
+// fence, and the posted-write-ordering assumption the doorbell design rested on
+// never comes up. Bytes on the wire double, which is irrelevant at 10 KB.
+//
+// Each thread pushes exactly the units it later reduces, so the in-place write
+// back into my own tensor cannot race with another thread pushing that unit.
+// Every device launches the same grid, so thread t covers the same units on
+// every device, and a thread has pushed its units before it waits on any peer.
+// That makes the grid a correctness constraint: a block that never launches
+// never pushes, and peers would then spin on units that do not exist. Hence the
+// fixed co-resident grid below (16 blocks on a 54-CU GPU).
+//
+// Inboxes are double-buffered by generation parity. A peer cannot be two
+// generations ahead while I am still reading generation g: its g+1 kernel is
+// enqueued on its stream after its g kernel, and that one needed my g push.
+// ---------------------------------------------------------------------------
+
+#define GGML_CUDA_AR_OS_BLOCKS  16
+#define GGML_CUDA_AR_OS_THREADS 256
+#define GGML_CUDA_AR_OS_SPIN    200000000L
+
+struct ggml_cuda_ar_os_args {
+    const unsigned *         self;                          // my tensor, as 4 B units
+    unsigned *               dst;                           // == self, in place
+    unsigned long long *     to  [GGML_CUDA_MAX_DEVICES];   // peer j's inbox slot for my data
+    const unsigned long long * from[GGML_CUDA_MAX_DEVICES]; // my inbox slot holding peer j's data
+    unsigned gen;
+    int      n;
+    int      self_i;
+    int      nunits;
+    bool     compute;                                       // false: I contribute zeros
+};
+
+// K * sizeof(T) == 4: one f32 per unit, or two f16/bf16.
+template <typename T, int K>
+static __global__ void ggml_cuda_ar_oneshot_kernel(ggml_cuda_ar_os_args a) {
+    union os_unit {
+        unsigned raw;
+        T        v[K];
+    };
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nth = gridDim.x * blockDim.x;
+
+    // Push my slice into every peer's inbox. Posted writes, no waiting.
+    for (int u = tid; u < a.nunits; u += nth) {
+        const unsigned raw = a.compute ? a.self[u] : 0u;
+        const unsigned long long w = ((unsigned long long) raw << 32) | (unsigned long long) a.gen;
+        for (int j = 0; j < a.n; ++j) {
+            if (j != a.self_i) {
+                a.to[j][u] = w;
+            }
+        }
+    }
+
+    // Reduce in ascending device order on every device, in float, so all N
+    // devices land on identical bits -- same invariant the add kernel keeps.
+    for (int u = tid; u < a.nunits; u += nth) {
+        float acc[K] = {};
+
+        for (int j = 0; j < a.n; ++j) {
+            unsigned raw;
+
+            if (j == a.self_i) {
+                raw = a.compute ? a.self[u] : 0u;
+            } else {
+                unsigned long long w    = 0;
+                long               spin = 0;
+
+                // volatile: the value is written by another device, so the load
+                // must not be hoisted out of the wait loop.
+                const volatile unsigned long long * slot = a.from[j];
+
+                while (true) {
+                    w = slot[u];
+                    const unsigned tag = (unsigned) w;
+                    if (tag == a.gen) {
+                        break;
+                    }
+                    if ((int) (tag - a.gen) > 0 && spin++ == 0) {
+                        printf("ar-oneshot: peer %d slot %d is at tag %u, wanted %u\n", j, u, tag, a.gen);
+                    }
+                    if (spin > GGML_CUDA_AR_OS_SPIN) {
+                        printf("ar-oneshot: timeout waiting for peer %d unit %d (tag %u, gen %u)\n",
+                               j, u, (unsigned) w, a.gen);
+                        break;
+                    }
+                }
+
+                raw = (unsigned) (w >> 32);
+            }
+
+            os_unit in;
+            in.raw = raw;
+            for (int k = 0; k < K; ++k) {
+                acc[k] += (float) in.v[k];
+            }
+        }
+
+        os_unit out;
+        for (int k = 0; k < K; ++k) {
+            out.v[k] = (T) acc[k];
+        }
+        a.dst[u] = out.raw;
+    }
+}
+
+static void ggml_cuda_ar_launch_oneshot(
+        ggml_cuda_ar_pipeline_direct * p,
+        void                        ** work_data,
+        ggml_type                      work_type,
+        int64_t                        ne,
+        const bool                   * compute,
+        cudaStream_t                 * streams) {
+    const int    n          = p->n_devices;
+    const size_t type_size  = ggml_type_size(work_type);
+    const int    nunits     = (int) ((size_t) ne * type_size / 4);
+    const size_t slot_bytes = 2 * p->tmp_bytes;
+    const unsigned gen      = ++p->os_generation;
+    const int    parity     = (int) (gen & 1);
+
+    ggml_cuda_ar_os_args a = {};
+    a.n       = n;
+    a.gen     = gen;
+    a.nunits  = nunits;
+
+    for (int i = 0; i < n; ++i) {
+        a.self_i  = i;
+        a.self    = (const unsigned *) work_data[i];
+        a.dst     = (unsigned *)       work_data[i];
+        a.compute = compute[i];
+
+        for (int j = 0; j < n; ++j) {
+            if (j == i) {
+                a.to[j]   = nullptr;
+                a.from[j] = nullptr;
+                continue;
+            }
+            a.to[j]   = (unsigned long long *) ((char *) p->os_inbox[j] + ((i * 2 + parity) * slot_bytes));
+            a.from[j] = (const unsigned long long *) ((const char *) p->os_inbox[i] + ((j * 2 + parity) * slot_bytes));
+        }
+
+        ggml_cuda_set_device(p->devices[i]);
+
+        switch (work_type) {
+            case GGML_TYPE_F32: ggml_cuda_ar_oneshot_kernel<float, 1><<<GGML_CUDA_AR_OS_BLOCKS, GGML_CUDA_AR_OS_THREADS, 0, streams[i]>>>(a); break;
+            case GGML_TYPE_F16: ggml_cuda_ar_oneshot_kernel<half,  2><<<GGML_CUDA_AR_OS_BLOCKS, GGML_CUDA_AR_OS_THREADS, 0, streams[i]>>>(a); break;
+            default:            ggml_cuda_ar_oneshot_kernel<nv_bfloat16, 2><<<GGML_CUDA_AR_OS_BLOCKS, GGML_CUDA_AR_OS_THREADS, 0, streams[i]>>>(a); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t need_bytes);
+
+// GGML_CUDA_AR_ONESHOT_PROBE=<iterations>: run the one-shot over the real links
+// before any model work. Each device seeds every element with (rank+1), so the
+// result must be n*(n+1)/2 on every device; that checks the 8-byte wire unit
+// (one atomic store carrying payload plus generation) on the actual root
+// complex instead of trusting the assumption, and it also times one round trip
+// with no NCCL in the loop. On failure the pipeline drops back to auto.
+static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
+    const int iters = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_ONESHOT_PROBE", 0);
+
+    if (iters <= 0 || p->algo != GGML_CUDA_AR_ALGO_ONESHOT) {
+        return;
+    }
+
+    const int     n   = p->n_devices;
+    const int64_t ne  = 1024;
+    float       * host = new float[ne];
+
+    if (!ggml_cuda_ar_ensure_tmp(p, (size_t) ne * sizeof(float))) {
+        delete[] host;
+        return;
+    }
+
+    void       * work_data[GGML_CUDA_MAX_DEVICES];
+    bool         compute[GGML_CUDA_MAX_DEVICES];
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES];
+
+    for (int i = 0; i < n; ++i) {
+        work_data[i] = p->dev_tmp[i];
+        compute[i]   = true;
+        streams[i]   = 0;
+
+        ggml_cuda_set_device(p->devices[i]);
+        for (int64_t e = 0; e < ne; ++e) {
+            host[e] = (float) (i + 1);
+        }
+        CUDA_CHECK(cudaMemcpy(p->dev_tmp[i], host, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    ggml_cuda_ar_launch_oneshot(p, work_data, GGML_TYPE_F32, ne, compute, streams);
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    float expect = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        expect += (float) (i + 1);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaMemcpy(host, p->dev_tmp[i], (size_t) ne * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int64_t e = 0; e < ne; ++e) {
+            ok = ok && host[e] == expect;
+        }
+    }
+
+    // Timing loop: re-running without re-seeding keeps the ping-pong advancing
+    // through generations, which is the part that would break if the double
+    // buffering were wrong.
+    const auto t0 = std::chrono::steady_clock::now();
+
+    for (int k = 0; k < iters; ++k) {
+        ggml_cuda_ar_launch_oneshot(p, work_data, GGML_TYPE_F32, ne, compute, streams);
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+
+    const double us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count() / (double) iters;
+
+    if (ok) {
+        GGML_LOG_INFO("%s: probe ok over %d GPUs: %.1f us per collective for %d KB, sum %.1f "
+                      "identical on every device\n", __func__, n, us, (int) (ne * 4 / 1024), expect);
+    } else {
+        GGML_LOG_ERROR("%s: probe FAILED, expected sum %.1f; dropping to algo=auto\n", __func__, expect);
+        p->algo = GGML_CUDA_AR_ALGO_AUTO;
+    }
+
+    delete[] host;
 }
 
 // Measurement-based ring shape (GGML_CUDA_AR_DIRECT_RING_ORDER, default
@@ -418,8 +676,9 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
     }
 
     // Algorithm selection: GGML_CUDA_AR_DIRECT_ALGO=auto (default) |
-    // butterfly | ring | bde. Auto picks per call by tensor size (see
-    // ggml_cuda_ar_allreduce_direct).
+    // butterfly | ring | bde | oneshot. Auto picks per call by tensor size (see
+    // ggml_cuda_ar_allreduce_direct); oneshot is opt-in only until the bench box
+    // has measured it.
     ggml_cuda_ar_algo algo = GGML_CUDA_AR_ALGO_AUTO;
     {
         const char * algo_env = getenv("GGML_CUDA_AR_DIRECT_ALGO");
@@ -430,6 +689,8 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
                 algo = GGML_CUDA_AR_ALGO_BUTTERFLY;
             } else if (strcmp(algo_env, "bde") == 0) {
                 algo = GGML_CUDA_AR_ALGO_BDE;
+            } else if (strcmp(algo_env, "oneshot") == 0) {
+                algo = GGML_CUDA_AR_ALGO_ONESHOT;
             } else if (strcmp(algo_env, "auto") != 0) {
                 GGML_LOG_WARN("%s: unknown GGML_CUDA_AR_DIRECT_ALGO value '%s'; using auto\n",
                               __func__, algo_env);
@@ -602,6 +863,8 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
         }
     }
 
+    ggml_cuda_ar_oneshot_probe(p);
+
     if (p->algo == GGML_CUDA_AR_ALGO_RING) {
         GGML_LOG_INFO("%s: initialized direct-P2P AllReduce pipeline: %zu GPUs, %zu KB tmp per GPU, "
                       "algo=ring (%d steps)\n",
@@ -615,6 +878,11 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
                       "algo=auto (%s, bde for tensors >= %zu KB)\n",
                       __func__, n_devices, p->tmp_bytes >> 10,
                       p->n_rounds > 0 ? "butterfly below" : "ring only", p->auto_ring_bytes >> 10);
+    } else if (p->algo == GGML_CUDA_AR_ALGO_ONESHOT) {
+        GGML_LOG_INFO("%s: initialized direct-P2P AllReduce pipeline: %zu GPUs, %zu KB tmp per GPU, "
+                      "algo=oneshot (1 launch per GPU per collective, %d x %d blocks)\n",
+                      __func__, n_devices, p->tmp_bytes >> 10,
+                      GGML_CUDA_AR_OS_BLOCKS, GGML_CUDA_AR_OS_THREADS);
     } else {
         GGML_LOG_INFO("%s: initialized direct-P2P AllReduce pipeline: %zu GPUs, %zu KB tmp per GPU, "
                       "algo=butterfly (%d rounds)\n",
@@ -632,6 +900,9 @@ void ggml_cuda_ar_pipeline_direct_free(ggml_cuda_ar_pipeline_direct * p) {
         ggml_cuda_set_device(p->devices[i]);
         if (p->dev_tmp[i]) {
             (void)cudaFree(p->dev_tmp[i]);
+        }
+        if (p->os_inbox[i]) {
+            (void)cudaFree(p->os_inbox[i]);
         }
 #if defined(GGML_HIP_AR_BF16)
         if (p->dev_bf16[i]) {
@@ -656,6 +927,10 @@ static void ggml_cuda_ar_free_tmp_buffers(ggml_cuda_ar_pipeline_direct * p) {
         if (p->dev_tmp[i]) {
             (void) cudaFree(p->dev_tmp[i]);
             p->dev_tmp[i] = nullptr;
+        }
+        if (p->os_inbox[i]) {
+            (void) cudaFree(p->os_inbox[i]);
+            p->os_inbox[i] = nullptr;
         }
 #if defined(GGML_HIP_AR_BF16)
         if (p->dev_bf16[i]) {
@@ -706,6 +981,13 @@ static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t nee
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         bool ok = cudaMalloc(&p->dev_tmp[i], want) == cudaSuccess;
+        // One-shot inbox: n source slots x 2 parities x 2 wire bytes per payload
+        // byte. Sized off `want` so the slot layout stays a pure function of
+        // tmp_bytes (see ggml_cuda_ar_launch_oneshot).
+        ok = ok && cudaMalloc(&p->os_inbox[i], (size_t) p->n_devices * 2 * 2 * want) == cudaSuccess;
+        // Generation 0 means never-written, so the inbox must not start out
+        // holding random tags that could equal a real generation.
+        ok = ok && cudaMemset(p->os_inbox[i], 0, (size_t) p->n_devices * 2 * 2 * want) == cudaSuccess;
 #if defined(GGML_HIP_AR_BF16)
         // bf16 buffers are half-width (2 bytes/elem vs F32's 4).
         ok = ok && cudaMalloc(&p->dev_bf16[i],     want / 2) == cudaSuccess;
@@ -1187,13 +1469,25 @@ bool ggml_cuda_ar_allreduce_direct(
         return false;
     }
 
-    // Match NCCL semantics: inactive shards contribute zeros. Zero their
-    // data up-front on their compute stream.
+    // Selected up front: the one-shot path neither zeroes inactive shards nor
+    // records data_ready events, so the choice must be known before both.
+    ggml_cuda_ar_algo algo = p->algo;
+    if (algo == GGML_CUDA_AR_ALGO_AUTO) {
+        const size_t work_bytes = (size_t) ne * ggml_type_size(t);
+        const bool  latency_bound = n == 2 || work_bytes < p->auto_ring_bytes;
+        algo = p->n_rounds == 0 ? GGML_CUDA_AR_ALGO_RING
+             : latency_bound    ? GGML_CUDA_AR_ALGO_BUTTERFLY
+                                : GGML_CUDA_AR_ALGO_BDE;
+    }
+    const bool oneshot = algo == GGML_CUDA_AR_ALGO_ONESHOT;
+
+    // Match NCCL semantics: inactive shards contribute zeros. The one-shot
+    // pushes zeros for them instead of paying a memset per shard.
     bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
     for (int i = 0; i < n; ++i) {
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n && !oneshot; ++i) {
         if (!compute_flag[i]) {
             ggml_cuda_set_device(p->devices[i]);
             auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
@@ -1207,7 +1501,7 @@ bool ggml_cuda_ar_allreduce_direct(
     // bytes/elem) always take the uncompressed path.
     bool use_bf16_compress = false;
 #if defined(GGML_HIP_AR_BF16)
-    use_bf16_compress = t == GGML_TYPE_F32 && nbytes >= p->bf16_threshold;
+    use_bf16_compress = t == GGML_TYPE_F32 && nbytes >= p->bf16_threshold && !oneshot;
 #endif
     const ggml_type work_type  = use_bf16_compress ? GGML_TYPE_BF16 : t;
 
@@ -1239,21 +1533,32 @@ bool ggml_cuda_ar_allreduce_direct(
     // backend queues each device's subgraph on its compute stream and calls us
     // immediately, so the per-device compute (and the bf16-compress kernel
     // above) is still in flight -- peers must wait on this before reading in
-    // round 0, or they would read stale data.
-    for (int i = 0; i < n; ++i) {
-        auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
-        CUDA_CHECK(cudaEventRecord(p->data_ready[i], ctx->stream()));
+    // round 0, or they would read stale data. The one-shot reads only its own
+    // inbox, which is written by peers' pushes, so it needs no such handshake.
+    if (!oneshot) {
+        for (int i = 0; i < n; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            CUDA_CHECK(cudaEventRecord(p->data_ready[i], ctx->stream()));
+        }
     }
 
-    // Auto mode: butterfly below auto_ring_bytes (latency-bound) or at N=2,
-    // else bde when it can run (power-of-2 N, n_rounds > 0), else ring.
-    ggml_cuda_ar_algo algo = p->algo;
-    if (algo == GGML_CUDA_AR_ALGO_AUTO) {
-        const size_t work_bytes = (size_t) ne * ggml_type_size(work_type);
-        const bool  latency_bound = n == 2 || work_bytes < p->auto_ring_bytes;
-        algo = p->n_rounds == 0 ? GGML_CUDA_AR_ALGO_RING
-             : latency_bound    ? GGML_CUDA_AR_ALGO_BUTTERFLY
-                                : GGML_CUDA_AR_ALGO_BDE;
+    if (oneshot) {
+        // One 8 B wire unit carries 4 B of payload, so the tensor has to be a
+        // multiple of 4 bytes; every AR tensor here is n_embd wide.
+        if ((nbytes & 3) != 0) {
+            GGML_LOG_DEBUG("%s: one-shot needs a 4-byte multiple, got %zu; falling back\n",
+                           __func__, nbytes);
+            return false;
+        }
+
+        cudaStream_t streams[GGML_CUDA_MAX_DEVICES];
+        for (int i = 0; i < n; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            streams[i] = ctx->stream();
+        }
+
+        ggml_cuda_ar_launch_oneshot(p, work_data, work_type, ne, compute_flag, streams);
+        return true;
     }
 
     if (algo == GGML_CUDA_AR_ALGO_RING) {
