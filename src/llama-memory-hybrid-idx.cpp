@@ -767,17 +767,17 @@ void llama_memory_hybrid_idx::set_input_qsa(
             return true;
         };
 
-            for (int64_t ii = 0; ii < n_tps; ++ii) {
-                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
 
-                if (std::find(key_seqs.begin(), key_seqs.end(), seq_id) == key_seqs.end()) {
-                    key_seqs.push_back(seq_id);
-                }
+            if (std::find(key_seqs.begin(), key_seqs.end(), seq_id) == key_seqs.end()) {
+                key_seqs.push_back(seq_id);
             }
+        }
 
-            const bool fast = try_contiguous();
+        const bool fast = try_contiguous();
 
-            if (!fast) {
+        if (!fast) {
             // a run whose endpoints agree but whose interior does not makes try_contiguous bail after
             //     it wrote part of the mapping, so start the general path from a clean block list
             n_bid = 0;
