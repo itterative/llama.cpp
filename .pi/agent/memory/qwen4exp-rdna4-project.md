@@ -234,7 +234,11 @@ what is left on it is vision - H20 (pool nothing while an image is in the run), 
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
 bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
 VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
-reservation ratchet. B4 (the fork diff) and N4 were dropped in the backlog sweep; `test-backend-ops`
+reservation ratchet. **E058 is armed and needs a bench-box run**: what the n-gram fetch costs a decode
+step under `-lzm on-direct`, and what share of its rows are cold. `126b7a43b` added the instrumentation
+(prof regions inside `graph:set_inputs`, plus `/proc/self/io` counters bucketed decode vs prefill), and
+the answer decides between a one-line worker-divisor fix and a GPU row cache. B4 (the fork diff) and N4
+were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
 
 Gate for any QSA block-numbering, pool or mrope change: `experiments/tools/qsa-posgap-harness.cpp`.
