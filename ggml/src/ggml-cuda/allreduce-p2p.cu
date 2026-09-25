@@ -343,6 +343,22 @@ static void ggml_cuda_ar_launch_oneshot(
     }
 }
 
+// Per-call size ladder, shared by algo=auto and by an explicit algo=oneshot,
+// which still has to hand the big messages back: one-shot moves (n-1) wire-doubled
+// copies of the payload against ring's 2*(n-1)/N chunks, so above os_bytes its
+// bytes cost far more than the rounds it saves, and the bf16 compression that
+// would offset that is a build flag off by default.
+static ggml_cuda_ar_algo ggml_cuda_ar_pick_by_size(
+        const ggml_cuda_ar_pipeline_direct * p, size_t work_bytes) {
+    if (work_bytes <= p->os_bytes && p->os_inbox[0] != nullptr) {
+        return GGML_CUDA_AR_ALGO_ONESHOT;
+    }
+    if (p->n_rounds == 0) {
+        return GGML_CUDA_AR_ALGO_RING;
+    }
+    return work_bytes < p->auto_ring_bytes ? GGML_CUDA_AR_ALGO_BUTTERFLY : GGML_CUDA_AR_ALGO_BDE;
+}
+
 static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t need_bytes);
 
 // GGML_CUDA_AR_ONESHOT_PROBE=<iterations>: run the one-shot over the real links
@@ -863,12 +879,15 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
             return nullptr;
         }
 
-        if (cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess ||
-            cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaMalloc for the one-shot inbox failed (%zu bytes) on device %d\n",
-                           __func__, ggml_cuda_ar_os_bytes(p, p->tmp_bytes), p->devices[i]);
-            ggml_cuda_ar_pipeline_direct_free(p);
-            return nullptr;
+        // Only worth 4 x tmp_bytes per GPU if the one-shot can actually be picked.
+        if (algo == GGML_CUDA_AR_ALGO_AUTO || algo == GGML_CUDA_AR_ALGO_ONESHOT) {
+            if (cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess ||
+                cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaMalloc for the one-shot inbox failed (%zu bytes) on device %d\n",
+                               __func__, ggml_cuda_ar_os_bytes(p, p->tmp_bytes), p->devices[i]);
+                ggml_cuda_ar_pipeline_direct_free(p);
+                return nullptr;
+            }
         }
 
 #if defined(GGML_HIP_AR_BF16)
@@ -962,9 +981,9 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
                       __func__, n_devices, p->tmp_bytes >> 10, 2 * p->n_rounds);
     } else if (p->algo == GGML_CUDA_AR_ALGO_AUTO) {
         GGML_LOG_INFO("%s: initialized direct-P2P AllReduce pipeline: %zu GPUs, %zu KB tmp per GPU, "
-                      "algo=auto (%s, bde for tensors >= %zu KB)\n",
-                      __func__, n_devices, p->tmp_bytes >> 10,
-                      p->n_rounds > 0 ? "butterfly below" : "ring only", p->auto_ring_bytes >> 10);
+                      "algo=auto (one-shot <= %zu KiB, then %s, bde >= %zu KB)\n",
+                      __func__, n_devices, p->tmp_bytes >> 10, p->os_bytes >> 10,
+                      p->n_rounds > 0 ? "butterfly" : "ring only", p->auto_ring_bytes >> 10);
     } else if (p->algo == GGML_CUDA_AR_ALGO_ONESHOT) {
         GGML_LOG_INFO("%s: initialized direct-P2P AllReduce pipeline: %zu GPUs, %zu KB tmp per GPU, "
                       "algo=oneshot (1 launch per GPU per collective, %d x %d blocks)\n",
@@ -1556,21 +1575,11 @@ bool ggml_cuda_ar_allreduce_direct(
 
     // Selected up front: the one-shot path neither zeroes inactive shards nor
     // records data_ready events, so the choice must be known before both.
-    //
-    // algo=oneshot is still a per-call decision above os_bytes: one-shot moves
-    // (n-1) wire-doubled copies of the payload instead of ring's 2*(n-1)/N
-    // chunks, so at prefill sizes its bytes cost far more than the rounds it
-    // saves, and the bf16 compression that would offset it is a build flag off
-    // by default. Above the cutoff this falls back to what auto would pick.
     const size_t work_bytes = (size_t) ne * ggml_type_size(t);
     ggml_cuda_ar_algo algo = p->algo;
 
-    if (algo == GGML_CUDA_AR_ALGO_AUTO ||
-        (algo == GGML_CUDA_AR_ALGO_ONESHOT && work_bytes > p->os_bytes)) {
-        const bool latency_bound = n == 2 || work_bytes < p->auto_ring_bytes;
-        algo = p->n_rounds == 0 ? GGML_CUDA_AR_ALGO_RING
-             : latency_bound    ? GGML_CUDA_AR_ALGO_BUTTERFLY
-                                : GGML_CUDA_AR_ALGO_BDE;
+    if (algo == GGML_CUDA_AR_ALGO_AUTO || algo == GGML_CUDA_AR_ALGO_ONESHOT) {
+        algo = ggml_cuda_ar_pick_by_size(p, work_bytes);
     }
     const bool oneshot = algo == GGML_CUDA_AR_ALGO_ONESHOT;
 
