@@ -124,6 +124,12 @@ struct ggml_cuda_ar_pipeline_direct {
     int      pairs_in_round[16][2 * GGML_CUDA_MAX_DEVICES];
 };
 
+// One-shot inbox size for a given tmp high-water mark: n source slots x 2
+// generation parities x 2 wire bytes per payload byte (the LL tag).
+static size_t ggml_cuda_ar_os_bytes(const ggml_cuda_ar_pipeline_direct * p, size_t tmp_bytes) {
+    return (size_t) p->n_devices * 2 * 2 * tmp_bytes;
+}
+
 // In-place add dst[i] += src[i], summed in float, written back as T. Peer data
 // is copied losslessly as raw bytes, so every device does the same float add on
 // the same inputs and all N land on identical bits -- no cast-through-wire-type
@@ -830,6 +836,14 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
             return nullptr;
         }
 
+        if (cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess ||
+            cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaMalloc for the one-shot inbox failed (%zu bytes) on device %d\n",
+                           __func__, ggml_cuda_ar_os_bytes(p, p->tmp_bytes), p->devices[i]);
+            ggml_cuda_ar_pipeline_direct_free(p);
+            return nullptr;
+        }
+
 #if defined(GGML_HIP_AR_BF16)
         if (cudaMalloc(&p->dev_bf16[i], p->tmp_bytes / 2) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaMalloc for dev_bf16 failed (%zu bytes) on device %d\n",
@@ -1026,13 +1040,11 @@ static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t nee
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         bool ok = cudaMalloc(&p->dev_tmp[i], want) == cudaSuccess;
-        // One-shot inbox: n source slots x 2 parities x 2 wire bytes per payload
-        // byte. Sized off `want` so the slot layout stays a pure function of
-        // tmp_bytes (see ggml_cuda_ar_launch_oneshot).
-        ok = ok && cudaMalloc(&p->os_inbox[i], (size_t) p->n_devices * 2 * 2 * want) == cudaSuccess;
-        // Generation 0 means never-written, so the inbox must not start out
-        // holding random tags that could equal a real generation.
-        ok = ok && cudaMemset(p->os_inbox[i], 0, (size_t) p->n_devices * 2 * 2 * want) == cudaSuccess;
+        // Reallocated with tmp, so the slot layout stays a pure function of
+        // tmp_bytes (see ggml_cuda_ar_launch_oneshot). Zeroed because generation
+        // 0 means never-written and random tags must not equal a real one.
+        ok = ok && cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, want)) == cudaSuccess;
+        ok = ok && cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, want)) == cudaSuccess;
 #if defined(GGML_HIP_AR_BF16)
         // bf16 buffers are half-width (2 bytes/elem vs F32's 4).
         ok = ok && cudaMalloc(&p->dev_bf16[i],     want / 2) == cudaSuccess;
@@ -1588,6 +1600,14 @@ bool ggml_cuda_ar_allreduce_direct(
     }
 
     if (oneshot) {
+        for (int i = 0; i < n; ++i) {
+            if (p->os_inbox[i] == nullptr) {
+                GGML_LOG_WARN("%s: one-shot inbox missing on device %d; using the meta fallback\n",
+                              __func__, p->devices[i]);
+                return false;
+            }
+        }
+
         // One 8 B wire unit carries 4 B of payload, so the tensor has to be a
         // multiple of 4 bytes; every AR tensor here is n_embd wide.
         if ((nbytes & 3) != 0) {
