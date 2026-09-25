@@ -234,10 +234,13 @@ what is left on it is vision - H20 (pool nothing while an image is in the run), 
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
 bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
 VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
-reservation ratchet. **E058 is armed and needs a bench-box run**: what the n-gram fetch costs a decode
-step under `-lzm on-direct`, and what share of its rows are cold. `126b7a43b` added the instrumentation
-(prof regions inside `graph:set_inputs`, plus `/proc/self/io` counters bucketed decode vs prefill), and
-the answer decides between a one-line worker-divisor fix and a GPU row cache. B4 (the fork diff) and N4
+reservation ratchet. **E058 ran**: the n-gram fetch is **4.5% of the decode token wall** (1.18 ms of
+26.11 ms at 38.3 t/s) and exposed, so that is the whole prize. A decode step requests 16 rows but reads
+**one** distinct 1760 B row, cold 60-100% of the time, while prefill's 756 distinct rows per ubatch are
+~99% page-cache hits - different populations, so prefill's warming does nothing for decode. The
+worker-divisor fix is dead (one row, nothing to parallelise) and a `POSIX_FADV_RANDOM` arm was confounded
+by a cold cache and reverted. What is left is `io:reuse_decode` (`92586c61f`): whether decode's rows
+repeat across steps, which decides whether any cache can help. B4 (the fork diff) and N4
 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
 
