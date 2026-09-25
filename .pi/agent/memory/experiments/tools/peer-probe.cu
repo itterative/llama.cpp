@@ -46,6 +46,14 @@ __global__ void pull(const unsigned * src, unsigned * dst) {
     *dst = *src;
 }
 
+// Destination-side kernel copying its own local word somewhere the host can read.
+// Peer stores show up here even when hipMemcpy of the same address reads back
+// zero, so this is the only way to ask whether the store landed where a kernel on
+// the destination can see it -- the property the allreduce actually needs.
+__global__ void relay_local(const unsigned long long * src, unsigned long long * dst) {
+    *dst = *src;
+}
+
 // 4: LL round trip with a bounded spin: write one tagged unit to the peer, then
 // wait for the peer's unit in my own inbox. Reports the tag it actually saw.
 __global__ void ll_round_trip(unsigned long long * to_peer, const unsigned long long * from_peer,
@@ -104,27 +112,49 @@ int main(int argc, char ** argv) {
     const unsigned long long pat = 0x1122334455667788ull;
     unsigned long long host = 0;
 
-    // test 1: plain remote write
-    CHECK(hipSetDevice(da));
-    push_plain<<<1, 1>>>(buf_b, pat);
-    printf("test1 launch: %s\n", hipGetErrorString(hipGetLastError()));
-    CHECK(hipDeviceSynchronize());
+    unsigned long long * relay = nullptr;   // on device b, written by a b-local kernel
     CHECK(hipSetDevice(db));
-    CHECK(hipMemcpy(&host, buf_b, sizeof(host), hipMemcpyDeviceToHost));
-    printf("test1 remote write, no fence:      %s (0x%016llx)\n",
-           host == pat ? "LANDED" : "MISSING", host);
+    CHECK(hipMalloc(&relay, sizeof(unsigned long long)));
+    CHECK(hipMemset(relay, 0xFF, sizeof(unsigned long long)));
 
-    // test 2: fenced remote write
-    CHECK(hipSetDevice(db));
-    CHECK(hipMemset(buf_b, 0, 4096));
-    CHECK(hipSetDevice(da));
-    push_fenced<<<1, 1>>>(buf_b, pat);
-    printf("test2 launch: %s\n", hipGetErrorString(hipGetLastError()));
-    CHECK(hipDeviceSynchronize());
-    CHECK(hipSetDevice(db));
-    CHECK(hipMemcpy(&host, buf_b, sizeof(host), hipMemcpyDeviceToHost));
-    printf("test2 remote write, sys fence:     %s (0x%016llx)\n",
-           host == pat ? "LANDED" : "MISSING", host);
+    // Tests 1 and 2: one remote store, checked two ways. The DMA read is expected
+    // to miss even when the store landed, since a peer write surfaces in the
+    // destination's cache hierarchy while the copy engine reads DRAM. Distinct
+    // patterns per variant so a stale line shows up as the other value.
+    struct variant { const char * name; unsigned long long pat; bool fence; };
+    const variant variants[2] = {
+        { "test1 remote store, no fence ", 0x1111111122222222ull, false },
+        { "test2 remote store, sys fence", 0x3333333344444444ull, true  },
+    };
+
+    for (int t = 0; t < 2; ++t) {
+        const variant & v = variants[t];
+
+        CHECK(hipSetDevice(da));
+        if (v.fence) {
+            push_fenced<<<1, 1>>>(buf_b, v.pat);
+        } else {
+            push_plain<<<1, 1>>>(buf_b, v.pat);
+        }
+        printf("%s launch: %s\n", v.name, hipGetErrorString(hipGetLastError()));
+        CHECK(hipDeviceSynchronize());
+
+        CHECK(hipSetDevice(db));
+        relay_local<<<1, 1>>>(buf_b, relay);
+        CHECK(hipDeviceSynchronize());
+
+        unsigned long long seen = 0;
+        CHECK(hipMemcpy(&seen, relay, sizeof(seen), hipMemcpyDeviceToHost));
+
+        unsigned long long dma = 0;
+        CHECK(hipMemcpy(&dma, buf_b, sizeof(dma), hipMemcpyDeviceToHost));
+
+        printf("%-33s kernel-on-destination: %-9s (%016llx)  hipMemcpy: %s\n", v.name,
+               seen == v.pat ? "LANDED" :
+               (seen == 0xFFFFFFFFFFFFFFFFull ? "UNTOUCHED" :
+               (seen == variants[1-t].pat ? "STALE-OLD" : "WRONG")),
+               seen, dma == v.pat ? "sees it" : "stale (expected)");
+    }
 
     // test 3: remote read
     CHECK(hipSetDevice(db));
@@ -137,7 +167,8 @@ int main(int argc, char ** argv) {
     CHECK(hipDeviceSynchronize());
     unsigned low = 0;
     CHECK(hipMemcpy(&low, flag_a, sizeof(low), hipMemcpyDeviceToHost));
-    printf("test3 remote read:                 got 0x%08x (want 0xBABECAFE or 0xCAFE...)\n", low);
+    printf("test3 remote read:                 %s (got 0x%08x, want the low word of 0xCAFEBABE)\n",
+           low == 0xCAFEBABEu ? "WORKS" : "WRONG", low);
 
     // test 4: LL round trip. Both sides must be launched before either waits,
     // exactly as the real path does from one host thread.
@@ -175,7 +206,10 @@ int main(int argc, char ** argv) {
     printf("test5 200 remote writes: %.2f us per launch+store\n",
            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200.0);
 
-    printf("\nif test1/test2 MISSING or test4 TIMEOUT, kernel-side peer access does not work\n"
-           "on this box and the one-shot cannot be built on remote stores at all.\n");
+    printf("\nreading the lines above:\n"
+           "  kernel-on-destination LANDED -> the inbox primitive works; that is all the AR needs\n"
+           "  hipMemcpy stale              -> normal for peer stores, the AR never DMA-reads an inbox\n"
+           "  test4 MATCH                  -> the LL tag round trip completes with a bounded spin\n"
+           "  test5                        -> host floor per collective is n_devices x that number\n");
     return 0;
 }
