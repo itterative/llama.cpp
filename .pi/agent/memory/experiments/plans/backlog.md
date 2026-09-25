@@ -66,23 +66,35 @@ question is closed by E056, H9's correctness under mrope by E057.
 
 ## Likely bottlenecks (this is where the effort should go)
 
-### L1 - is the Q5 n-gram table actually resident?
+### L1 - is the Q5 n-gram table actually resident? **handed to E058**
 
 - `-lzm auto` lazy-reads any tensor over 4 GiB (`src/llama-model-loader.cpp:1088-1100`) `[v]`, so a
-  ~33 GB table is probably served from the page cache on demand, not held in RAM.
-- **Next:** check the load log for `lazy read enabled`, then A/B `-lzm off` / `auto` /
-  `--load-mode mmap+mlock` on `tg` stability. Zero code change, no rerun to diagnose, and irregular
-  `tg` over a 20 M-row random gather is exactly its signature.
+  ~33 GB table is served from the page cache on demand, not held in RAM. Whether it *stays* cached is the
+  open question: the user observes 1-2 MB/s of reads during decode and the units are unconfirmed, which
+  brackets the hit rate between ~20% and ~90%.
+- **Next:** E058 measures it directly. `126b7a43b` reports `/proc/self/io` deltas around `gather()`
+  through the new prof counters, bucketed decode vs prefill, so `io:storage / io:rchar` is the miss rate
+  with no external sampler and no model-load contamination.
+- **Retracted:** the `-lzm off` A/B. With no reader the gather becomes a `ggml_get_rows` CPU op inside
+  the graph again, so that arm measures the split E031 removed rather than residency. The clean arm keeps
+  `on-direct` and warms the table's byte range with `dd` first (E058 arm 2).
 
-### L2 - PLE placement is *suspected* of costing tg, unresolved
+### L2 - PLE placement is *suspected* of costing tg **handed to E058, ceiling now arithmetic**
 
-- The table is the `ggml_get_rows` source at `src/models/qwen4exp.cpp:1202`. On CPU that is host gather
-  + H2D copy + split, and the n-gram hash is already host-side (no int64/xor in ggml).
-- **Whether that is what costs 35 ms/token is unknown** - the user's own read is "hard to say". Putting
-  the table on GPU is not an option (mirrored, ~30 GB/card), so the earlier "keep it on GPU" framing
-  here was wrong.
-- **Next:** measure faults, do not build. `ple-prefetch.md` method 1 = `iostat` during a decode run,
-  zero code. See E008b.
+- Stale as written: under `-lzm on-direct` there is no `ggml_get_rows` node at all.
+  `llm_graph_lazy_rows::build` returns an F32 input tensor, the host pre-gathers and dequantizes, and
+  `set_rows` uploads it, so the fetch moved out of the graph and into `graph:set_inputs`.
+- **The ceiling is arithmetic now, not suspicion:** 16 rows x 1760 B = 28 KB/token useful, 64 KB if every
+  row is a cold page, so an all-cold decode pays ~1.6 ms of a 47 ms step (~4%). The one existing trace
+  puts `graph:set_inputs` at 0.6124 ms/call against `phase:decode` 47.1054 ms/call = 1.3%, but it ran 27
+  steps under rocprofv3, so it is a hint and not a measurement.
+- **The cheap lever this exposed:** `gather()` picks `n_workers = min(n_readers, max(1, n/32))`, so
+  decode's 16 rows are read **serially on one worker** while 32 buffered FDs idle. If E058 shows cold
+  reads, that divisor is most of the prize for one line, and it competes with a GPU cache rather than
+  needing one.
+- **Next:** E058, which also decides the VRAM cache question in `ple-prefetch.md`. Placing the table on
+  GPU is still impossible (mirrored, ~30 GB/card); a *partial* row cache is feasible but its prize is
+  bounded by the ~4% above.
 
 ### L3 - 10-of-512 expert routing on HIP **routing is fine; E053 redirected this row**
 

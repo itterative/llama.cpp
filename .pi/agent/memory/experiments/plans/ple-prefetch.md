@@ -1,5 +1,31 @@
 # PLE / n-gram table: prefetch design notes
 
+## Update 2026-09-25: E031 changed the mechanism, E058 is the measurement
+
+Everything below was written when the table was demand-paged through the mmap. `-lzm on-direct`
+(`84b141ac6`, [E031](../runs/E031-lazy-direct-reads.md)) replaced that: `gather()` dedupes and sorts an
+ubatch's row indices and reads them with positional `pread`s on buffered FDs, dequantizing to F32
+host-side. What that does to this plan:
+
+- **There are no page faults left to count**, so methods 2, 3 and 5 below measure the wrong thing.
+  Method 1 (`iostat`) still works but is superseded: `126b7a43b` reports `/proc/self/io` deltas around
+  `gather()` through the prof counters, bucketed decode vs prefill, which attributes the bytes exactly
+  and cannot be contaminated by model load. That is [E058](../runs/E058-ple-fetch-cost.md).
+- **The mid-graph split is already gone.** With a reader, `llm_graph_lazy_rows::build` returns an F32
+  input tensor and there is no `get_rows` node in the graph, so section (b)'s "removes the mid-graph
+  sync" prize no longer exists. What a VRAM cache would still save is the preads on hits, the host
+  dequant, and the F32 upload (10240 B/row against 1760 stored).
+- **`-lzm off` is not a residency test.** With no reader the gather becomes a CPU `get_rows` inside the
+  graph, so that arm measures the split, not the cache state. The clean residency arm keeps `on-direct`
+  and warms the table's byte range with `dd` first. This retracts the "(a) alone" bullet below as
+  written, and the `--load-mode mmap+mlock` A/B with it.
+- **The VRAM cache got more feasible and less justified.** Feasible: `ggml_set_rows` is in tree (H9),
+  constant shapes are achievable so graph capture survives, and Q5 storage makes 1M rows 1.76 GB/card
+  instead of 10 GB. Less justified: the ceiling is now arithmetic - 16 rows x 1760 B = 28 KB/token, so an
+  all-cold decode pays ~1.6 ms of a 47 ms step - and `gather()` reads decode's 16 rows on **one worker**
+  (`n_workers = min(n_readers, max(1, n/32))`), so most of that 1.6 ms is recoverable with one line
+  instead of a subsystem. E058 decides which.
+
 Killed: **E007** (put the table in VRAM). Reason, from code not taste - under `-sm tensor`
 the PLE table is **mirrored, not split** (`src/llama-model.cpp:513-515`,
 `GGML_BACKEND_SPLIT_AXIS_MIRRORED`, because "its conv is mirrored, so every device runs the
