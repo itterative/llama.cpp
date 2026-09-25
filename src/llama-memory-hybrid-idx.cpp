@@ -339,7 +339,7 @@ void llama_memory_hybrid_idx::qsa_pool_truncate(llama_seq_id seq_id, llama_pos p
     }
 }
 
-llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const {
+llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv, bool worst_case) const {
     llama_qsa_pool res;
 
     // the pool is addressed by block index, which is only append-stable in the state the fast path of
@@ -350,6 +350,23 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     // 16 is above any speculative verification width, so those steps stay pooled
     if (!qsa_pool_on || ratio == 0 || n_stream != 1 ||
             (ubatch.n_tokens >= 16 && llama_qsa_pool_no_prefill())) {
+        return res;
+    }
+
+    // graph reservation walks a full context, which holds no cells, so the state test below cannot run
+    // there. answer with the widest pooled graph instead: every block derived and written. without it the
+    // reservation measures the historic graph and ggml-alloc re-reserves on every pooled ubatch
+    if (worst_case) {
+        const uint32_t n_bid = (n_kv + ratio - 1)/ratio;
+
+        if (n_bid == 0) {
+            return res;
+        }
+
+        res.mode  = llama_qsa_pool::CACHED;
+        res.n_bid = n_bid;
+        res.n_new = n_bid;
+
         return res;
     }
 
@@ -416,17 +433,16 @@ llama_qsa_pool llama_memory_hybrid_idx::qsa_pool_get(uint32_t ratio, const llama
     }
 
     if (!have) {
-        if (n_bid == 0) {
-            return res; // nothing complete to pool yet: the historic chain has to supply every column
-        }
-
         // nothing valid recorded for this numbering: the same graph as the cached case with wm = 0, so
         // it derives and writes every complete block. one shape for both, and a cold start no longer
         // changes the node set
         res.mode  = llama_qsa_pool::CACHED;
         res.wm    = 0;
         res.n_bid = n_bid;
-        res.n_new = n_bid;
+        // a run shorter than one block pools nothing, but still writes a row: the node set has to stay
+        // the same, or the reservation that measured it is dropped. every block bias is -inf while
+        // n_bid == 0, so the row cannot reach the selection
+        res.n_new = std::max<uint32_t>(1, n_bid);
 
         return res;
     }
@@ -717,25 +733,22 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 const int32_t b0 = pool.mode == llama_qsa_pool::CACHED ? (int32_t) wm_live : 0;
                 const int32_t nw = (int32_t) pool.n_new;
 
-                GGML_ASSERT(nw > 0 && n_bid >= 1 && b0 <= n_bid && (uint32_t) (n_bid - b0) <= pool.n_new);
+                GGML_ASSERT(nw > 0 && b0 <= n_bid && (uint32_t) (n_bid - b0) <= pool.n_new);
 
                 for (int32_t j = 0; j < nw; ++j) {
-                    int32_t b = b0 + j;
+                    const int32_t b = std::min(b0 + j, std::max(n_bid - 1, 0));
 
-                    if (b >= n_bid) {
-                        b = n_bid - 1;
-                    }
-
-                    const int32_t idx = (int32_t) ((b_lo + b)*r);
+                    // no complete block yet: derive row 0 from the head of the run instead
+                    const int32_t idx = n_bid > 0 ? (int32_t) ((b_lo + b)*r) : (int32_t) p0;
+                    const int32_t c0  = (int32_t) (j0 + (idx - p0));
 
                     dst_new_rows[j] = b;
 
                     if (dst_new_cells) {
-                        const int32_t c0 = (int32_t) (j0 + (idx - p0));
-
-                        // block-major like blk_cells: the graph reads [r, n_new] with r fastest
+                        // block-major like blk_cells: the graph reads [r, n_new] with r fastest. a run
+                        // shorter than r repeats its last cell
                         for (int64_t m = 0; m < r; ++m) {
-                            dst_new_cells[j*r + m] = c0 + (int32_t) m;
+                            dst_new_cells[j*r + m] = std::min(c0 + (int32_t) m, (int32_t) (j1 - 1));
                         }
 
                         for (int64_t sec = 0; sec < 4; ++sec) {
@@ -1121,5 +1134,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 llama_qsa_pool llama_memory_hybrid_idx_context::qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const {
     GGML_ASSERT(mem != nullptr);
 
-    return mem->qsa_pool_get(ratio, ubatch, n_stream, n_kv);
+    // a full-cache or update context carries no ubatch state, so it asks for the worst case to reserve
+    return mem->qsa_pool_get(ratio, ubatch, n_stream, n_kv, is_update);
 }

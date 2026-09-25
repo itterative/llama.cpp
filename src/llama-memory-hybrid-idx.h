@@ -116,7 +116,9 @@ public:
     // which pool variant a graph build should use for this ratio, see plans/h9-pooled-block-keys.md
     // pure query: no side effects, so it is safe from can_reuse and from graph reservation
     // n_kv is the cell window the graph sizes its tensors from, so the caller has to pass the same one
-    llama_qsa_pool qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv) const;
+    // worst_case answers for a context with no ubatch state to test (graph reservation): the shape that
+    // derives and writes every block, so that the reservation covers every pooled graph
+    llama_qsa_pool qsa_pool_get(uint32_t ratio, const llama_ubatch & ubatch, uint32_t n_stream, uint32_t n_kv, bool worst_case) const;
 
     // the pooled keys are positional, so any mutation that can move cells or positions drops every
     // recorded run: the next fast-state build re-derives all complete blocks once and writes them back
