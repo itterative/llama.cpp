@@ -313,24 +313,52 @@ a false negative.
 
 ### Status and what is left
 
-Opt-in: `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal` (the ladder reaches one-shot through `auto` as of
-`4cf0555a4`). Correctness evidence so far: token-level match against the NCCL arm on real weights, the
-init probe (sum identical on all four devices), and a PPL pair that does **not** match (2.6785 vs 2.7004,
-most likely NCCL's lossy bf16 wire compression rather than this kernel - see above).
+In use as: `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal` - two variables, with `algo=auto` reaching
+one-shot below `GGML_CUDA_AR_DIRECT_ONESHOT_BYTES` (`4cf0555a4`). Explicit `butterfly` / `ring` / `bde`
+bypass the ladder and no longer reserve inboxes. Correctness evidence: token-level match against the NCCL
+arm on real weights, the init probe (sum identical on all four devices), and a PPL pair differing by 0.81%
+which is most likely noise at that corpus size - see the sign problem above.
 
-Open: the 256 KiB cutoff is a guess (the plan's P5), the `auto` ladder does not include one-shot yet, so
-three env vars are needed to reach this path at all, `GGML_CUDA_AR_DIRECT_TMP_BYTES` defaults to 16 MiB
-so the inboxes reserve 4 x 16 MiB per GPU, and whether `GGML_CUDA_ALLREDUCE` itself should stop
-defaulting to NCCL on this branch is undecided.
+Deliberately left as is, each a decision rather than an oversight:
+
+- **`GGML_HIP_AR_BF16` stays OFF**, so the internal path moves f32 where NCCL moves bf16 at or above 262144
+  elements. That is probably the whole reason internal+auto measured ~5% below NCCL on pp. Enabling it is a
+  cmake flag plus a pp A/B, not a code change.
+- **The 256 KiB cutoff is unmeasured** (P5). Decode is 10 KB and prefill is 10 MB, so nothing in the
+  current configs sits near it; it matters for whatever MTP does, below.
+- **`GGML_CUDA_ALLREDUCE` still defaults to NCCL** on Linux. Flipping it is a decision for a user run.
+- **P3 (capture the AR inside each device's graph) and P4 (fuse it with residual and norm) are parked, not
+  abandoned.** Both were priced against a collective costing 3.5-12 ms/step of host time; it now costs 0.62,
+  and the paired run showed even that only surfaces at depth. The remaining decode problem is the wall time
+  that lands outside every region, which is a different investigation.
+
+Three code-side loose ends, in the order I would take them:
+
+1. **A stall on this path presents as a reboot, not a log line.** `GGML_CUDA_AR_OS_SPIN` is a compile-time
+   2e8 iterations, which outlives the GPU watchdog, so every failure mode looks like "three cards stuck".
+   An env-tunable cap is the one change I would still make, and it is what made the debugging loop cost
+   three reboots.
+2. **`--n-draft` will run one-shot at sizes it has never seen.** The AR tensor is `(1 + n_draft) x 2560`
+   elements, so verify widths of 2-5 push the payload to 20-50 KB - inside the 256 KiB cutoff, therefore
+   routed to one-shot, and never exercised. Same for multi-token pooled decode steps. Nothing in the design
+   says it breaks (grid-stride push and parity slots are size-agnostic, and the 10.5 MB fill collectives
+   already proved large messages run), but it is unexercised code.
+3. **Two reachable-but-never-executed ladder branches:** `pick_by_size`'s `n_rounds == 0` fallback to ring
+   (non-power-of-2 device counts), and the `(nbytes & 3) != 0` bail to the meta fallback (an odd-length f16
+   collective). Both degrade by returning false rather than corrupting, but neither has run anywhere.
+
+Upstream, if it goes there: an issue before code, per CONTRIBUTING, and the things a reviewer will want
+discussed are the size policy, the 4 x `tmp_bytes` inbox reservation, and a co-resident spin-wait kernel
+inside a graph-captured pipeline.
 
 ## 9. Open questions
 
-- Does P2's device win survive if the four ranks are only loosely synchronized by the ARs
-  themselves? A spin kernel that keeps SMs busy while peers catch up is fine at decode batch 1 and
-  wrong if the AR ever overlaps compute on-device.
-- Is the 5 MiB prefill collective worth a two-shot variant, or leave it on NCCL permanently?
-- `graph:alloc` / `sched:realloc_size` show ~123 calls at ~420 ms in these runs, which is H9
-  territory and dwarfs every comms number here. It is very possibly the largest single host-side
-  cost in a llama-bench decode measurement, and it was excluded from the sweep by design. Worth one
-  dedicated look after P0, because a 420 ms reserve per fill ubatch is not what E051 claimed was
-  left.
+- Does the device-side win survive if the four ranks are only loosely synchronized by the ARs themselves? A
+  spin kernel holding SMs while peers catch up is fine at decode batch 1 and wrong if the AR ever overlaps
+  compute on-device.
+- Is the ~10 MB prefill collective worth a two-shot variant, or does it stay on NCCL (or on `bde` with
+  `GGML_HIP_AR_BF16=ON`) permanently?
+- Resolved since first written, kept so the wrong reading stays visible: `graph:alloc` and
+  `sched:realloc_size` looked like ~123 calls at ~420 ms in the cumulative reports, which would have been
+  the largest host cost in a bench run. That was phase attribution again - inside one test window it is 6
+  allocs at 22 ms and **zero** re-reserves, so H9 is doing its job and there is no allocator storm here.
