@@ -11,9 +11,10 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H9's prefill question (the pool works, and excluding prefill from it is a workaround
-nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated), E008b
-(the measurement that decides the whole PLE/prefetch line), and the H13 leftovers.
+**Live right now:** H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
+with the pool off), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated),
+E008b (the measurement that decides the whole PLE/prefetch line), and the H13 leftovers. H9's prefill
+question is closed by E056.
 
 ---
 
@@ -307,9 +308,9 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
 - Also open: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage (H15/P3) is still on the table;
   and the crossover depth where pooling stops paying (-5% at 4096, +2.6% at 40960 on 4 cards) is
   unexplained.
-- **Separate bug found on the way (E056):** `llama-cli -c 4096 -n 2500` on `q4exp-4l` re-reserves **13
-  times with `Q4EXP_POOLED=0`** (2 of them on a node-count change), and `llama-perplexity -b 256 -c 2048`
-  120 times in both arms. Nothing to do with H9; at ~300 ms a re-reserve on 4 cards it is worth its own id.
+- **Separate bug found on the way (E056):** `llama-cli` and `llama-perplexity` re-reserve 13 and 120
+  times per run **with `Q4EXP_POOLED=0`**, same ratchet, different first trigger. Nothing to do with H9;
+  promoted to **H19** with the named tensor and the evidence.
 - **Scope:** prefill, decode, 4-card.
 
 ### H10 - mmq cutoff tuning for MoE models
@@ -543,6 +544,50 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
     proves the nextn fusion weights exist, because `graph_mtp` asserts `layer.nextn.eh_proj`, `enorm`,
     `hnorm` and `hc_head_norm` non-null. What stays unknown is specifically the indexer.
 - **Scope:** decode, 4-card.
+
+### H19 - the reservation ratchet is not H9's alone: llama-cli and llama-perplexity re-reserve with the pool off
+
+- **Found by E056**, which removed the pool's own contribution and then measured the residue. Counts on
+  `q4exp-4l`, `-sm none`, **identical with `Q4EXP_POOLED=0` and `=1`**: `llama-cli -c 4096 -n 2500 -st`
+  13 in both arms, the `-c 1024 -n 2000` shift stress 6 in both, `llama-perplexity -b 256 -c 2048` 120 in
+  both (its runtime node count alternates 696/697, 30 of the 120 on the count). `llama-bench` pp/tg: 0.
+  Note `llama-cli` in this build runs on the merged server machinery, so its log carries `srv`/`slot`/`que`
+  lines.
+- **Same three-act ratchet as H9's.** The reservation is `n_tokens 512, n_seqs 1, n_outputs 1` -> 697
+  nodes / 138 leafs, 231.39 MiB. Then, in order: a node-count change at t=2.263 s, `node
+  model.input_embed is not valid` (a size) at 2.343, a second node-count change at 2.365 - all inside the
+  first 110 ms of the prompt phase - and after that ten size events spaced exactly ~1.06 s apart.
+- **The 1.06 s is 256 generated tokens, and 256 is the cache's own padding:** `llama_kv_cache::get_n_kv`
+  (`llama-kv-cache.cpp:1260`) rounds n_kv up to `max(n_pad, 256u)`, "so that the graph remains constant
+  across batches and can be reused". So `can_reuse` holds for 256 decode steps (no alloc at all), then
+  n_kv jumps and every depth-proportional tensor jumps with it.
+- **The growing tensor is named.** `leaf_111` is the src of `node #517 (GET_ROWS)` whose other src is
+  `cache_idx_k_l3`, i.e. `ggml_get_rows(k_all, inp->blk_cells)` in `build_qsa_top_k`, so it is
+  **`blk_cells`**, I32 `[ratio*n_blocks, n_stream]`: 16 KB at the reserve's n_kv=4096 (4 B x 4 x 1024
+  blocks) and stepping 1K -> 2K -> 3K in the `GGML_SCHED_DEBUG=2` assignment listing. `attn_inp_kq_mask`
+  and the QSA block bias grow alongside it.
+- **The ten decode events are collateral, not the bug.** n_kv can never exceed n_ctx, so had the
+  worst-case budget survived the prompt phase there would be zero re-reserves in the whole session -
+  which is what llama-bench shows, and what E056 bought for the pool.
+- **Gap: the root cause is unnamed.** What are the two node-count changes? The reserve is built with
+  `n_outputs = 1` and `n_seqs = n_seq_max` and passes `sampling.samplers` into
+  `ubatch_prepare_reserve`/`resolve_fused_ops`, while the server's prompt ubatches carry 0 outputs except
+  the last one, so the output/fused-sampler path is the only part of the graph whose node set can depend
+  on that. `build_inp_out_ids` deliberately keeps its topology constant (its comment cites PR 14275), so
+  it is not the obvious candidate; perplexity's 696/697 is a single node, which fits that family.
+  **Cheapest probe:** three lines in `process_ubatch` printing `ggml_graph_n_nodes(gf)`/`n_leafs` next to
+  n_tokens/n_outputs, or re-add E056's split-graph dump. One 90 s run.
+- **The user's read is that this belongs to the utils, not to `llama-server`.** The evidence so far points
+  the other way (cli and perplexity churn, bench does not), but it does not settle it: `llama-cli -st` is
+  one slot with no prompt-cache reuse and no keep-alive, so a real server session is untested. One curl
+  request against a server started with `GGML_PROF_REGIONS=1` and a `sched:realloc` count decides it.
+- **Cost:** ~25 ms per event here, ~300 ms on 4 cards (run8's `realloc_size` ms/call). A 2500-token turn
+  throws away ~0.3 s locally and ~4 s on the bench box, and a 4000-token generation re-reserves ~16 times.
+  It is a per-turn tax rather than a per-prefill one, which is why it hides under everything else.
+- **Scope:** every tool, both split modes, and probably not qwen4exp-specific once the node-count
+  difference is named - any arch whose host inputs scale with n_kv ratchets the same way, it only takes
+  one early mismatch to start it.
+- Would become **E057**.
 
 ---
 

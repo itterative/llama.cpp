@@ -152,7 +152,11 @@ state by construction, so there is nothing to read and nothing to assert on.
 **13 times with `Q4EXP_POOLED=0`** and 13 times with it on (2 of them "different number of nodes", so
 this arch has another shape switch somewhere); `-c 1024 -n 2000` is 6 and 6. `llama-perplexity -b 256
 -c 2048` is 120 and 120. At the ~300 ms a re-reserve costs on 4 cards that is seconds per session,
-and it is a separate bug from H9. Not chased here; worth its own id.
+and it is a separate bug from H9. Tracked as **H19** in `plans/backlog.md`, which carries what I found
+after writing this record: the growing tensor is `blk_cells` (named by its consumer,
+`GET_ROWS(cache_idx_k_l3, ...)`), it steps once per 256 tokens because `llama_kv_cache::get_n_kv` pads to
+`max(n_pad, 256)`, and the ten decode events are collateral from three prompt-phase mismatches that drop
+the worst-case budget. Still unnamed: the two node-count changes.
 
 **The recorded golden gate is vacuous for the pool.** `llama-perplexity` computes
 `n_seq = max(1, n_batch/n_ctx)`, so the standard golden command (`-c 512 -b 2048`) runs **4 sequences
