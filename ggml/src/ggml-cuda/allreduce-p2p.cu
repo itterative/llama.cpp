@@ -270,8 +270,9 @@ static void ggml_cuda_ar_os_dump_ptr(const char * what, const void * ptr) {
     hipPointerAttribute_t at = {};
     const hipError_t e = hipPointerGetAttributes(&at, ptr);
 
-    GGML_LOG_INFO("[ar-os]   %-22s %p  err=%d type=%d dev=%d managed=%d devptr=%p\n", what, ptr,
-                  (int) e, (int) at.type, at.device, at.isManaged, at.devicePointer);
+    fprintf(stderr, "[ar-os]   %-22s %p  err=%d type=%d dev=%d managed=%d devptr=%p\n", what, ptr,
+            (int) e, (int) at.type, at.device, (int) at.isManaged, at.devicePointer);
+    fflush(stderr);
 }
 
 static void ggml_cuda_ar_launch_oneshot(
@@ -312,9 +313,9 @@ static void ggml_cuda_ar_launch_oneshot(
         ggml_cuda_set_device(p->devices[i]);
 
         static const bool dbg = getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr;
-        if (dbg && gen == 1) {
-            GGML_LOG_INFO("[ar-os] dev %d gen %u nunits %d slot %zu tmp %zu\n",
-                          p->devices[i], gen, nunits, slot_bytes, p->tmp_bytes);
+        if (dbg && gen <= 2) {
+            fprintf(stderr, "[ar-os] dev %d gen %u nunits %d slot %zu tmp %zu\n",
+                    p->devices[i], gen, nunits, slot_bytes, p->tmp_bytes);
             ggml_cuda_ar_os_dump_ptr("self",  a.self);
             ggml_cuda_ar_os_dump_ptr("dst",   a.dst);
             for (int j = 0; j < n; ++j) {
@@ -373,6 +374,17 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
             host[e] = (float) (i + 1);
         }
         CUDA_CHECK(cudaMemcpy(p->dev_tmp[i], host, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    if (getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr) {
+        fprintf(stderr, "[ar-os] pre-launch: n=%d ne=%d tmp=%zu slot=%zu inbox=%zu\n",
+                n, (int) ne, p->tmp_bytes, 2 * p->tmp_bytes, (size_t) n * 2 * 2 * p->tmp_bytes);
+        for (int i = 0; i < n; ++i) {
+            const std::string tag = "dev" + std::to_string(p->devices[i]);
+            ggml_cuda_ar_os_dump_ptr((tag + " dev_tmp").c_str(),  p->dev_tmp[i]);
+            ggml_cuda_ar_os_dump_ptr((tag + " os_inbox").c_str(), p->os_inbox[i]);
+        }
+        fflush(stderr);
     }
 
     ggml_cuda_ar_launch_oneshot(p, work_data, GGML_TYPE_F32, ne, compute, streams);
