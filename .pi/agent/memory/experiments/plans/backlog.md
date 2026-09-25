@@ -397,31 +397,28 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `REBUILD`/fallback path, where the gather is still f16 -> f32.
 - **Scope:** prefill, decode.
 
-### H16 - the 4-card reduce: RCCL is exhausted, the in-tree p2p path is the live question **un-parked by measurement, see [plans/decode-comms-plan.md](decode-comms-plan.md)**
+### H16 - 4-card decode comms: one-shot allreduce is +7-8% tg, pp at parity **done, opt-in**
 
-- E037: `ncclDevKernel_Generic_4` is **163,124 calls, 22.0 s** in the chain-off arm and 22.2 s in the
-  chain-on arm, i.e. 96 collectives per graph build (2 per layer) at **135 us each** for a 2560-wide f32
-  activation. Identical with the chain off, so QSA does not cause it, but it is bigger than any single
-  chain term, and the user's fork carries a commit about RDNA4 p2p across PCIe - if that path is meant to
-  replace the NCCL collectives, it is not active in this build.
-- **E038 makes it bigger:** 95.5 s at 131k with calls x1.21, so per call 136 -> 485 us even though the
-  payload size is depth-independent - that is peer-wait, i.e. imbalance exposure growing with depth, and
-  it is ~15 ms/token of a ~45 ms/token step, the same order as the whole chain.
-- **Do not chase without asking:** the user says NCCL is not an issue.
-- ~~Parked by the user (2026-09-24)~~ **measured 2026-09-25, five arms, `results/user/llama-bench/82bc067c3/0[3-6]*.log`
-  and `99-*.log`.** The old note that "p2p is slightly slower" is now `p2p is ~7% slower and it is
-  explainable`: NCCL Ring 37 us/call host and 33.48 tg, our direct-p2p butterfly 127 us/call and 31.23.
-  The cost is linear in API calls at ~4-5 us each, and the copy/event path issues ~30 per collective
-  against NCCL's 6. So the gap is mechanism, not capability, and the fix has a shape (one fused kernel per
-  device per collective, push and reduce in one launch) that is *not* what the current code or the legacy
-  one-shot sketch does. Full plan: [decode-comms-plan.md](decode-comms-plan.md).
-- **RCCL itself has nothing left.** `NCCL_ALGO=Tree` was silently ignored (identical per-call cost to
-  Ring; its `AllReduce` row is `0.0/0.0` in RCCL's own tuning table), `NCCL_ALGO=FC` is accepted and is
-  133 us/call and 8% slower, LL and one channel are already auto-selected at 10240 B, and `VMM: no` on all
-  four devices means cuMem/symmetric windows - the only one-shot NCCL could offer - cannot exist here.
-  `RCCL_USE_AMD_SMI_LIB=1 NCCL_CUMEM_ENABLE=1` is a **hazard, not a knob**: the collective got cheaper
-  (40 us/call) and tg fell to 3.60. Do not re-run that pair.
+- **Resolved by [plans/decode-comms-plan.md](decode-comms-plan.md)**, which has the three-arm table, the
+  cost model, and the three defects it took to get there. Short version: `GGML_CUDA_P2P=1
+  GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot` gives tg128 35.50 (d4096) and 32.17
+  (d131072) against NCCL's 33.10 and 29.76 on the real model - **+7.2% / +8.1%** - with pp unchanged, and
+  host cost per collective 15.2 -> 5.3 us.
+- The old p2p path is genuinely worse than NCCL (31.90 / 29.07 tg, 41.2 us/call), so "p2p is slightly
+  slower" understated it: the copy/event pipeline pays ~30 API calls per collective against NCCL's 6.
+- Still open on this item: the 256 KiB size cutoff is a guess, `auto` does not pick one-shot so the path
+  needs three env vars, the inboxes reserve 4 x `GGML_CUDA_AR_DIRECT_TMP_BYTES` (256 MiB) per GPU, and
+  whether `GGML_CUDA_ALLREDUCE` should stop defaulting to NCCL on this branch.
+- **RCCL itself has nothing left.** `NCCL_ALGO=Tree` is silently ignored (`AllReduce | Tree = 0.0/0.0` in
+  its own tuning table), `NCCL_ALGO=FC` is accepted and 8% slower, LL and one channel are already
+  auto-selected at 10240 B, and `VMM: no` on all four devices means cuMem/symmetric windows cannot exist.
+  `RCCL_USE_AMD_SMI_LIB=1 NCCL_CUMEM_ENABLE=1` is a **hazard**: the collective got cheaper and tg fell to
+  3.60. Do not re-run that pair.
 - **Scope:** decode, 4-card.
+- **History that motivated it:** E037 measured `ncclDevKernel_Generic_4` at 163,124 calls / 22.0 s for the
+  chain-off arm, 96 collectives per graph build at ~135 us each for a 2560-wide f32 activation, identical
+  with QSA off; E038 pushed the per-call number to 485 us at 131k, i.e. peer-wait growing with depth. Both
+  are now explained by the API-call cost model in the plan rather than by NCCL being slow at bytes.
 
 ### ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
 
