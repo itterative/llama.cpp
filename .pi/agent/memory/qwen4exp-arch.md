@@ -103,6 +103,27 @@ compaction so the sparsity is collectable. (b) is the long-context pp win; (a) a
 smaller, safer win that is measurable at any context length. Doing neither means long
 context costs the same as dense attention plus a tax.
 
+## QSA has three index spaces, and mixing them is the bug class `[v]`
+
+Cells, positions and ranks are *not* interchangeable in the QSA path, and each of the three is used
+for something slightly different:
+
+- **cell** index: what the indexer cache actually holds. `get_n_kv()` (`llama-kv-cache.cpp:1260`)
+  measures and pads *this* (to `max(n_pad, 256)`), and `blk_cells` names cells.
+- **position** index: what the block cut uses (`pb = pos/r`), because Eq. 16 defines a block as `r`
+  consecutive positions, and what the block-key pool is numbered by (`b_lo`, `wm`).
+- **rank** index: position order over the used cells, dense by construction. The mrope path already
+  selects and tails in it (`llama-memory-hybrid-idx.cpp:779`, E041).
+
+For plain text all three coincide, which is why every gate we own (golden, sparse corpus, greedy
+decode, rollback) passes whether or not a change is space-correct. They separate the moment an
+image enters: mrope pins `nx*ny` cells to one `t` and advances the line by only `max(nx, ny)`, so in
+the *target* cells outrun positions, while the *MTP draft* skips embedding batches entirely
+(`common/speculative.cpp:1491-1493`) and so keeps the position advance without the cells - positions
+outrun cells there, past the window, which is the `qsa: cell position runs past the cell window`
+abort after three images. E057 fixed it by ranking whenever the line does not step once per cell
+(`ebe30e1fd`); the rule to keep is that anything block-numbered must say which space it means.
+
 ## PLE - per-layer embeddings via n-gram hashing
 
 `PLE_{KEY,VALUE,NORM_KEY,NORM_QUERY,NORM_CONV,CONV1D}`

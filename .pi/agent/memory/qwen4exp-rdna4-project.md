@@ -169,7 +169,7 @@ the E018 golden corpus (3428 tokens) can never reach the depth gate - use
 `tools/sparse-corpus.md` with `-c 8192` for any sparse-path check. H4a stays live: sparse
 scans the mask, it does not stop the model from rebuilding it.
 
-## H9 block-key pool state (E044 -> on by default)
+## H9 block-key pool state (E044 -> E057, on by default)
 
 `Q4EXP_POOLED` (**on by default since `9111adf2c`**; `=0` is the opt-out) makes the QSA indexer pool each
 block key once, when the block completes, instead of re-deriving all of them every step. On 4 cards at
@@ -193,9 +193,33 @@ Three shape rules came out of the prefill work and are the part to remember:
 pooling prefill measures slightly positive and is cheaper on the host, because the pooled variant never
 creates `blk_pos` (I32 `[4*n_blocks*n_stream]`, 557 KB per ubatch at 131k), which is where
 `graph:set_inputs` spends 125.9 ms pool-off and 90.8 ms pooled. The pooled reservation is also 34.8 MiB
-*smaller* at that context. What still builds the historic graph, and so still churns against a pooled
-reservation: more than one sequence in the cells, or a non-dense run (an interior `seq_rm`). Reaching that
-needs `--kv-unified` with >1 slot.
+*smaller* at that context.
+
+### What the pool cannot cover, and the crash it hid (E057)
+
+- **No session containing an mrope image ever pools**, in the target or in the draft. Pooling and the
+  block-bias fast path both require the used cells to be a dense 1:1 run of positions
+  (`llama-memory-hybrid-idx.cpp:379-388`), and an image pins `nx*ny` cells to one `t`. So **+32.6% tg
+  is text-only**, and no gate we own could show it: golden, sparse corpus, greedy decode and rollback
+  all feed dense text, where position, cell and rank numbering coincide. H20 closes it (pool in rank
+  space, which is append-stable for mrope exactly like position space).
+- **The same requirement was the field crash.** A user conversation with 3 images aborted on
+  `qsa: cell position runs past the cell window` in `ctx_dft`: `draft_mtp::process` returns early on
+  embedding batches (`common/speculative.cpp:1491-1493`) so image cells never enter the draft cache,
+  while the positions it copies keep the image's `max(nx, ny)` advance - positions run past the window
+  that `get_n_kv()` sizes from the *cells*, and with `r = 4` that window is `ceil256(cell_p1)`, so the
+  slack a conversation has to beat is under 256 cells, not the context size. Fixed by `ebe30e1fd`: rank
+  the cells whenever the position line does not step once per cell. **It was never the pool**
+  (`blk_bias` comes from the mask shape and causality; both pool arms abort identically) and it predates
+  H9. E057 has the prediction-then-observation table and the two further states the fix exposed
+  (`n_bid` left dirty by a bailed `try_contiguous`; `new_rows`/`new_cells` never named when the pool was
+  promised at build and the run broke after it, which sent the indexer gather off the cache into a GPU
+  fault).
+- What still builds the historic graph, and so still churns against a pooled reservation: more than one
+  sequence in the cells (needs `--kv-unified` with >1 slot), **any run with an image in it**, a non-dense
+  run from an interior `seq_rm`, or a run whose endpoints satisfy the pool's test while its interior does
+  not. Safe since E057, but the last one rebuilds the graph per 256-cell bucket (H21), and a pinned or
+  gapped run counted 19-21 `sched:realloc_size` per 7.5k cells against 0 for dense (H22, unresolved).
 
 Two things the default flip changes that no numeric gate catches: the pool's **354 MiB/card at ctx
 245760** is now paid by every qwen4exp run (H15/P3's f16 storage is the fix, and it just got more
@@ -206,10 +230,16 @@ unless that number set `Q4EXP_POOLED` explicitly - same trap as E055's `855a6554
 
 Top code action is the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
-what is left on it is the general-path shape and the VRAM tax that default now makes everyone pay. H19 is
-the non-pool
+what is left on it is vision - H20 (pool nothing while an image is in the run), H21 (the pool promises on
+an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
+bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
+VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
 reservation ratchet. B4 (the fork diff) and N4 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
+
+Gate for any QSA block-numbering, pool or mrope change: `experiments/tools/qsa-posgap-harness.cpp`.
+It feeds `seqN` / `pinN` / `gapN` scripts to one plain context and fingerprints the final logits, so it
+catches the index-space class of bug that every existing gate is blind to. Run both pool arms.
 
 
 ## Related memories
