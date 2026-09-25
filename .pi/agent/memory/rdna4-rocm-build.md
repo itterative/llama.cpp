@@ -165,6 +165,31 @@ re-baseline before comparing.
 The gain is flat in depth, unlike the pool's, so the two are additive: the pool removes work that grows with
 context, small_k removes per-matmul reduction work that does not.
 
+### 4-card decode collectives: use the in-tree one-shot, not RCCL
+
+```sh
+GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot \
+  build/bin/llama-bench ... -sm tensor ...
+```
+
++7.2% / +8.1% tg128 (d4096 / d131072) over the NCCL default on the real model, pp unchanged, host cost per
+collective 15.2 -> 5.3 us. Needs all three variables: `GGML_CUDA_P2P` because peer access is gated on that
+name being *present* (`ggml-cuda.cu:606`, so `=0` also enables it), `GGML_CUDA_ALLREDUCE=internal` because
+Linux defaults to NCCL, and the algo because `auto` does not pick one-shot yet. Details, measurements and
+the three defects it took: [experiments/plans/decode-comms-plan.md](experiments/plans/decode-comms-plan.md).
+
+There is no RCCL tuning left to do, in case that tempts anyone: `Tree` is silently ignored
+(`AllReduce | Tree = 0.0/0.0` in its own tuning table), `FC` is accepted and slower, LL plus one channel are
+already chosen at 10240 B, and `VMM: no` on all four cards rules out cuMem/symmetric windows.
+`RCCL_USE_AMD_SMI_LIB=1 NCCL_CUMEM_ENABLE=1` makes the collective cheaper and the run 9x slower.
+
+Two traps from building it, both general: a peer store is visible to a **kernel** on the destination but a
+`hipMemcpy` of the same address reads stale (copy engine sees DRAM), and an unfenced remote store is not
+visible to either - atomicity is not visibility. Debug anything like it with
+`GGML_CUDA_AR_ONESHOT_DEBUG=1` (dumps the kernel's pointers with `hipPointerGetAttributes`) and
+`GGML_CUDA_AR_ONESHOT_PROBE=<n>` (round-trips the real path at init and falls back on mismatch), because
+`llama-bench` mutes `GGML_LOG_INFO` without `-v` and that cost me two rounds.
+
 Origins: `ec16a072f` ("Optimize MOE GEMV kernel for BS > 1.", #20905) added small_k and the RDNA exclusion
 in the same commit - the exclusion came with the feature rather than after measuring RDNA, which is
 consistent with untested rather than lost. Unproven either way, and RDNA3 is unmeasured, which is the other

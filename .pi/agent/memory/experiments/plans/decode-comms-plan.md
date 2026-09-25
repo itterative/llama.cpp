@@ -220,9 +220,72 @@ Q4EXP_POOLED=1 GGML_FATTN_RDNA_RTILE=1 GGML_CUDA_MMVQ_RDNA4_SMALL_K=1 Q4EXP_SPAR
   -d 4096,131072 -p 0 -n 128 -r 3 -b 2048 -ub 1024 -o md
 ```
 
-Bar from section 2: `meta:allreduce` at or under ~20 us/call (NCCL is 37.0, butterfly 127.1), and tg
-at or above 33.48 / 29.61. Expect the probe's `us per collective` to be a few us if the round-trip
-theory holds; if it comes back at 40-60 us, the peer wait dominates and P2 is not the lever.
+### Results
+
+Three arms on the box at build `e9769ef02`, all with `GGML_PROF_REGIONS=1`, dense + pool + small_k,
+`-d 4096,131072 -p 8192 -n 128 -r 3` (`results/user/p2p-improvements/run6-*.log`):
+
+| arm | pp8192 d4096 | pp8192 d131072 | tg128 d4096 | tg128 d131072 | AR us/call |
+|---|---|---|---|---|---|
+| NCCL (platform default) | 1886.7 +/- 83.9 | 1230.9 +/- 8.1 | 33.10 +/- 2.00 | 29.76 +/- 1.59 | 15.2 |
+| internal + auto (butterfly/bde) | 1787.3 +/- 95.0 | 1189.4 +/- 10.0 | 31.90 +/- 1.81 | 29.07 +/- 1.51 | 41.2 |
+| internal + one-shot | 1837.9 +/- 85.8 | 1213.3 +/- 17.3 | **35.50 +/- 2.27** | **32.17 +/- 1.90** | **5.3** |
+
+**Decode: +7.2% and +8.1% over NCCL, +11.3% and +10.7% over the existing internal path.** Best decode
+numbers this box has produced for this model. Roughly two standard errors on its own, so the mechanism
+carries the rest of the weight: host cost 15.2 -> 5.3 us/call is 2.9x, and the ~30% pass-through slope
+predicts about the gain measured.
+
+**Prefill is at parity, and the middle arm is what proves the cutoff works.** Prefill collectives are
+~10 MB, so arms `b` and `c` execute the identical `bde`/`butterfly` path there - and still differ by
++2.8% and +2.0%. That difference is caused by nothing, which puts the pp noise floor of this harness at
+about 3%, and puts `c` vs `a` (-2.6%, -1.4%) inside it.
+
+**Two predictions of mine were wrong, both in the same direction: I under-priced how cheap a launch is
+and over-priced the win.** I claimed a hard host floor of `n_devices x 6.3 us ~ 25 us` from
+`peer-probe` test5; actual is 5.3 us, i.e. ~1.3 us per launch. test5 measured launch *plus a fenced
+remote store plus a device sync*, not enqueue cost. The first repricing said the feature was worth ~1%
+of tg; it is worth ~7%.
+
+**The internal copy/event pipeline is worse than NCCL** (-3.6% tg), which retroactively justifies this
+branch keeping NCCL as the default and means "our p2p is slightly slower" (the old H16 note) was
+underselling it.
+
+### What it took to get here
+
+Three defects, none of which was visible on a single-GPU box, in order of discovery:
+
+1. **`os_inbox[]` was always NULL.** Pipeline init allocates `dev_tmp` directly with `tmp_bytes`
+   defaulting to 16 MiB, so `ensure_tmp`'s growth path - the only place I allocated the inboxes -
+   early-returns forever. The kernel wrote to `NULL + slot offset`, which is the `0x2000000` page fault
+   in dmesg, and the three peers then spun forever on data that would never come: `failed to suspend
+   all gangs` on three cards, 4 s apart, with no fault recorded on them. Diagnosed by dumping the
+   kernel's four pointers with `hipPointerGetAttributes` under `GGML_CUDA_AR_ONESHOT_DEBUG=1`.
+2. **No fence after the push.** Atomicity of the 8-byte tagged store protects against torn reads, not
+   against the write never leaving the source device. `peer-probe` test1 vs test2 shows an unfenced
+   remote store is invisible to a kernel on the destination. Load-bearing, but *not* the cause of the
+   hangs - the NULL deref explained those too, and I mis-attributed the multi-card pattern to it.
+3. **Two log traps.** The probe result went to `GGML_LOG_INFO`, which llama-bench mutes without `-v`,
+   so "no output" was about the sink. And the probe's timing loop synced all four devices per iteration,
+   printing 153 us for a collective that costs 5.3 us; it now reports pipelined and fully-synced
+   separately.
+
+Also worth keeping: **peer stores surface to kernels on the destination, but a `hipMemcpy` of the same
+address reads stale** (copy engine sees DRAM, peer writes land in the destination's cache). That is
+harmless here because nothing DMA-reads an inbox, and it made the first version of `peer-probe` report
+a false negative.
+
+### Status and what is left
+
+Opt-in: `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot`. Correctness
+evidence so far is a token-level match against the NCCL arm on real weights plus the init probe
+(sum identical on all four devices) - not a PPL comparison, and not bit-exactness, which the different
+reduction order rules out by design.
+
+Open: the 256 KiB cutoff is a guess (the plan's P5), the `auto` ladder does not include one-shot yet, so
+three env vars are needed to reach this path at all, `GGML_CUDA_AR_DIRECT_TMP_BYTES` defaults to 16 MiB
+so the inboxes reserve 4 x 16 MiB per GPU, and whether `GGML_CUDA_ALLREDUCE` itself should stop
+defaulting to NCCL on this branch is undecided.
 
 ## 9. Open questions
 
