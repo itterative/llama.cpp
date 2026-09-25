@@ -1,9 +1,11 @@
 #include "llama-lazy-reader.h"
 
 #include "llama-impl.h"
+#include "ggml-prof.h"
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -57,7 +59,34 @@ void llama_lazy_reader::read_range(const std::pair<int32_t, int32_t> * pairs, in
     }
 }
 
+// rchar is every byte asked of read()/pread(), page cache hits included; read_bytes is only what
+// storage served, so the pair gives the miss rate. these two reads add ~400 B to rchar themselves
+static bool lazy_self_io(uint64_t & rchar, uint64_t & storage) {
+    std::ifstream f("/proc/self/io");
+
+    if (!f) {
+        return false;
+    }
+
+    std::string key;
+    uint64_t    val;
+    bool        got_rchar = false, got_storage = false;
+
+    while (f >> key >> val) {
+        if      (key == "rchar:")      { rchar = val;   got_rchar = true;   }
+        else if (key == "read_bytes:") { storage = val; got_storage = true; }
+    }
+
+    return got_rchar && got_storage;
+}
+
+// a gather of at most this many rows is decode or a speculative verify, above it is prefill
+static const int64_t LAZY_IO_DECODE_MAX_ROWS = 1024;
+
 void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) const {
+    uint64_t     rchar0 = 0, storage0 = 0;
+    const bool   io = ggml_prof_enabled() && lazy_self_io(rchar0, storage0);
+
     std::vector<std::pair<int32_t, int32_t>> pairs;
     pairs.reserve(n);
     for (int64_t i = 0; i < n; ++i) {
@@ -65,7 +94,11 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
         pairs.emplace_back(rows[i], (int32_t) i);
     }
 
-    std::sort(pairs.begin(), pairs.end());
+    {
+        ggml_prof_region prof_sort("lazy:sort");
+
+        std::sort(pairs.begin(), pairs.end());
+    }
 
     const int n_workers = (int) std::min<int64_t>(files.size(), std::max<int64_t>(1, n / 32));
 
@@ -95,6 +128,18 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
 
     for (auto & t : workers) {
         t.join();
+    }
+
+    if (io) {
+        uint64_t rchar1 = 0, storage1 = 0;
+
+        if (lazy_self_io(rchar1, storage1)) {
+            const bool dec = n <= LAZY_IO_DECODE_MAX_ROWS;
+
+            ggml_prof_count(dec ? "io:rows_decode"    : "io:rows_prefill",    (uint64_t) n);
+            ggml_prof_count(dec ? "io:rchar_decode"   : "io:rchar_prefill",   rchar1 - rchar0);
+            ggml_prof_count(dec ? "io:storage_decode" : "io:storage_prefill", storage1 - storage0);
+        }
     }
 
     for (const auto & err : errs) {

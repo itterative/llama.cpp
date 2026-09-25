@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-lazy-reader.h"
+#include "ggml-prof.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -92,10 +93,24 @@ void llm_graph_lazy_rows::set_rows(const int32_t * idx, int64_t n) {
         return;
     }
 
-    staging.resize(n*reader->row_elems()*sizeof(float));
-    reader->gather(idx, n, (float *) staging.data());
+    {
+        // a grow zero-fills the new bytes before gather overwrites them
+        ggml_prof_region prof_staging("input:lazy_staging");
 
-    ggml_backend_tensor_set(t, staging.data(), 0, staging.size());
+        staging.resize(n*reader->row_elems()*sizeof(float));
+    }
+
+    {
+        ggml_prof_region prof_gather("input:lazy_gather");
+
+        reader->gather(idx, n, (float *) staging.data());
+    }
+
+    {
+        ggml_prof_region prof_h2d("input:lazy_h2d");
+
+        ggml_backend_tensor_set(t, staging.data(), 0, staging.size());
+    }
 }
 
 bool llm_graph_lazy_rows::can_reuse(int64_t n_rows) const {
