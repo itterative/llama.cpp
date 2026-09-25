@@ -53,6 +53,20 @@ thermals, a stale shared library, or a device filter that matched nothing.
 average them, do not trade one for the other silently - a change that improves `pp`
 while hurting `tg` is a decision, not a result.
 
+## An effect under ~5% needs paired, alternating runs
+
+Measured noise on the bench box, same binary and flags, `-r 3`: 0.7-1.0% on tg at d4096-d40960 and
+**2.6% at d131072**, from an A/B that turned out to run the identical binary in both arms. So `-r 3`
+sequentially cannot resolve a claim below about 5%, and this bit twice: E055's first 4-card A/B, and the
+first reading of the one-shot allreduce (logged as +7.2%/+8.1% from two separate `-r 3` invocations;
+paired and alternating at `-r 10` it is +2.5% at depth and zero at 4k).
+
+Required before an effect is written down as a result: both arms **in one session, alternating**
+(`for pass in 1 2; do for arm in A B; do ...`), `-r >= 10`, one depth per invocation if the harness mixes
+phases. And prefer a mechanism check over more reps where possible - a measured cost that predicts the
+gain by independent arithmetic (us/call x calls/step / step time) is stronger evidence than a t/s delta,
+and it also shows where the model of the change is wrong.
+
 ## Before any measurement, on this box
 
 ```sh
