@@ -430,8 +430,11 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
         std::chrono::steady_clock::now() - t0).count() / (double) iters;
 
     if (ok) {
-        GGML_LOG_INFO("%s: probe ok over %d GPUs: %.1f us per collective for %d KB, sum %.1f "
-                      "identical on every device\n", __func__, n, us, (int) (ne * 4 / 1024), expect);
+        // stderr, not GGML_LOG_INFO: llama-bench mutes INFO unless verbose is on, and
+        // this is the only measurement of one round trip over the real links.
+        fprintf(stderr, "[ar-os] probe ok over %d GPUs: %.1f us per collective for %d KB, sum %.1f "
+                        "identical on every device\n", n, us, (int) (ne * 4 / 1024), expect);
+        fflush(stderr);
     } else {
         GGML_LOG_ERROR("%s: probe FAILED, expected sum %.1f; dropping to algo=auto\n", __func__, expect);
         p->algo = GGML_CUDA_AR_ALGO_AUTO;
