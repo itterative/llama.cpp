@@ -4,6 +4,9 @@
 
 // Named region timing for host-side phases of a run.
 //
+// Counters: ggml_prof_count accumulates a named integer alongside the regions and is printed in its
+// own section of the same report. Use it for quantities that are not time, e.g. bytes read.
+//
 // Two uses of the same annotations:
 //   - counters: when GGML_PROF_REGIONS is set, each region accumulates count / total / max wall ms and
 //     the table is printed at exit. Works on any backend.
@@ -26,6 +29,9 @@ extern "C"
 
     GGML_API void ggml_prof_region_begin(const char * name);
     GGML_API void ggml_prof_region_end(void);
+
+    // add delta to a named counter; the name is kept, not copied, so pass a literal
+    GGML_API void ggml_prof_count(const char * name, uint64_t delta);
 
     // print the accumulated table, then reset it
     GGML_API void ggml_prof_report(const char * title);
