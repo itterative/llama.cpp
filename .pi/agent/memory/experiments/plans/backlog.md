@@ -408,9 +408,10 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   and zero at 4k. Same class of error as E055's first 4-card A/B, and the noise floor that exposed it was
   already in my own table (two arms differing by 3% where the code path was identical) and I applied it
   only to the result I liked.
-- Still open on this item: the 256 KiB size cutoff is a guess, `auto` does not pick one-shot so the path
-  needs three env vars, the inboxes reserve 4 x `GGML_CUDA_AR_DIRECT_TMP_BYTES` (256 MiB) per GPU, and
-  whether `GGML_CUDA_ALLREDUCE` should stop defaulting to NCCL on this branch.
+- Still open on this item: the 256 KiB size cutoff is a guess, and whether `GGML_CUDA_ALLREDUCE` should stop
+  defaulting to NCCL on this branch. Both env-var plumbing questions are closed: `auto` reaches one-shot
+  since `4cf0555a4` (two variables to opt in), and the inboxes are sized off the cutoff rather than
+  `GGML_CUDA_AR_DIRECT_TMP_BYTES` since `git log -1`, so they cost 4 MiB per GPU instead of 256 MiB.
 - **RCCL itself has nothing left.** `NCCL_ALGO=Tree` is silently ignored (`AllReduce | Tree = 0.0/0.0` in
   its own tuning table), `NCCL_ALGO=FC` is accepted and 8% slower, LL and one channel are already
   auto-selected at 10240 B, and `VMM: no` on all four devices means cuMem/symmetric windows cannot exist.

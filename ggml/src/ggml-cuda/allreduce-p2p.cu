@@ -125,10 +125,13 @@ struct ggml_cuda_ar_pipeline_direct {
     int      pairs_in_round[16][2 * GGML_CUDA_MAX_DEVICES];
 };
 
-// One-shot inbox size for a given tmp high-water mark: n source slots x 2
-// generation parities x 2 wire bytes per payload byte (the LL tag).
-static size_t ggml_cuda_ar_os_bytes(const ggml_cuda_ar_pipeline_direct * p, size_t tmp_bytes) {
-    return (size_t) p->n_devices * 2 * 2 * tmp_bytes;
+// One-shot inbox size: n source slots x 2 generation parities x 2 wire bytes per
+// payload byte (the LL tag). Sized off os_bytes, the cutoff that bounds who may
+// use one-shot at all -- NOT off tmp_bytes, the whole-pipeline high-water mark,
+// which is 16 MiB by default and would reserve 256 MiB per GPU for a path that
+// only ever sees 10 KB collectives.
+static size_t ggml_cuda_ar_os_bytes(const ggml_cuda_ar_pipeline_direct * p) {
+    return (size_t) p->n_devices * 2 * 2 * p->os_bytes;
 }
 
 // In-place add dst[i] += src[i], summed in float, written back as T. Peer data
@@ -292,7 +295,7 @@ static void ggml_cuda_ar_launch_oneshot(
     const int    n          = p->n_devices;
     const size_t type_size  = ggml_type_size(work_type);
     const int    nunits     = (int) ((size_t) ne * type_size / 4);
-    const size_t slot_bytes = 2 * p->tmp_bytes;
+    const size_t slot_bytes = 2 * p->os_bytes;
     const unsigned gen      = ++p->os_generation;
     const int    parity     = (int) (gen & 1);
 
@@ -400,8 +403,8 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
     }
 
     if (getenv("GGML_CUDA_AR_ONESHOT_DEBUG") != nullptr) {
-        GGML_LOG_INFO("%s: pre-launch: n=%d ne=%d tmp=%zu slot=%zu inbox=%zu\n", __func__, n, (int) ne,
-                      p->tmp_bytes, 2 * p->tmp_bytes, ggml_cuda_ar_os_bytes(p, p->tmp_bytes));
+        GGML_LOG_INFO("%s: pre-launch: n=%d ne=%d tmp=%zu os_bytes=%zu inbox=%zu\n", __func__, n, (int) ne,
+                      p->tmp_bytes, p->os_bytes, ggml_cuda_ar_os_bytes(p));
         for (int i = 0; i < n; ++i) {
             const std::string tag = "dev" + std::to_string(p->devices[i]);
             ggml_cuda_ar_os_dump_ptr((tag + " dev_tmp").c_str(),  p->dev_tmp[i]);
@@ -877,10 +880,10 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
 
         // Only worth 4 x tmp_bytes per GPU if the one-shot can actually be picked.
         if (algo == GGML_CUDA_AR_ALGO_AUTO || algo == GGML_CUDA_AR_ALGO_ONESHOT) {
-            if (cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess ||
-                cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, p->tmp_bytes)) != cudaSuccess) {
+            if (cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p)) != cudaSuccess ||
+                cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p)) != cudaSuccess) {
                 GGML_LOG_ERROR("%s: cudaMalloc for the one-shot inbox failed (%zu bytes) on device %d\n",
-                               __func__, ggml_cuda_ar_os_bytes(p, p->tmp_bytes), p->devices[i]);
+                               __func__, ggml_cuda_ar_os_bytes(p), p->devices[i]);
                 ggml_cuda_ar_pipeline_direct_free(p);
                 return nullptr;
             }
@@ -1030,10 +1033,9 @@ static void ggml_cuda_ar_free_tmp_buffers(ggml_cuda_ar_pipeline_direct * p) {
             (void) cudaFree(p->dev_tmp[i]);
             p->dev_tmp[i] = nullptr;
         }
-        if (p->os_inbox[i]) {
-            (void) cudaFree(p->os_inbox[i]);
-            p->os_inbox[i] = nullptr;
-        }
+        // os_inbox is deliberately absent here: it is sized off os_bytes and
+        // allocated once, so growth must not take it away (a freed inbox would
+        // silently turn one-shot off mid-run via pick_by_size's null check).
 #if defined(GGML_HIP_AR_BF16)
         if (p->dev_bf16[i]) {
             (void) cudaFree(p->dev_bf16[i]);
@@ -1083,11 +1085,6 @@ static bool ggml_cuda_ar_ensure_tmp(ggml_cuda_ar_pipeline_direct * p, size_t nee
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         bool ok = cudaMalloc(&p->dev_tmp[i], want) == cudaSuccess;
-        // Reallocated with tmp, so the slot layout stays a pure function of
-        // tmp_bytes (see ggml_cuda_ar_launch_oneshot). Zeroed because generation
-        // 0 means never-written and random tags must not equal a real one.
-        ok = ok && cudaMalloc(&p->os_inbox[i], ggml_cuda_ar_os_bytes(p, want)) == cudaSuccess;
-        ok = ok && cudaMemset(p->os_inbox[i], 0, ggml_cuda_ar_os_bytes(p, want)) == cudaSuccess;
 #if defined(GGML_HIP_AR_BF16)
         // bf16 buffers are half-width (2 bytes/elem vs F32's 4).
         ok = ok && cudaMalloc(&p->dev_bf16[i],     want / 2) == cudaSuccess;
@@ -1654,6 +1651,14 @@ bool ggml_cuda_ar_allreduce_direct(
         if ((nbytes & 3) != 0) {
             GGML_LOG_DEBUG("%s: one-shot needs a 4-byte multiple, got %zu; falling back\n",
                            __func__, nbytes);
+            return false;
+        }
+
+        // pick_by_size already keeps this from happening; the slots are sized off
+        // os_bytes, so a call above it would write past one.
+        if (nbytes > p->os_bytes) {
+            GGML_LOG_WARN("%s: one-shot asked for %zu bytes over a %zu byte cutoff; falling back\n",
+                          __func__, nbytes, p->os_bytes);
             return false;
         }
 
