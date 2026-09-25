@@ -204,6 +204,12 @@ static __global__ void ggml_cuda_ar_oneshot_kernel(ggml_cuda_ar_os_args a) {
         }
     }
 
+    // The 8 B store makes a peer's read atomic -- it sees the old unit or the
+    // new one -- but atomicity is not visibility: without this fence the writes
+    // can sit in this device's cache hierarchy while the thread waits on its
+    // peers, which are waiting for exactly those writes.
+    __threadfence_system();
+
     // Reduce in ascending device order on every device, in float, so all N
     // devices land on identical bits -- same invariant the add kernel keeps.
     for (int u = tid; u < a.nunits; u += nth) {
