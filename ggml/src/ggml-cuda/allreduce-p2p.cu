@@ -117,6 +117,7 @@ struct ggml_cuda_ar_pipeline_direct {
     // as dev_tmp so the slot layout is a pure function of tmp_bytes.
     void *   os_inbox[GGML_CUDA_MAX_DEVICES];
     unsigned os_generation;      // host-side tag, +1 per collective
+    size_t   os_bytes;           // GGML_CUDA_AR_DIRECT_ONESHOT_BYTES: above it, fall back to auto's pick
 
     // Butterfly/bde pairing: pairs_in_round[r][2k+0..1] = (a, b), log2(N) rounds.
     int      n_rounds;
@@ -426,14 +427,32 @@ static void ggml_cuda_ar_oneshot_probe(ggml_cuda_ar_pipeline_direct * p) {
         }
     }
 
-    const double us = std::chrono::duration<double, std::micro>(
+    const double lat_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - t0).count() / (double) iters;
+
+    // Back-to-back collectives with a single sync at the end. This is the number
+    // that is comparable to meta:allreduce: the loop above pays n device syncs
+    // per iteration, which swamps the collective itself.
+    const auto t1 = std::chrono::steady_clock::now();
+
+    for (int k = 0; k < iters; ++k) {
+        ggml_cuda_ar_launch_oneshot(p, work_data, GGML_TYPE_F32, ne, compute, streams);
+    }
+
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    const double thr_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t1).count() / (double) iters;
 
     if (ok) {
         // stderr, not GGML_LOG_INFO: llama-bench mutes INFO unless verbose is on, and
         // this is the only measurement of one round trip over the real links.
-        fprintf(stderr, "[ar-os] probe ok over %d GPUs: %.1f us per collective for %d KB, sum %.1f "
-                        "identical on every device\n", n, us, (int) (ne * 4 / 1024), expect);
+        fprintf(stderr, "[ar-os] probe ok over %d GPUs: %.1f us pipelined per collective, %.1f us\n"
+                        "        with a full device wait each round; %d KB payload, sum %.1f identical\n",
+                n, thr_us, lat_us, (int) (ne * 4 / 1024), expect);
         fflush(stderr);
     } else {
         GGML_LOG_ERROR("%s: probe FAILED, expected sum %.1f; dropping to algo=auto\n", __func__, expect);
@@ -804,6 +823,11 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
     // (~512-640 KiB at N=4).
     p->auto_ring_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DIRECT_AUTO_RING_BYTES", 1 * 1024 * 1024);
 
+    // One-shot is a latency trick, so it is only chosen for small collectives.
+    // 256 KiB is a guess pending the pp measurement; n_embd * ubatch * 4 B for
+    // a 1024-token prefill ubatch is 10 MiB, well above anything decode sees.
+    p->os_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_DIRECT_ONESHOT_BYTES", 256 * 1024);
+
     // Enable peer access on every ordered pair. It is device-global state that
     // persists across the pipeline's lifetime, so a 2nd+ init finds it already
     // enabled: cudaErrorPeerAccessAlreadyEnabled is benign but leaves the
@@ -906,7 +930,8 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
     // can be selected. n_rounds==0 means only ring can run.
     p->n_rounds = 0;
     if (p->algo == GGML_CUDA_AR_ALGO_BUTTERFLY || p->algo == GGML_CUDA_AR_ALGO_BDE ||
-        (p->algo == GGML_CUDA_AR_ALGO_AUTO && (n_devices & (n_devices - 1)) == 0)) {
+        ((p->algo == GGML_CUDA_AR_ALGO_AUTO || p->algo == GGML_CUDA_AR_ALGO_ONESHOT) &&
+         (n_devices & (n_devices - 1)) == 0)) {
         size_t offset_j = n_devices / 2;
         while (offset_j >= 1) {
             const int r = p->n_rounds;
@@ -1531,10 +1556,18 @@ bool ggml_cuda_ar_allreduce_direct(
 
     // Selected up front: the one-shot path neither zeroes inactive shards nor
     // records data_ready events, so the choice must be known before both.
+    //
+    // algo=oneshot is still a per-call decision above os_bytes: one-shot moves
+    // (n-1) wire-doubled copies of the payload instead of ring's 2*(n-1)/N
+    // chunks, so at prefill sizes its bytes cost far more than the rounds it
+    // saves, and the bf16 compression that would offset it is a build flag off
+    // by default. Above the cutoff this falls back to what auto would pick.
+    const size_t work_bytes = (size_t) ne * ggml_type_size(t);
     ggml_cuda_ar_algo algo = p->algo;
-    if (algo == GGML_CUDA_AR_ALGO_AUTO) {
-        const size_t work_bytes = (size_t) ne * ggml_type_size(t);
-        const bool  latency_bound = n == 2 || work_bytes < p->auto_ring_bytes;
+
+    if (algo == GGML_CUDA_AR_ALGO_AUTO ||
+        (algo == GGML_CUDA_AR_ALGO_ONESHOT && work_bytes > p->os_bytes)) {
+        const bool latency_bound = n == 2 || work_bytes < p->auto_ring_bytes;
         algo = p->n_rounds == 0 ? GGML_CUDA_AR_ALGO_RING
              : latency_bound    ? GGML_CUDA_AR_ALGO_BUTTERFLY
                                 : GGML_CUDA_AR_ALGO_BDE;
