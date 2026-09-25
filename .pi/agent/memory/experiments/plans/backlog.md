@@ -397,15 +397,17 @@ nobody likes), H18 (the MTP tax, now framed as over-drafting), H17b (is the chai
   the `REBUILD`/fallback path, where the gather is still f16 -> f32.
 - **Scope:** prefill, decode.
 
-### H16 - 4-card decode comms: one-shot allreduce is +7-8% tg, pp at parity **done, opt-in**
+### H16 - 4-card decode comms: in-tree one-shot allreduce, +2.5% at depth, tied at 4k **done, opt-in**
 
-- **Resolved by [plans/decode-comms-plan.md](decode-comms-plan.md)**, which has the three-arm table, the
-  cost model, and the three defects it took to get there. Short version: `GGML_CUDA_P2P=1
-  GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot` gives tg128 35.50 (d4096) and 32.17
-  (d131072) against NCCL's 33.10 and 29.76 on the real model - **+7.2% / +8.1%** - with pp unchanged, and
-  host cost per collective 15.2 -> 5.3 us.
-- The old p2p path is genuinely worse than NCCL (31.90 / 29.07 tg, 41.2 us/call), so "p2p is slightly
-  slower" understated it: the copy/event pipeline pays ~30 API calls per collective against NCCL's 6.
+- **Resolved by [plans/decode-comms-plan.md](decode-comms-plan.md)**, which has the arms, the cost model,
+  the correction below and the three defects it took. `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal`
+  reaches it through `auto`: paired at r=10 it gives tg128 30.97 vs NCCL 30.20 at d131072 (+2.5%) and a
+  tie at d4096, host cost per collective 14.8 -> 6.3 us, pp unchanged.
+- **Correction worth keeping where it will be read:** the first reading of this was +7.2% / +8.1%, from
+  unpaired `-r 3` runs in separate invocations. Paired and alternating at `-r 10`, it is +2.5% at depth
+  and zero at 4k. Same class of error as E055's first 4-card A/B, and the noise floor that exposed it was
+  already in my own table (two arms differing by 3% where the code path was identical) and I applied it
+  only to the result I liked.
 - Still open on this item: the 256 KiB size cutoff is a guess, `auto` does not pick one-shot so the path
   needs three env vars, the inboxes reserve 4 x `GGML_CUDA_AR_DIRECT_TMP_BYTES` (256 MiB) per GPU, and
   whether `GGML_CUDA_ALLREDUCE` should stop defaulting to NCCL on this branch.

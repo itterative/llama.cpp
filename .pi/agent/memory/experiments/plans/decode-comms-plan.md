@@ -229,23 +229,54 @@ Three arms on the box at build `e9769ef02`, all with `GGML_PROF_REGIONS=1`, dens
 |---|---|---|---|---|---|
 | NCCL (platform default) | 1886.7 +/- 83.9 | 1230.9 +/- 8.1 | 33.10 +/- 2.00 | 29.76 +/- 1.59 | 15.2 |
 | internal + auto (butterfly/bde) | 1787.3 +/- 95.0 | 1189.4 +/- 10.0 | 31.90 +/- 1.81 | 29.07 +/- 1.51 | 41.2 |
-| internal + one-shot | 1837.9 +/- 85.8 | 1213.3 +/- 17.3 | **35.50 +/- 2.27** | **32.17 +/- 1.90** | **5.3** |
+| internal + one-shot | 1837.9 +/- 85.8 | 1213.3 +/- 17.3 | 35.50 +/- 2.27 | 32.17 +/- 1.90 | **5.3** |
 
-**Decode: +7.2% and +8.1% over NCCL, +11.3% and +10.7% over the existing internal path.** Best decode
-numbers this box has produced for this model. Roughly two standard errors on its own, so the mechanism
-carries the rest of the weight: host cost 15.2 -> 5.3 us/call is 2.9x, and the ~30% pass-through slope
-predicts about the gain measured.
+**Those tg deltas did not survive a paired run. See the correction below.**
 
-**Prefill is at parity, and the middle arm is what proves the cutoff works.** Prefill collectives are
-~10 MB, so arms `b` and `c` execute the identical `bde`/`butterfly` path there - and still differ by
-+2.8% and +2.0%. That difference is caused by nothing, which puts the pp noise floor of this harness at
-about 3%, and puts `c` vs `a` (-2.6%, -1.4%) inside it.
+### Correction: paired at r=10, the win is +2.5% at depth and nothing at 4k
 
-**Two predictions of mine were wrong, both in the same direction: I under-priced how cheap a launch is
-and over-priced the win.** I claimed a hard host floor of `n_devices x 6.3 us ~ 25 us` from
-`peer-probe` test5; actual is 5.3 us, i.e. ~1.3 us per launch. test5 measured launch *plus a fenced
-remote store plus a device sync*, not enqueue cost. The first repricing said the feature was worth ~1%
-of tg; it is worth ~7%.
+`run7-paired.log`, arms alternating in one session, `-p 0`, same flags otherwise:
+
+| depth | NCCL | one-shot | delta |
+|---|---|---|---|
+| d4096 | 35.22, 34.67 | 35.14 | ~0% |
+| d131072 | 30.20 | 30.97 | **+2.5%** |
+| AR host us/call | 14.8, 14.9 | **6.3** | 2.35x cheaper |
+
+The host saving is reproducible and exactly as predicted: 14.8 -> 6.3 us/call x 96 = 0.82 ms/step, which
+against a 33 ms step at 131k is 2.5% - the measured gain to the decimal. At d4096 the same 0.82 ms would
+predict +2.9% and the measurement says nothing, so the host cost is *hidden* at short context and
+*exposed* at depth. That is consistent with a short-context step being weight-streaming bound (the MoE
+bytes do not care about depth) and a deep step having the collective chain on its critical path, but it
+is a reading, not a measurement.
+
+What was wrong: run6's +7.2% and +8.1% came from separate sequential runs at `-r 3`, whose SE is
++/-1.0-1.7% -- the same unpaired-r=3 mistake as E055's first 4-card attempt. The `b` vs `c` comparison in
+that table also showed 3% from nothing, which was right there as the noise floor and I used it to clear
+the pp result without applying it to the tg result.
+
+**Numerics: not parity, and the gap is bigger than reduction order can explain.** Same corpus, same
+flags, NCCL 2.6785 +/- 0.048 vs internal 2.7004 +/- 0.049 - +0.81%, whereas reassociating a float sum
+should move PPL by well under 0.01%. The likely cause is not the one-shot: NCCL compresses collectives at
+or above 262144 elements to bf16 (`ggml-cuda.cu:1035-1040`), which is lossy, and the internal path keeps
+f32 unless `GGML_HIP_AR_BF16` is compiled in. If that is right, the internal arm is the more accurate of
+the two. Test: rerun both arms with `-b 64 -ub 64` (163840 elements, below NCCL's bf16 threshold) so both
+use f32 end to end; if the two converge, the gap is NCCL's wire format.
+
+Liveness of the ladder is confirmed on the box: `algo=auto (one-shot <= 256 KiB, then butterfly, bde >=
+1024 KiB)`. Do not use `run7-auto.log` for performance - it was captured with `-v 3`, and the logging
+itself pushed tg down to 33.91 / 29.44.
+
+Prefill is at parity, and the middle arm of run6 is what proves the cutoff works: prefill collectives are
+~10 MB, so arms `b` and `c` execute the identical `bde`/`butterfly` path there and still differ by +2.8%
+and +2.0%. That difference is caused by nothing, which puts the pp noise floor at about 3% and puts
+`c` vs `a` (-2.6%, -1.4%) inside it.
+
+**Two predictions of mine were wrong in the same direction: I over-priced a launch, then over-claimed the
+gain.** I claimed a hard host floor of `n_devices x 6.3 us ~ 25 us` from `peer-probe` test5; actual is
+~1.3 us per launch, so the floor was never the issue - test5 measured launch plus a fenced remote store
+plus a sync. Then I logged +7-8% from unpaired `-r 3` runs, and the paired `-r 10` run says +2.5% at
+131k and nothing at 4k. Both errors were mine and both are recorded above rather than edited away.
 
 **The internal copy/event pipeline is worse than NCCL** (-3.6% tg), which retroactively justifies this
 branch keeping NCCL as the default and means "our p2p is slightly slower" (the old H16 note) was
@@ -277,10 +308,10 @@ a false negative.
 
 ### Status and what is left
 
-Opt-in: `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_ALGO=oneshot`. Correctness
-evidence so far is a token-level match against the NCCL arm on real weights plus the init probe
-(sum identical on all four devices) - not a PPL comparison, and not bit-exactness, which the different
-reduction order rules out by design.
+Opt-in: `GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal` (the ladder reaches one-shot through `auto` as of
+`4cf0555a4`). Correctness evidence so far: token-level match against the NCCL arm on real weights, the
+init probe (sum identical on all four devices), and a PPL pair that does **not** match (2.6785 vs 2.7004,
+most likely NCCL's lossy bf16 wire compression rather than this kernel - see above).
 
 Open: the 256 KiB cutoff is a guess (the plan's P5), the `auto` ladder does not include one-shot yet, so
 three env vars are needed to reach this path at all, `GGML_CUDA_AR_DIRECT_TMP_BYTES` defaults to 16 MiB
