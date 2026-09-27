@@ -5,10 +5,16 @@
 #include "convert.cuh"
 
 // E061: unroll the decode K loop by this factor (ncols_dst == 1, no fusion, f32 or bf16).
-// 1 keeps the plain loop; the register report puts the f32 decode shape at 12 VGPRs, i.e. about
-// one load in flight per thread, and this knob is how E061 tested giving each thread more.
+// The register report puts the f32 decode shape at 12 VGPRs, i.e. about one load in flight per
+// thread; 4x gives 25 VGPRs with no spills and no occupancy loss, worth +1.9% tg on four cards
+// and 1.1-2.4x per shape on the dev box. Default 4 on gfx12 only - the measurement is RDNA4-only,
+// so every other target keeps the plain loop exactly as before.
 #ifndef MMVF_K_UNROLL
-#define MMVF_K_UNROLL 1
+#  if defined(__gfx1200__) || defined(__gfx1201__)
+#    define MMVF_K_UNROLL 4
+#  else
+#    define MMVF_K_UNROLL 1
+#  endif
 #endif
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
