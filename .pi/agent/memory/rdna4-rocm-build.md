@@ -363,25 +363,31 @@ as experienced expectation, not verified behaviour.
 
 ## Traps
 
-- **Bench-box decode for this model has three pathological steps** `[v]` (E059, both arms, identical
-  indices): steps 1, 3 and 258 of the 385-step `-r 3` tg128 run take 989 / 526 / 675 ms against a 22.6 ms
-  median. That is **19% of the decode window in 3 of 385 steps, ~5.5 ms/token of inflation on every t/s
-  figure ever recorded on this box for this model**. It cancels in an A/B only because it hits both arms,
-  so it corrupts cross-experiment comparisons far more than paired ones. Step 1's is a single 598 ms
-  `meta:subgraph`; suspected first-touch faults on the 133 MB n-gram table (E058's compulsory misses),
-  not measured. Trim or median-filter before quoting t/s.
-- **rocprofv3 traces: three parsing traps** `[v]`. (1) `Kernel_Name` contains commas, so positional `$N`
-  in awk is wrong - index with `$(NF-k)` from the end. (2) mmvq's block is **2D**, `Workgroup_Size_X` is
-  `warp_size` (32 on gfx1201, confirming wave32) and nwarps is `Workgroup_Size_Y`; reading only `_X` makes
-  every kernel look 1-warp. (3) **Never compute wall exposure from a profiled run** - interception costs
-  ~0.7 us per dispatch and decode issues 3,616 per card per step, i.e. ~2.5 ms/step, which makes the run
-  host-bound and absorbs device-side savings (E059: +1.5% profiled against +4.2% real for the same
-  change). Use the trace for mechanism and `kernel_trace.csv` per-agent busy time for device totals; use
-  an unprofiled llama-bench for wall. The traces also hold far more than `kernel_stats.csv`: all four GPUs
-  in one file under `Agent 1..4` on a common clock (so cross-rank skew is measurable), plus
-  `Scratch_Size`, `LDS_Block_Size`, `VGPR_Count`, `SGPR_Count`, grid/block geometry, and a joinable
-  `Correlation_Id`; `marker_api_stats.csv` gives llama.cpp's own nested host ranges (`phase:decode`,
-  `graph:compute`, `meta:subgraph`, `meta:allreduce`, `input:lazy_*`).
+- **rocprofv3 + ROCTX: never scope device time to marker ranges** `[v]` (E059; this cost two wrong
+  corrections). `phase:decode` is a *host* span around an async graph launch, so device execution spills
+  past its end: of one card's 1,392,129 kernels only 810,565 (3,303 ms) fall inside the 385 markers and
+  581,564 (2,333 ms) fall in the gaps between them - the same kernels, executing late. Marker duration is
+  host launch time, not token wall. Take device totals over the whole trace divided by step count, and
+  verify the step count against a control (799,260 matvecs / 4 cards / 385 = 519 per card per step); take
+  the wall from an unprofiled llama-bench. Profiled throughput is ~36.7 ms/token against 26.6 unprofiled
+  (23.6 ms marker + 13.1 ms median inter-marker gap), so absolute profiled numbers are not comparable,
+  though ratios between arms inside one trace are.
+- **rocprofv3 trace parsing** `[v]`. Use duckdb (`read_csv(..., header=true, quote='"')`; 1.8 GB in ~0.7 s),
+  not awk: `Kernel_Name` contains commas, so positional `$N` is wrong and `$(NF-k)` from the end is needed
+  if you must use awk at all. mmvq's block is **2D** - `Workgroup_Size_X` is `warp_size` (32 on gfx1201,
+  confirming wave32) and nwarps is `Workgroup_Size_Y`, so reading only `_X` makes every kernel look
+  1-warp. The traces hold far more than `kernel_stats.csv`: all four GPUs in one file under `Agent 1..4`
+  on a common clock (so cross-rank skew is measurable), plus `Scratch_Size`, `LDS_Block_Size`,
+  `VGPR_Count`, `SGPR_Count`, grid/block geometry and a joinable `Correlation_Id`. `marker_api_stats.csv`
+  gives llama.cpp's own nested host ranges (`phase:decode`, `graph:compute`, `meta:subgraph`,
+  `meta:allreduce`, `input:lazy_*`). **No performance counters are collected**, so these files cannot
+  answer bandwidth or cache-hit questions - that needs a separate counter run or `--att`.
+- **Unexplained long spans in bench-box decode** `[v]` (E059, both arms, identical indices): host spans of
+  989 / 526 / 675 ms at steps 1, 3 and 258 of the 385-step `-r 3` tg128 run against a 22.6 ms median, a
+  **17.0 s gap after step 2**, and 129 / 150 ms gaps at the rep boundaries (steps 130, 258). They cancel in
+  a paired A/B. Whether they also occur unprofiled is *not established*, so do not yet treat bench-box t/s
+  for this model as inflated. Suspected first-touch faults on the 133 MB n-gram table (E058's compulsory
+  misses); not measured.
 
 - **`docs/ops.md` and `docs/ops/*.csv` are stale and wrong for these ops** `[s]`: they mark
   `DSV4_HC_*` as unsupported on CUDA and Metal while the kernels exist, and `CUDA.csv` has no
