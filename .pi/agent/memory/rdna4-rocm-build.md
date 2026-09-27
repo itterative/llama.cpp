@@ -111,7 +111,9 @@ Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_* 7, default 8. Batch 1 is below every one of them,
 expert types go to mmvq and `should_use_mmq`'s `n_experts > 0` clause only ever fires on prefill. Inside
 mmvq, `MMVQ_PARAMETERS_RDNA4` (`calc_nwarps`, `mmvq.cu:465-489`) gives **8 warps at `ncols_dst == 1`** for
 exactly those types - so the measured ~115 GB/s is happening on the branch RDNA4 tuning was written to
-favor, which is the point of the whole investigation.
+favor, which is the point of the whole investigation. **[x] E059 retracted the framing**: the 8-warp
+whitelist was 2x off optimum at narrow K, and ~115 GB/s was never a bandwidth limit - see "Sizing mmvq
+blocks by K width" below.
 
 **Two tables matter, not one:**
 - `get_mmvq_mmid_max_batch_rdna4` (`mmvq.cu:258`) - who gets mmvq at which batch.
@@ -148,7 +150,9 @@ for the types this model has (`calc_nwarps`, `mmvq.cu:465-489`), but `calc_rows_
 `GGML_CUDA_CC_IS_RDNA(cc)` on the same `else if` line as the per-type NVIDIA lists, with no comment.
 
 The condition is plainly true here: `ffn_down` at Q5_0, `k = 640` -> `blocks_per_row_x = 20`, versus
-`nwarps * blocks_per_iter_1warp = 8 * 8 = 64`. So a 256-thread block cooperatively reduces a **480-byte
+`nwarps * blocks_per_iter_1warp = 8 * 16 = 128` (`blocks_per_iter_1warp = vdr*warp_size/qi = 2*32/4`,
+since `QI5_0 = QK5_0/(4*QR5_0) = 4`; this line used to say qi=8 and a threshold of 64, which does not
+change the conclusion). So a 256-thread block cooperatively reduces a **480-byte
 row**, paying a cross-warp shared-memory reduction per output value for 2.5 warps' worth of K trips. That is
 exactly the case small_k was written for, disabled for the architecture with the widest blocks.
 
@@ -164,6 +168,43 @@ re-baseline before comparing.
 
 The gain is flat in depth, unlike the pool's, so the two are additive: the pool removes work that grows with
 context, small_k removes per-matmul reduction work that does not.
+
+### Sizing mmvq blocks by K width, not by type alone (`d133df7d4`, E059)
+
+small_k was half the story. The threads that ever enter mmvq's K loop number
+`blocks_per_row_x * (qi/vdr)`, and that does **not** depend on `rows_per_cuda_block` - every thread
+already accumulates all of its block's rows in `tmp[ncols_dst][rows_per_cuda_block]`. So at the 4-card
+`ffn_down_exps` slice (q5_0, k=160, `blocks_per_row_x = 5`) **10 of 256 threads do work**, and the other
+246 still take part in the 7-warp shared reduction that produces 8 output values. That, not bandwidth,
+is the ~115 GB/s: the same shape reaches only 64 GB/s while fully L2-resident (8 MB L2).
+
+`qi/vdr = 2` for the block-32 types and 16 for the K-quants, so the variable that matters is
+`blocks_per_row_x = k / blck_size`, and **one k means different things per type**: at k=2560 the
+block-32 types (kblk 80) want 8 warps while the K-quants (kblk 10) want 2.
+
+The fix is a `narrow_nwarps` int template parameter chosen host-side from `blocks_per_row_x`, mirroring
+`halve_iters` and guarded by a `c_promoted`-style test so tables that ignore it compile no extra kernel.
+RDNA4, `ncols_dst == 1`, type != Q6_K: kblk <= 5 -> 1 warp, <= 20 -> 2 warps, else the table's 8.
+RDNA4's block shape now lives in `mmvq-config-rdna4.cuh`, matching the `mmq-config-*.cuh` convention.
+
+Measured: `mul_mat_vec_q` device time 8794.8 -> 6702.9 ms (1.312x), **tg +3.7..4.7% on the real 4-card
+model at every depth**, and 22 of 33 grid cells better by >5%, up to 3.84x. Two things not to repeat:
+raising `rows_per_block` instead is **4.6x worse** (32 live floats per thread plus 28 KB of `tmp_shared`),
+and Q6_K had to be excluded because its best warp count is not monotone in K (1 warp at kblk 1, 8 at
+kblk 4, 4 at kblk 10) - and it is 64 calls per card per step in the real model.
+
+`GGML_CUDA_MMVQ_RDNA4_SMALL_K=0` does **not** disable this, `narrow_k_nwarps` never consults it, so that
+env var is not a valid baseline arm. Zero `MMVQ_RDNA4_NARROW_K_MAX` and `MMVQ_RDNA4_MID_K_MAX` and
+rebuild. RPATH on the dev box defeats `.so` swapping for an interleaved A/B (`LD_LIBRARY_PATH` ignored,
+`LD_PRELOAD` fails, mixing two trees core-dumps), so arms must be rebuilt - ccache makes that ~3 s once
+both variants have been built once.
+
+**Measuring mmvq shapes without a model.** `test-export-graph-ops -m <gguf> -np 1 -o ops.txt` dumps the
+real tg graph, `test-backend-ops perf --test-file ops.txt -b ROCm0 -o MUL_MAT_ID` runs it, and the file
+is editable plain text - so a per-card TP slice, which only exists on a 4-card box, is measurable on one
+card. Format, the type-size table and three tool traps (the GB/s column is allocated bytes over time and
+is garbage for file-loaded matmuls; ids are fixed so narrow cases are L2-warm; `touch` fakes a fast
+rebuild) are in the E059 record.
 
 ### 4-card decode collectives: the in-tree one-shot beats RCCL by ~2.5% at depth
 

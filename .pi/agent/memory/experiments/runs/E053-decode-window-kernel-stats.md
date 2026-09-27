@@ -1,5 +1,12 @@
 # E053 - first decode-window kernel stats from a real turn, on 4 cards
 
+> **Superseded in part by [E059](E059-mmvq-narrow-k-rdna4.md).** This table is truncated (the `%` column
+> sums to 82.98) and two of its readings were later corrected: the ~115 GB/s for the quantized matvecs was
+> not a bandwidth limit but mmvq failing to fill its blocks at narrow K, and `ffn_down_exps` is Q5_0 in some
+> layers and Q8_0 in others, not uniformly Q5_0. `mul_mat_vec_f` is 18.0% of decode device time, not the
+> 6.1% estimated here. The routing conclusion (519 launches, not 24,576) and the 96-collective count both
+> held, and E059 reproduced them independently.
+
 Artifact: [results/user/llama-cli-traces/82bc067/kernel-stats.log](../results/user/llama-cli-traces/82bc067/kernel-stats.log)
 (bench box, `82bc067`, `rocprofv3 --selected-regions --marker-trace --kernel-trace --stats`,
 `GGML_PROF_REGIONS=1 GGML_PROF_DECODE=1`, `Q4EXP_POOLED=1 Q4EXP_SPARSE_FA=1 GGML_FATTN_RDNA_RTILE=1`,

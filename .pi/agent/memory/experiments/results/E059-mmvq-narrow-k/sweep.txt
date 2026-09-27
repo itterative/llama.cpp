@@ -1,0 +1,10 @@
+nwarps=8 mult=1 rows=8  down_k160=35.80us  down_k640=38.29us  gate_m160=11.95us
+nwarps=8 mult=2 rows=16  down_k160=50.19us  down_k640=52.45us  gate_m160=13.48us
+nwarps=8 mult=4 rows=32  down_k160=164.61us  down_k640=180.64us  gate_m160=16.89us
+nwarps=4 mult=1 rows=4  down_k160=32.95us  down_k640=34.66us  gate_m160=11.68us
+nwarps=4 mult=2 rows=8  down_k160=31.16us  down_k640=32.47us  gate_m160=11.71us
+nwarps=4 mult=4 rows=16  down_k160=32.69us  down_k640=34.54us  gate_m160=11.70us
+nwarps=2 mult=1 rows=2  down_k160=21.22us  down_k640=25.57us  gate_m160=10.44us
+nwarps=2 mult=2 rows=4  down_k160=19.03us  down_k640=23.73us  gate_m160=10.46us
+nwarps=2 mult=4 rows=8  down_k160=18.36us  down_k640=25.80us  gate_m160=10.45us
+nwarps=1 mult=1 rows=1  down_k160=17.96us  down_k640=28.15us  gate_m160=9.88us
