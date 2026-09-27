@@ -106,7 +106,11 @@ The PLE table is **~51 B params = 28% of the model, serving exactly one layer**,
 via host-side n-gram hashing (ggml has no int64/xor). That single fact reordered the
 backlog: L1 (is that table resident or `--lazy-mode` page-faulting?), L2 (host-side gather
 + graph split per ubatch), L3 (10-of-512 expert routing) now sit ahead of the HC/QSA kernel
-threads as first-guess `tg` bottlenecks.
+threads as first-guess `tg` bottlenecks. **All three are since closed.** L1/L2 by E058: the misses are
+compulsory first touches of a 133 MB working set, no cache of any placement helps, and a WILLNEED
+prefetch over the 16 distinct 110 B rows a step reads gave +4.2% tg. L3 by E059: routing was always
+fine, mmvq simply could not fill its own blocks at narrow K, and sizing nwarps by K width gave
++3.7..4.7% tg.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness

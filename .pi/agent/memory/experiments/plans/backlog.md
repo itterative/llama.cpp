@@ -127,7 +127,16 @@ question is closed by E056, H9's correctness under mrope by E057.
   llama-cli A/B on this box can be text-matched; normalize per call, and use the deterministic part of the
   workload as a control - prefill's counters came out byte-identical across all four arms.
 
-### L3 - 10-of-512 expert routing on HIP **routing is fine; E053 redirected this row**
+### L3 - 10-of-512 expert routing on HIP **closed by E059 - routing was fine, the kernel was the problem**
+
+- **E059 closed it.** The ~115 GB/s was never a bandwidth limit: at `blocks_per_row_x = 5` only 10 of 256
+  threads enter mmvq's K loop, and `rows_per_block` cannot change that because every thread already
+  accumulates all of its block's rows. Sizing nwarps by K width (`d133df7d4`) cuts `mul_mat_vec_q` device
+  time 1.312x and gives **+3.7..4.7% tg on the real 4-card model at every depth**. Raising rows per block,
+  the obvious guess, is 4.6x *worse*. The type census is settled too: `ffn_down_exps` is **Q5_0 in some
+  layers and Q8_0 in others**, not uniformly Q5_0. What survives from this row is `quantize_q8_1` (4.0% of
+  device time, one launch per matvec, no memoization on `src1` at `mmvq.cu:1503-1509`) and Q8_0 at wide K
+  (1.68x available at kblk=80). See [runs/E059-mmvq-narrow-k-rdna4.md](../runs/E059-mmvq-narrow-k-rdna4.md).
 
 - `num_experts 512`, `per_tok 10`, `moe_intermediate_size 640`: ~2% of expert weights touched per token
   per layer, so `tg` is a scattered-read problem.
