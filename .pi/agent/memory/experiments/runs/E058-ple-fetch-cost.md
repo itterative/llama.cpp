@@ -180,8 +180,10 @@ ubatch implies).
 
 ## notes
 
-- The two `/proc/self/io` reads inside `gather` add ~150 B/call to `rchar`, ~8% of a decode call, so the
-  miss rate is understated by that much. Subtracting it is what makes `rchar` come out at 16 x 110 B.
+- The two `/proc/self/io` reads inside `gather` add ~150 B/call to `rchar`, ~8% of a decode call. Only
+  the earlier sample lands in the window: the later one is charged to `rchar` after it reports. That
+  length used to be subtracted by hand (the 16 x 110 B result); `lazy_self_io` now does it itself with a
+  persistent fd and `pread` (8.5 -> 1.6 us/call), so `rchar` is an exact multiple of the row size.
 - `lazy_seen` is process-wide and never evicted, so decode's reuse figure includes rows *prefill* read.
   Decode-only reuse is at most the measured 27.7-34.1%, which only strengthens the cache conclusion.
 - Cold pages are derived as `storage / 4096`. If the device granularity is not 4 kB the absolute count is

@@ -6,9 +6,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -16,6 +16,9 @@
 #ifdef __has_include
     #if __has_include(<fcntl.h>)
         #include <fcntl.h>
+    #endif
+    #if __has_include(<unistd.h>)
+        #include <unistd.h>
     #endif
 #endif
 
@@ -69,24 +72,55 @@ void llama_lazy_reader::read_range(const std::pair<int32_t, int32_t> * pairs, in
 }
 
 // rchar is every byte asked of read()/pread(), page cache hits included; read_bytes is only what
-// storage served, so the pair gives the miss rate. these two reads add ~400 B to rchar themselves
-static bool lazy_self_io(uint64_t & rchar, uint64_t & storage) {
-    std::ifstream f("/proc/self/io");
+// storage served, so the pair gives the miss rate. reading this file counts itself in rchar, so the
+// caller gets the length back and subtracts it
+static bool lazy_self_io(uint64_t & rchar, uint64_t & storage, size_t & n_read) {
+#if defined(__linux__)
+    static const int fd = open("/proc/self/io", O_RDONLY);
 
-    if (!f) {
+    if (fd < 0) {
         return false;
     }
 
-    std::string key;
-    uint64_t    val;
-    bool        got_rchar = false, got_storage = false;
+    char buf[256];
+    const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
 
-    while (f >> key >> val) {
-        if      (key == "rchar:")      { rchar = val;   got_rchar = true;   }
-        else if (key == "read_bytes:") { storage = val; got_storage = true; }
+    if (n <= 0) {
+        return false;
+    }
+
+    n_read = (size_t) n;
+    buf[n] = '\0';
+
+    bool got_rchar   = false;
+    bool got_storage = false;
+
+    for (char * line = buf; line != nullptr; ) {
+        char * nl = strchr(line, '\n');
+
+        if (nl != nullptr) {
+            *nl = '\0';
+        }
+
+        if (strncmp(line, "rchar:", 6) == 0) {
+            rchar = strtoull(line + 6, nullptr, 10);
+            got_rchar = true;
+        } else if (strncmp(line, "read_bytes:", 11) == 0) {
+            storage = strtoull(line + 11, nullptr, 10);
+            got_storage = true;
+        }
+
+        line = nl != nullptr ? nl + 1 : nullptr;
     }
 
     return got_rchar && got_storage;
+#else
+    (void) rchar;
+    (void) storage;
+    (void) n_read;
+
+    return false;
+#endif
 }
 
 // a gather of at most this many rows is decode or a speculative verify, above it is prefill
@@ -126,7 +160,8 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
     const bool prof = ggml_prof_enabled() != 0;
 
     uint64_t   rchar0 = 0, storage0 = 0;
-    const bool io = prof && lazy_self_io(rchar0, storage0);
+    size_t     n_read0 = 0;
+    const bool io = prof && lazy_self_io(rchar0, storage0, n_read0);
 
     std::vector<std::pair<int32_t, int32_t>> pairs;
     pairs.reserve(n);
@@ -225,9 +260,11 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
 
         if (io) {
             uint64_t rchar1 = 0, storage1 = 0;
+            size_t   n_read1 = 0;
 
-            if (lazy_self_io(rchar1, storage1)) {
-                ggml_prof_count(dec ? "io:rchar_decode"   : "io:rchar_prefill",   rchar1 - rchar0);
+            if (lazy_self_io(rchar1, storage1, n_read1)) {
+                // only the first read lands in the window: the second is charged after it reports
+                ggml_prof_count(dec ? "io:rchar_decode"   : "io:rchar_prefill",   rchar1 - rchar0 - n_read0);
                 ggml_prof_count(dec ? "io:storage_decode" : "io:storage_prefill", storage1 - storage0);
             }
         }
