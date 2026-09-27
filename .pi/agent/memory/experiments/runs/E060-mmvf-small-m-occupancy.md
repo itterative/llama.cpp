@@ -185,7 +185,9 @@ adds independent iterations per thread:
 | 65536 | 134 MB | 219.31 | **612 (DRAM)** |
 
 512 blocks *can* saturate DRAM (612 GB/s at k = 65536) - the block-count theory of the
-router's 27.37 us is dead. Note the screening consequence: the cache-resident m = 512 case
+router's 27.37 us is dead. E061 tests the resulting lever (more independent loads per thread)
+and finds the dev-box win; the bench reading is still the deciding number. Note the screening
+consequence: the cache-resident m = 512 case
 (7.19 us) is latency-bound on the *same* limit - 5 loads per thread - so a change that gives
 each thread more independent work should move it here, before the bench is asked to confirm
 the cold number. What the router lacks is independent work per thread: 5 float2

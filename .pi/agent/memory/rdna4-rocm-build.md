@@ -213,6 +213,17 @@ describes the MALL and nothing else - those rows need the bench decode window. `
 rebuild; and `test_generic_op` parses the fields with `operator>>`, so a scientific-notation stride is
 truncated to its mantissa and the case aborts in rocBLAS) are in the E059 and E060 records.
 
+**Reading per-kernel registers and occupancy without a profiler.** The dev box has no rocprofv3,
+but the compiler reports what each kernel will use: compile the TU the way the build does with
+`-Rpass-analysis=kernel-resource-usage` and read the per-instantiation remarks (VGPRs, SGPRs,
+spills, LDS, occupancy in waves/SIMD). `results/E061-mmvf-decode-ilp/resource-screen.py` does
+this and filters by instantiation; it takes the flags from
+`build/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/flags.make`, and those have to be passed as
+argv rather than through the shell because the FA defines contain quotes. It is the only
+dev-box instrument for ILP/occupancy questions: it showed the mmvf decode loop running at
+**12 VGPRs** (about one load in flight per thread) and the E061 unroll taking it to 25-28 with
+no spills and occupancy still at the 16 waves/SIMD limit.
+
 ### 4-card decode collectives: the in-tree one-shot beats RCCL by ~2.5% at depth
 
 ```sh
