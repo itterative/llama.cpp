@@ -723,7 +723,11 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        ggml_prof_region prof_sync("phase:sync");
+
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1343,10 +1347,14 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    if (mctx) {
+        ggml_prof_region prof_apply("mctx:apply");
+
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -1356,7 +1364,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    bool can_reuse = !graph_reuse_disable && gf_res_prev_active == res;
+
+    if (can_reuse) {
+        ggml_prof_region prof_reuse("graph:reuse");
+
+        can_reuse = res->can_reuse(gparams);
+    }
+
+    if (can_reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1448,6 +1464,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens = balloc->get_n_tokens();
+
+    // an encoder pass (vision tower and the like) is prompt-side work, so it shares the prefill bucket
+    ggml_prof_region prof_encode("phase:encode");
+
+    ggml_prof_set_phase(GGML_PROF_PHASE_PREFILL);
+    ggml_prof_count("tok:prefill", n_tokens);
 
     // [TAG_NO_CACHE_PAD]
     // TODO: add new split mode where we pad the input sequences so that ubatch.equal_seqs == true
@@ -1663,15 +1685,23 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-// capture window over decode steps only, for profiler traces: GGML_PROF_DECODE=<max n_tokens still
-// counted as decode>. 1 for plain decode; raise it to cover speculative verify (n_draft + 1) or -np > 1
-// slots. opens on the first matching batch, closes on the next larger one or at exit
+// a batch at or below this width is decode: 1 for plain decode; raise it to cover speculative verify
+// (n_draft + 1) or -np > 1 slots
 static int llama_prof_decode_limit(void) {
     static const int val = []() {
         const char * env = getenv("GGML_PROF_DECODE");
 
-        return env != nullptr ? std::max(1, atoi(env)) : 0;
+        return env != nullptr ? std::max(1, atoi(env)) : 1;
     }();
+
+    return val;
+}
+
+// the capture window is a separate ask from the phase regions: resume/pause decides what a rocprofv3
+// --selected-regions run records, so it stays opt-in. opens on the first decode batch, closes on the
+// next wider one or at exit
+static bool llama_prof_window(void) {
+    static const bool val = getenv("GGML_PROF_DECODE") != nullptr;
 
     return val;
 }
@@ -1687,13 +1717,13 @@ static void llama_prof_decode_close(void) {
 }
 
 static bool llama_prof_decode_touch(int n_tokens) {
-    const int limit = llama_prof_decode_limit();
+    const bool is_decode = n_tokens <= llama_prof_decode_limit();
 
-    if (limit == 0) {
-        return false;
+    if (!llama_prof_window()) {
+        return is_decode;
     }
 
-    if (n_tokens > limit) {
+    if (!is_decode) {
         llama_prof_decode_close();
 
         return false;
@@ -1730,8 +1760,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool                      prof_decode = llama_prof_decode_touch(batch_inp.n_tokens);
     std::optional<ggml_prof_region> prof;
 
-    if (prof_decode && ggml_prof_enabled()) {
-        prof.emplace("phase:decode");
+    if (ggml_prof_enabled()) {
+        ggml_prof_set_phase(prof_decode ? GGML_PROF_PHASE_DECODE : GGML_PROF_PHASE_PREFILL);
+
+        prof.emplace(prof_decode ? "phase:decode" : "phase:prefill");
+
+        ggml_prof_count(prof_decode ? "tok:decode" : "tok:prefill", (uint64_t) batch_inp.n_tokens);
     }
 
     const auto & vocab   = model.vocab;

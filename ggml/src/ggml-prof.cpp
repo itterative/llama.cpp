@@ -16,6 +16,9 @@ struct ggml_prof_region_stat {
     uint64_t     max_ns;
     uint64_t     min_ns;
     uint64_t     count;
+    // per-phase split of the same time, see ggml_prof_set_phase
+    uint64_t     ph_ns[GGML_PROF_PHASE_N];
+    uint64_t     ph_count[GGML_PROF_PHASE_N];
 };
 
 static ggml_prof_region_stat ggml_prof_regions[GGML_PROF_MAX_REGIONS];
@@ -39,6 +42,13 @@ static thread_local struct {
     int      depth;
 } ggml_prof_thread;
 
+// sticky per thread, see ggml-prof.h
+static thread_local int ggml_prof_cur_phase = GGML_PROF_PHASE_OTHER;
+
+void ggml_prof_set_phase(enum ggml_prof_phase phase) {
+    ggml_prof_cur_phase = (int) phase;
+}
+
 static void ggml_prof_report_atexit(void);
 
 void ggml_prof_register_sink(const struct ggml_prof_sink * sink) {
@@ -58,7 +68,7 @@ static int ggml_prof_region_idx(const char * name) {
 
     const int i = ggml_prof_n_regions++;
 
-    ggml_prof_regions[i] = { name, 0, 0, UINT64_MAX, 0 };
+    ggml_prof_regions[i] = { name, 0, 0, UINT64_MAX, 0, { 0 }, { 0 } };
 
     return i;
 }
@@ -164,6 +174,9 @@ void ggml_prof_region_end(void) {
     r->max_ns    = dt > r->max_ns ? dt : r->max_ns;
     r->min_ns    = dt < r->min_ns ? dt : r->min_ns;
 
+    r->ph_ns[ggml_prof_cur_phase]    += dt;
+    r->ph_count[ggml_prof_cur_phase] += 1;
+
     if (ggml_prof_sink && ggml_prof_sink->region_end) {
         ggml_prof_sink->region_end();
     }
@@ -205,10 +218,41 @@ void ggml_prof_report(const char * title) {
                 r->count ? r->total_ns * 1e-6 / r->count : 0.0,
                 r->count ? r->min_ns * 1e-6 : 0.0,
                 r->max_ns  * 1e-6);
+
+        // min and max stay across phases, so split the row when a region saw both kinds of batch
+        int n_ph = 0;
+
+        for (int p = 0; p < GGML_PROF_PHASE_N; ++p) {
+            n_ph += r->ph_count[p] > 0;
+        }
+
+        if (n_ph > 1) {
+            static const char * ggml_prof_phase_name[GGML_PROF_PHASE_N] = { "other", "pp", "tg" };
+
+            fprintf(stderr, "[prof]   %-28s", "");
+
+            bool first = true;
+
+            for (int p = 0; p < GGML_PROF_PHASE_N; ++p) {
+                if (r->ph_count[p] == 0) {
+                    continue;
+                }
+
+                fprintf(stderr, "%s %s %llu calls %.2f ms %.4f ms/call",
+                        first ? "  " : "  |", ggml_prof_phase_name[p],
+                        (unsigned long long) r->ph_count[p],
+                        r->ph_ns[p] * 1e-6,
+                        r->ph_ns[p] * 1e-6 / r->ph_count[p]);
+
+                first = false;
+            }
+
+            fprintf(stderr, "\n");
+        }
     }
 
     for (int i = 0; i < ggml_prof_n_regions; ++i) {
-        ggml_prof_regions[i] = { ggml_prof_regions[i].name, 0, 0, UINT64_MAX, 0 };
+        ggml_prof_regions[i] = { ggml_prof_regions[i].name, 0, 0, UINT64_MAX, 0, { 0 }, { 0 } };
     }
 
     if (ggml_prof_n_counters > 0) {

@@ -18,6 +18,9 @@
 //
 // Regions nest, per thread. End matches the most recent begin on that thread. Totals are inclusive of
 // nested regions, so do not sum them; subtract to get self time.
+//
+// Every region total is also bucketed by phase. A region reached from more than one kind of batch prints
+// a second line with the per-phase calls and ms, because ms/call across mixed batches means nothing.
 
 #ifdef  __cplusplus
 extern "C"
@@ -29,6 +32,18 @@ extern "C"
 
     GGML_API void ggml_prof_region_begin(const char * name);
     GGML_API void ggml_prof_region_end(void);
+
+    // Phase labels for the region buckets. Sticky per thread: it says what kind of batch the thread is
+    // handling, so work between calls - a sync draining a decode - is attributed to the phase that
+    // produced it. A region is bucketed by the phase current when it ends.
+    enum ggml_prof_phase {
+        GGML_PROF_PHASE_OTHER   = 0,
+        GGML_PROF_PHASE_PREFILL = 1,
+        GGML_PROF_PHASE_DECODE  = 2,
+        GGML_PROF_PHASE_N       = 3,
+    };
+
+    GGML_API void ggml_prof_set_phase(enum ggml_prof_phase phase);
 
     // add delta to a named counter; the name is kept, not copied, so pass a literal
     GGML_API void ggml_prof_count(const char * name, uint64_t delta);
