@@ -414,6 +414,23 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// T1 knob (E060): force mul_mat_vec_f's block size instead of the niter heuristic. 0 or
+// unset keeps the heuristic. The K loop is split across the block, so this changes the
+// summation order - a measurement knob, not bit-exact with the default.
+static int64_t ggml_cuda_mmvf_block_size(void) {
+    static const int64_t val = []() -> int64_t {
+        const char * name = getenv("GGML_CUDA_MMVF_BLOCK_SIZE");
+
+        if (name == nullptr || name[0] == '\0' || name[0] == '0') {
+            return 0;
+        }
+
+        return atoll(name);
+    }();
+
+    return val;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -447,6 +464,11 @@ void launch_mul_mat_vec_f_cuda(
             niter_best      = niter;
             block_size_best = block_size;
         }
+    }
+
+    const int64_t block_size_forced = ggml_cuda_mmvf_block_size();
+    if (block_size_forced >= 2*warp_size && block_size_forced <= max_block_size && block_size_forced % warp_size == 0) {
+        block_size_best = block_size_forced;
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
