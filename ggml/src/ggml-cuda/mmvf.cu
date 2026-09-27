@@ -4,6 +4,13 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+// E061: unroll the decode K loop by this factor (ncols_dst == 1, no fusion, f32 or bf16).
+// 1 keeps the plain loop; the register report puts the f32 decode shape at 12 VGPRs, i.e. about
+// one load in flight per thread, and this knob is how E061 tested giving each thread more.
+#ifndef MMVF_K_UNROLL
+#define MMVF_K_UNROLL 1
+#endif
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -126,7 +133,48 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    if constexpr (std::is_same_v<T, float>) {
+    if constexpr (MMVF_K_UNROLL > 1 && ncols_dst == 1 && !has_fusion &&
+            (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>)) {
+        constexpr int U = MMVF_K_UNROLL;
+        float acc[U] = {0.0f};
+
+        auto load_x2 = [&](int i) -> float2 {
+            if constexpr (std::is_same_v<T, float>) {
+                return ((const float2 *) x)[i];
+            } else {
+                const int raw = ((const int *) x)[i];
+                return make_float2(ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&raw)[0]),
+                                   ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&raw)[1]));
+            }
+        };
+
+        int col2 = tid;
+        for (; col2 + (U - 1)*block_size < ncols2; col2 += U*block_size) {
+            float2 tx[U];
+            float2 ty[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                tx[u] = load_x2(col2 + u*block_size);
+                ty[u] = y2[col2 + u*block_size];
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                ggml_cuda_mad(acc[u], tx[u].x, ty[u].x);
+                ggml_cuda_mad(acc[u], tx[u].y, ty[u].y);
+            }
+        }
+        for (; col2 < ncols2; col2 += block_size) {
+            const float2 tx = load_x2(col2);
+            const float2 ty = y2[col2];
+            ggml_cuda_mad(acc[0], tx.x, ty.x);
+            ggml_cuda_mad(acc[0], tx.y, ty.y);
+        }
+#pragma unroll
+        for (int u = 1; u < U; ++u) {
+            acc[0] += acc[u];
+        }
+        sumf[0] = acc[0];
+    } else if constexpr (std::is_same_v<T, float>) {
         const float2 * x2 = (const float2 *) x;
         [[maybe_unused]] const float2 * gate_x2 = nullptr;
         if constexpr (has_fusion) {
