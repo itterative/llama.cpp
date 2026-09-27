@@ -202,9 +202,13 @@ both variants have been built once.
 **Measuring mmvq shapes without a model.** `test-export-graph-ops -m <gguf> -np 1 -o ops.txt` dumps the
 real tg graph, `test-backend-ops perf --test-file ops.txt -b ROCm0 -o MUL_MAT_ID` runs it, and the file
 is editable plain text - so a per-card TP slice, which only exists on a 4-card box, is measurable on one
-card. Format, the type-size table and three tool traps (the GB/s column is allocated bytes over time and
-is garbage for file-loaded matmuls; ids are fixed so narrow cases are L2-warm; `touch` fakes a fast
-rebuild) are in the E059 record.
+card. Format, the type-size table and four tool traps (the GB/s column is allocated bytes over time and
+is garbage for file-loaded matmuls; ids are fixed so narrow cases are L2-warm - E060 measured how much
+that can lie: a case whose weight fits the 8 MB L2, like the 5.24 MB F32 router, runs 3.3-3.8x faster
+than the same shape costs in the bench's decode window, so the harness answers only within one regime;
+`touch` fakes a fast rebuild; and `test_generic_op` parses the fields with `operator>>`, so a
+scientific-notation stride is truncated to its mantissa and the case aborts in rocBLAS) are in the E059
+and E060 records.
 
 ### 4-card decode collectives: the in-tree one-shot beats RCCL by ~2.5% at depth
 
