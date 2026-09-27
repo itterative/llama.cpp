@@ -172,6 +172,10 @@ Reading the table, all three of which I got wrong the first time:
 - `graph:compute` is the *async* entry point: it returns after enqueueing, so its ms is mostly device
   wait only where something inside synchronizes. Do not read it as dispatch cost.
 - counters are not locked; overlapping threads can double count. Today's sites are all main-thread.
+- `io:rchar_*` / `io:storage_*` are `/proc/self/io` deltas taken inside the lazy-reader gather and
+  bucketed by row count at 1024 (decode vs prefill). The sample reads a persistent fd and subtracts the
+  earlier sample's own bytes, so `rchar` is exactly what `pread` asked for. The file is process-wide, so
+  they attribute cleanly only while one lazy tensor exists (qwen4exp has one).
 
 ## Crash and debug loop on this box
 
