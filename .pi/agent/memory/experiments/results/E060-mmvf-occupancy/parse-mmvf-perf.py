@@ -7,7 +7,7 @@ case), so recompute from the shape in the case name instead.
 import re, sys, glob, os
 
 TSIZE = {"f32": 4.0, "bf16": 2.0}
-CASE  = re.compile(r"name=(mmvf_(\w+)_k(\d+)_m(\d+))")
+CASE  = re.compile(r"name=(mmvf_(\w+)_k(\d+)_m(\d+)(?:_b(\d+))?)")
 RUN   = re.compile(r"(\d+) runs -\s+([\d.]+) us/run")
 
 def parse(path):
@@ -16,15 +16,17 @@ def parse(path):
         m = CASE.search(line)
         if m:
             cur = m.group(1)
-            out.setdefault(cur, {"k": int(m.group(3)), "m": int(m.group(4)), "t": m.group(2)})
+            out.setdefault(cur, {"k": int(m.group(3)), "m": int(m.group(4)), "t": m.group(2),
+                                 "b": int(m.group(5) or 1)})
         # the name and the timing line are separate lines for most cases, one line for some
         r = RUN.search(line)
         if r and cur:
             out[cur]["runs"] = int(r.group(1))
             out[cur]["us"] = float(r.group(2))
     for v in out.values():
-        v["bytes"] = v["k"] * v["m"] * TSIZE[v["t"]]
-        v["gbps"] = v["bytes"] / (v["us"] * 1e3) if "us" in v else 0.0
+        v["bytes"] = v["k"] * v["m"] * TSIZE[v["t"]]      # one slice
+        v["us_slice"] = v["us"] / v["b"] if "us" in v else 0.0
+        v["gbps"] = v["bytes"] / (v["us_slice"] * 1e3) if v["us_slice"] else 0.0
     return out
 
 def main():
@@ -40,18 +42,17 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for n in names:
-        base = first[n]["us"]
-        row = f"{n:30s}"
+        row = f"{n:34s}"
         for a in arms:
             v = arms[a].get(n, {}).get("us")
             row += f"{v:9.2f} " if v else f"{'-':>10s}"
-        print(row + f"  bytes={first[n]['bytes']/1e3:.0f}kB")
+        print(row + f"  slice={first[n]['bytes']/1e3:.0f}kB b={first[n]['b']}")
     print("\nGB/s of the fastest arm per case:")
     for n in names:
         best = min((arms[a][n]["us"], a) for a in arms if n in arms[a])
         v = arms[best[1]][n]
         base = first[n]["us"]
-        print(f"  {n:30s} best {best[1]:8s} {v['us']:8.2f} us  {v['gbps']:7.0f} GB/s"
-              f"  ({base/v['us']:.2f}x vs first arm)")
+        print(f"  {n:34s} best {best[1]:8s} {v['us']:8.2f} us  {v['us_slice']:7.2f} us/slice"
+              f"  {v['gbps']:6.0f} GB/s/slice  ({base/v['us']:.2f}x vs first arm)")
 
 main()

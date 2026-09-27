@@ -112,9 +112,11 @@ prefetch over the 16 distinct 110 B rows a step reads gave +4.2% tg. L3 by E059:
 fine, mmvq simply could not fill its own blocks at narrow K, and sizing nwarps by K width gave
 +3.7..4.7% tg. **E060 is negative for the same class of fix on the f32 side**: `mul_mat_vec_f`'s
 `niter` block-size heuristic is near-optimal in aggregate (smaller blocks are 1.7-2.7x worse at
-m <= 128, and a blanket override loses 1.5-4% end-to-end on the dummy) even though per-row optima are
-1.2-1.7x; its 2.61 ms/step per card is 1.62 in the two DRAM-latency-bound rows (f32 router 1.33,
-indexer.q_proj 0.29) plus ~0.85 on the launch floor of 170+ tiny calls per step - H23/H24.
+m <= 128, a blanket override loses 1.5-4% end-to-end on the dummy, and the cold arms are inert), so its
+2.61 ms/step per card is bound elsewhere: the f32 router (1.33) is limited by bytes in flight per thread -
+5 loads gives 190 GB/s where the same 512-block grid reaches 612 GB/s at 128 iterations - and ~0.85 sits
+on the launch floor of 170+ tiny calls (H23/H24). Harness lesson: the level that decides an op-level
+measurement here is the 64 MB Infinity Cache, so every per-tensor read under 64 MB is oversold up to 3.8x.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness

@@ -698,16 +698,23 @@ question is closed by E056, H9's correctness under mrope by E057.
   would be ~6 s per turn of vision chat. Decide with `GGML_PROF_REGIONS=1` plus wall time on one
   real 3-image conversation, not with more local reps.
 
-### H23 - a shape-keyed mmvf block size for the two L2-sized rows, measured cold
+### H23 - give mul_mat_vec_f's narrow rows more independent work per thread
 
-- **Open question from E060.** A blanket override loses (bs64 -4.0%, bs96 -1.5% end-to-end on the
-  dummy), but the per-row table says the two rows that carry 1.62 of the group's 2.61 ms/step want
-  bs96: ffn_gate_inp (f32 2560 x 512, 5.24 MB, 1.33 ms/step) and indexer.q_proj (bf16 2560 x 512,
-  2.62 MB, 0.29). Bound if it transfers: 0.2-0.4 ms/step, 1.5-3% of device time.
-- **Why it needs new instrument work:** the op-level harness re-reads one working set, and those two
-  weights fit the 8 MB L2, so it measured them 3.3-3.8x faster than the bench's decode window did
-  (7.33 vs 27.37 us and 7.89 vs 23.69). Either read it from a bench decode window with device time,
-  or make the harness rotate the weight buffer per iteration.
+- **Open question from E060**, reframed by it: this is no longer a block-size question. The cold
+  arms are inert (bs32/64/128/256 within 6% on the DRAM-bound cases) and the heuristic is right for
+  the tiny rows. The F32 router (m=512, k=2560, 5.24 MB per card) runs at 190 GB/s in the bench
+  window because each thread has only 5 float2 loads in flight; the *same* 512-block grid reaches
+  612 GB/s at k=65536, where each thread has 128 iterations, and the same slice in a cold batch of
+  16 (8192 blocks) costs 8.34 us against the bench's 27.37. Across 48 routers that is ~0.9 ms/step,
+  6% of device time.
+- **Levers:** register-block 2-4 rows per thread in `mul_mat_vec_f` (more in-flight loads, same
+  block count, no extra barrier), float4 instead of float2, or split one row's K across 2-4 blocks
+  with a partial buffer and a reduce.
+- **Instrument:** screen on the dev box with the cache-resident m=512 case (7.19 us), which is
+  latency-bound on the same 5-loads-per-thread limit, then confirm cold in the bench decode window
+  where the f32 mmvf row with 512 blocks is directly visible. The op harness cannot answer the cold
+  question at all: any tensor under 64 MB is MALL-resident there (E060 brackets the cliff at 62.9 MB
+  = 1396 GB/s effective, 73.4 MB = 663).
 
 ### H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step
 
