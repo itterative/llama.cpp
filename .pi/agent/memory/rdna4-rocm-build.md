@@ -224,6 +224,14 @@ dev-box instrument for ILP/occupancy questions: it showed the mmvf decode loop r
 **12 VGPRs** (about one load in flight per thread) and the E061 unroll taking it to 25-28 with
 no spills and occupancy still at the 16 waves/SIMD limit.
 
+**The collective absorbs kernel savings - measured, not inferred.** E061 shortened the mmvf kernels by
+21.8% of their device time and watched `ar_oneshot` grow 11.9% in the same session: the waiting cards
+arrive earlier and spin longer, so the per-call p90 went 36.6 -> 140.3 us on three of the four cards
+(the straggler, which waits least, barely moved). 76% of the saving came back as spin, and the wall
+ended 1.4-2% worse with the host's launch span inflating to absorb the blocked queue. On this topology
+a compute-phase optimisation only pays if the barrier's wait tail moves with it, and the tail is
+concentrated - 6 of the 96 collectives per step carry it - rather than uniform.
+
 ### 4-card decode collectives: the in-tree one-shot beats RCCL by ~2.5% at depth
 
 ```sh
