@@ -11,7 +11,7 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H23/H24 (E060's survivors - a shape-keyed mmvf block size for the two L2-sized rows, and the launch floor on the 170+ tiny mmvf calls), H20/H21/H22 (what E057's fix left open: the pool never engages for a session with
+**Live right now:** H24/H25 (E061's survivors - the launch floor on the 170+ tiny mmvf calls, and what makes 6 of the 96 collectives per step wait 140 us), E062 (whether the unroll's wall loss survives an unprofiled run), H20/H21/H22 (what E057's fix left open: the pool never engages for a session with
 an image, `qsa_pool_get` promises more than the fast path verifies, and whether the vision path pays
 H19's ratchet), H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
 with the pool off), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated),
@@ -698,23 +698,18 @@ question is closed by E056, H9's correctness under mrope by E057.
   would be ~6 s per turn of vision chat. Decide with `GGML_PROF_REGIONS=1` plus wall time on one
   real 3-image conversation, not with more local reps.
 
-### H23 - give mul_mat_vec_f's narrow rows more independent work per thread
+### ~~H23 - give mul_mat_vec_f's narrow rows more independent work per thread~~ answered by E061: real, but the allreduce absorbs it
 
-- **Open question from E060**, reframed by it: this is no longer a block-size question. The cold
-  arms are inert (bs32/64/128/256 within 6% on the DRAM-bound cases) and the heuristic is right for
-  the tiny rows. The F32 router (m=512, k=2560, 5.24 MB per card) runs at 190 GB/s in the bench
-  window because each thread has only 5 float2 loads in flight; the *same* 512-block grid reaches
-  612 GB/s at k=65536, where each thread has 128 iterations, and the same slice in a cold batch of
-  16 (8192 blocks) costs 8.34 us against the bench's 27.37. Across 48 routers that is ~0.9 ms/step,
-  6% of device time.
-- **Levers:** register-block 2-4 rows per thread in `mul_mat_vec_f` (more in-flight loads, same
-  block count, no extra barrier), float4 instead of float2, or split one row's K across 2-4 blocks
-  with a partial buffer and a reduce.
-- **Instrument:** screen on the dev box with the cache-resident m=512 case (7.19 us), which is
-  latency-bound on the same 5-loads-per-thread limit, then confirm cold in the bench decode window
-  where the f32 mmvf row with 512 blocks is directly visible. The op harness cannot answer the cold
-  question at all: any tensor under 64 MB is MALL-resident there (E060 brackets the cliff at 62.9 MB
-  = 1396 GB/s effective, 73.4 MB = 663).
+- The lever works at the kernel level (`MMVF_K_UNROLL=4`: mmvf device time -21.8%, 2.42x on
+  `hc_*_inject`, 1.46x on the one-row calls, 1.14x on the router) and loses at the system level:
+  `ar_oneshot` +11.9%, agent 1's p90 wait 36.6 -> 140.3 us, so 76% of the saving returns as spin
+  and the profiled wall ends 1.4-2% worse. The knob stays in the tree as the instrument for the
+  collective work.
+- **One open sub-question:** all three arms ran with `GGML_CUDA_AR_ONESHOT_PROBE=1`, which E059's
+  A/B did not set. An unprofiled, interleaved U=1 vs U=4 at `-r >= 10` settles whether the wait
+  tail is a probe artifact (device accounting then predicts -0.14 ms/step, -0.5% tg) or real
+  (+1.5% of loss). Registered as E062 in [../INDEX.md](../INDEX.md).
+
 
 ### H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step
 
@@ -728,6 +723,16 @@ question is closed by E056, H9's correctness under mrope by E057.
 ---
 
 ## Next runs (mostly flag-only, bench box)
+
+
+### H25 - what makes 6 of the 96 collectives per step wait 140 us
+
+- E061 measured the allreduce's p90 on the waiting cards explode from 36.6 to 140.3 us once the
+  compute phases got shorter, and the extra wait is not uniform: it sits on collective indices 6,
+  22, 38, 54, 70 and 86 of each step - every 8th layer, first collective. Which six those are is
+  not explained by E059 or E061, and the comms plan is the natural home for it. If it is a launch
+  order or rank-skew artifact it is fixable, and it is worth 0.433 ms/step per card (3% of device
+  time) every time the compute phases shrink.
 
 ### ~~E007 - drop `-ot per_layer_token_embd=CPU`~~ killed by the user, confirmed in code
 
