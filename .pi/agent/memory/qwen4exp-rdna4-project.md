@@ -117,6 +117,12 @@ m <= 128, a blanket override loses 1.5-4% end-to-end on the dummy, and the cold 
 5 loads gives 190 GB/s where the same 512-block grid reaches 612 GB/s at 128 iterations - and ~0.85 sits
 on the launch floor of 170+ tiny calls (H23/H24). Harness lesson: the level that decides an op-level
 measurement here is the 64 MB Infinity Cache, so every per-tensor read under 64 MB is oversold up to 3.8x.
+**E061 then tested the H23 lever and it works on the dev box**: the decode loop ran at 12 VGPRs, i.e.
+about one load in flight per thread, and unrolling it 4x takes that to 25 with no spills and no
+occupancy loss - 1.08x on the router shape, 1.19-1.34x on the k=8192-32768 probes, 1.54-1.63x on the
+bf16 hc rows, 1.12-1.13x on the tiny rows, and *inert* where DRAM-bound (k=65536 1.02x, cold batch
+1.00x), with 1297/1297 MUL_MAT and PPL inside 5e-7. The deciding number is still the router row's p50
+in a bench decode window (27.37 us baseline), so E061 is `open` until that runs.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness
