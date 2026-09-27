@@ -130,8 +130,10 @@ the 96 collectives per step) and the traced wall reads 1.4-2% worse - **but untr
 same arms measure +1.92%/+2.04% tg and -1.86%/-1.97% on the host launch+drain total, and the absorption is
 arithmetically gone** (0.475 of 0.572 ms/token = 83% conversion; a surviving 0.433 ms would have left
 +0.55%). So the loss was an artifact of `rocprofv3`, which perturbs the allreduce's arrival skew - a tracer
-can invert a relative result, see `experiment-protocol`. What is left is one paired `-r 10` run (E062) to
-turn +2% into a protocol-grade number, then the default can flip to `MMVF_K_UNROLL=4` gated to RDNA4.
+can invert a relative result, see `experiment-protocol`. The default has since flipped to
+`MMVF_K_UNROLL=4` gated to gfx12 (`8372ffc1f`) on those unpaired runs, so what is left is one paired
+`-r 10` run (E062) to confirm the ~2% and decide keep-vs-revert; a pre-flip bench number needs
+`MMVF_K_UNROLL=1` to stay comparable.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness
@@ -179,8 +181,10 @@ fixed cost, ~1/6 the magnitude, because per-node host work scales with layer cou
 
 Three rules that come from E017/E018 and must not be re-derived:
 - **Correctness gate**: `llama-perplexity -m models/q4exp-4l.gguf -f
-  experiments/tools/golden-corpus.md` -> `PPL = 262938.7619 +/- 3039.06817`, bit-stable across
-  runs. It covers the *prefill* path only, and its contract is "every diff is explained", not "no
+  experiments/tools/golden-corpus.md` -> `PPL = 263113.4044 +/- 3043.13706` on the current tree
+  (bit-stable across runs, and it moved 263113.6984 -> 263113.4044 when the mmvf decode unroll
+  became the default - summation order changes move this number, which is why the contract is
+  "every diff is explained" and not "no diff"). It covers the *prefill* path only, and its contract is "every diff is explained", not "no
   diff" - the QSA compaction port must move it.
 - **Noise floor ~1%**: the same file measured 180.3 / 181.8 / 181.9 t/s across invocations, and
   this GPU drives a display. Sub-2% local deltas are not findings.
@@ -260,7 +264,13 @@ unless that number set `Q4EXP_POOLED` explicitly - same trap as E055's `855a6554
 
 ## Next steps
 
-Top code action is the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
+Agreed 2026-09-27: the next bench session is the four flag/rebuild-only runs in
+`experiments/plans/bench-finish-bundle.md` (E062 paired, post-flip baseline, E048 draft sweep, E013 pool
+crossover); the next development thread after that is H20 (pool block keys in rank space, so vision
+sessions stop losing the pool's +32.6% tg). The ranking below still holds for the threads not in the
+bundle.
+
+Top code action was the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
 what is left on it is vision - H20 (pool nothing while an image is in the run), H21 (the pool promises on
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
