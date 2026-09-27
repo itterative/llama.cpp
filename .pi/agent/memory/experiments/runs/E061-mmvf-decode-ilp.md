@@ -70,11 +70,13 @@ knob is compile-time because the accumulators are register arrays.
 
 ## results
 
-Verdict: **real at the kernel level, lost at the system level**. The unroll cuts the mmvf group
-by 22% of its device time and the tiny rows by 2.4x, but on four cards the allreduce's wait
-tail grows by enough to take back 76% of that, and the profiled wall ends up 1.4-2% *worse*.
-The pre-registered deciding number, the F32 router row, moved 27.64 -> 24.24 us: the direction
-was right, the size was 3x smaller than predicted.
+Verdict: **real at the kernel level, and real on the wall once the tracer is off**. The unroll
+cuts the mmvf group by 22% of its device time and the tiny rows by 2.4x. Under `rocprofv3` that
+saving is 76% absorbed by the allreduce's wait tail, which made the traced wall 1.4-2% *worse* -
+but without the tracer the same two arms measure **+1.9-2.0% tg** and the absorption is
+arithmetically absent (section 2b). So the absorption is a property of the *traced* regime, not of
+the change. The pre-registered deciding number, the F32 router row, moved 27.64 -> 24.24 us:
+direction right, size 3x smaller than predicted.
 
 Bench run: `b673ab4ae`, one rebuild per arm, all three arms in one session,
 `GGML_PROF_REGIONS=1 GGML_PROF_DECODE=1 rocprofv3 --selected-regions --marker-trace --kernel-trace
@@ -123,7 +125,30 @@ The extra wait sits in specific collectives, not everywhere: group the 96 per st
 agent 1's p90 at U=4 is 433-579 us on indices 6, 22, 38, 54, 70, 86 - every 8th layer, first
 collective - against ~240 us on those indices at U=1 (which is uniform across all 96).
 
-### 3. Why the wall does not follow, and which card it hurts
+### 2b. Without the tracer the sign flips: +1.9-2.0% tg
+
+The same three arms were re-run with no `rocprofv3` attached, only `GGML_PROF_REGIONS=1` plus the
+roctx window (`u1/u2/u4-noprof.log` in the raw dir; no device trace, so no device accounting):
+
+| | u1 | u2 | u4 |
+| --- | --- | --- | --- |
+| `tg128 @ d16384` | 39.65 +/- 2.31 | **40.46 +/- 2.39** | **40.41 +/- 2.36** |
+| host launch + drain, ms/token | 16.9605 | 16.6956 (-1.97%) | 16.5241 (-1.86%) |
+| `meta:allreduce` host span, ms/token | 0.7630 | 0.7756 (+1.65%) | 0.7657 (+0.35%) |
+
+Two independent wall metrics agree: llama-bench's own `tg` and the process's own launch-plus-drain
+total. The per-token gain at U=4 is 0.475 ms against a traced kernel saving of 0.572 ms/step/card
+(83% conversion), where a surviving 0.433 ms of allreduce absorption would have left +0.55% instead
+of +1.9%. The host allreduce span - which is the launch path, not the device spin - moved by
+0.003-0.013 ms/token, i.e. 30-100x smaller than the traced device-side tail.
+
+Precision, honestly: these are three sequential `-r 3` runs, so each mean carries a ~1.3 SE and the
+difference ~1.9 on a 2% effect, and the arm order is not recorded in the logs (the mtimes are 6-7 s
+apart, too close for full runs, so they were copied or written at the end). The sign is consistent
+across both treatment arms and both metrics; the size is not yet protocol-grade. That is what E062's
+paired `-r 10` is for, and it is now a confirmation rather than an open question.
+
+### 3. Why the wall did not follow under the tracer, and which card it hurts
 
 | | U=1 | U=2 | U=4 |
 | --- | --- | --- | --- |
@@ -161,8 +186,12 @@ unroll would need a shape guard even if the absorption were fixed.
 
 ### 5. Caveat that keeps this from being the last word
 
-These three arms ran with `GGML_CUDA_AR_ONESHOT_PROBE=1`, which the E059 A/B did not set, and
-all three wall numbers are *profiled* (the profiler inflates the token period by ~45% here).
+The traced arms ran with `GGML_CUDA_AR_ONESHOT_PROBE=1`, which the E059 A/B did not set, and
+their wall numbers are *profiled* (the profiler inflates the token period by ~45% here). The
+untraced re-runs in 2b settle the wall question in the change's favour; the probe flag is still a
+difference from E059's setup and the untraced logs do not echo their environment, so whether they
+carried it is unknown. It does not change 2b's conclusion (the tracer is the variable that
+matters), but it is worth setting explicitly in E062.
 The device-time accounting is unaffected - it comes from the trace and the dispatch controls
 match - but whether the allreduce tail is as fragile without the probe flag is untested. The
 cheap settlement is one unprofiled, interleaved A/B of U=1 against U=4 at `-r >= 10`:
@@ -215,10 +244,9 @@ U=1 263.48 / 262.50, U=4 265.58 / 265.36 = **+0.94% paired** - the dev box said 
 
 ### 7. Left open
 
-- **The unprofiled A/B.** One interleaved U=1 vs U=4 run at `-r >= 10` with no profiler
-  settles whether the wall really loses 1.5%. Device accounting predicts -0.14 ms/step
-  (-0.5% tg) if the allreduce tail is a probe/profiler artifact, and +1.5% of loss if it is
-  not.
+- **The paired confirmation (E062).** Untraced `-r 3` runs already flipped the sign to
+  +1.9-2.0%; one interleaved U=1 vs U=4 run at `-r >= 10` turns that into a protocol-grade number
+  and is the last gate before a default flip.
 - **A shape guard for `indexer.q_proj`** if the unroll is ever revisited: bf16 2560 x 512 with
   12 calls/step regresses at both U=2 and U=4, and nothing else in the group does.
 - Non-RDNA4 builds instantiate the unrolled kernels too. They are only reachable when

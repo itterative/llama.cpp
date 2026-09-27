@@ -123,6 +123,23 @@ Live regions: `graph:build`, `graph:alloc`, `graph:set_inputs`, `graph:compute` 
 does **not** cover the mtmd vision tower: `mtmd_encode_impl` (`tools/mtmd/mtmd.cpp:1774`) runs on
 `clip_ctx` and never enters `llama_encode`, so image turns show up as no region at all.
 
+### A tracer can invert a relative result (E061)
+
+E061's arms ran twice: once under `rocprofv3 --kernel-trace --selected-regions`, once with only
+`GGML_PROF_REGIONS=1` and the roctx window, no tracer attached (the user's "no rocprofv3, host-side
+profiled" runs). **Under the tracer the unroll measured -1.8% tg. Untraced, the same two arms measured
++1.9-2.0% and -1.9% on the host's launch+drain total.**
+
+The trace showed why the traced run lost: `ar_oneshot`'s *device* time grew 11.9%, its p90 on the
+waiting cards went 36.6 -> 140.3 us, and that absorbed 76% of the kernel saving. Untraced the absorption
+is arithmetically absent - the wall gain (0.475 ms/token) is 83% of the traced kernel saving (0.572
+ms/token), where a surviving absorption would have left +0.55% instead of +1.9%.
+
+So an attached profiler can change the *sign* of a cross-arm comparison, not just the absolute level. It
+did it here by perturbing the allreduce's arrival skew, i.e. a barrier tail. Two consequences: any wall
+claim from a traced run needs an untraced confirmation of the same arms, and a *device-time* saving does
+not imply a wall saving when a barrier's wait tail moves with it.
+
 ### Phase buckets
 
 Every region additionally accumulates a per-phase split. The label is a sticky thread-local set when

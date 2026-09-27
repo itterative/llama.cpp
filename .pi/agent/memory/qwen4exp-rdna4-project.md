@@ -124,12 +124,14 @@ bf16 hc rows, 1.12-1.13x on the tiny rows, and *inert* where DRAM-bound (k=65536
 1.00x), with 1297/1297 MUL_MAT and PPL inside 5e-7. **On the 4-card box that lever wins at the kernel
 level and loses at the system level**: off the trace, `MMVF_K_UNROLL=4` cut mmvf device time 21.8%
 (router 27.64 -> 24.24 us, `hc_*_inject` 5.83 -> 2.41 = 2.42x, `ssm` 1.41x, one-row calls 1.46x;
-`indexer.q_proj` is the one regression at 0.97x), but `ar_oneshot` grew 11.9% - the waiting cards' p90
-went 36.6 -> 140.3 us, concentrated in 6 of the 96 collectives per step - so **76% of the saving came
-back as spin**, the host's launch span grew 12% while its drain span halved, and the profiled wall ended
-1.4-2% worse. **The allreduce is the absorber: while the barrier's wait tail is unaddressed, kernel work
-in this group is worth less than the comms thread.** E062 (planned) settles whether the tail survives
-without the profiler and without `GGML_CUDA_AR_ONESHOT_PROBE=1`, which all of E061's arms had set.
+`indexer.q_proj` is the one regression at 0.97x). **Under the tracer** that saving is 76% absorbed by the
+allreduce's wait tail (`ar_oneshot` +11.9%, the waiting cards' p90 36.6 -> 140.3 us, concentrated in 6 of
+the 96 collectives per step) and the traced wall reads 1.4-2% worse - **but untraced, E062's re-runs of the
+same arms measure +1.92%/+2.04% tg and -1.86%/-1.97% on the host launch+drain total, and the absorption is
+arithmetically gone** (0.475 of 0.572 ms/token = 83% conversion; a surviving 0.433 ms would have left
++0.55%). So the loss was an artifact of `rocprofv3`, which perturbs the allreduce's arrival skew - a tracer
+can invert a relative result, see `experiment-protocol`. What is left is one paired `-r 10` run (E062) to
+turn +2% into a protocol-grade number, then the default can flip to `MMVF_K_UNROLL=4` gated to RDNA4.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness

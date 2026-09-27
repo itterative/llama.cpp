@@ -705,10 +705,11 @@ question is closed by E056, H9's correctness under mrope by E057.
   `ar_oneshot` +11.9%, agent 1's p90 wait 36.6 -> 140.3 us, so 76% of the saving returns as spin
   and the profiled wall ends 1.4-2% worse. The knob stays in the tree as the instrument for the
   collective work.
-- **One open sub-question:** all three arms ran with `GGML_CUDA_AR_ONESHOT_PROBE=1`, which E059's
-  A/B did not set. An unprofiled, interleaved U=1 vs U=4 at `-r >= 10` settles whether the wait
-  tail is a probe artifact (device accounting then predicts -0.14 ms/step, -0.5% tg) or real
-  (+1.5% of loss). Registered as E062 in [../INDEX.md](../INDEX.md).
+- **Answered on the wall:** untraced, the same two arms measure +2.04% / +1.92% tg and -1.97% /
+  -1.86% on the host launch+drain total, and the traced absorption is arithmetically gone (0.475 of
+  0.572 ms/token = 83% conversion; a surviving absorption would have left +0.55%). So the loss was
+  the tracer, not the change. What is left is precision: E062's paired `-r 10` run, which is the
+  gate for a default flip to `MMVF_K_UNROLL=4` (gated to RDNA4).
 
 
 ### H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step
@@ -725,14 +726,18 @@ question is closed by E056, H9's correctness under mrope by E057.
 ## Next runs (mostly flag-only, bench box)
 
 
-### H25 - what makes 6 of the 96 collectives per step wait 140 us
+### H25 - what makes 6 of the 96 collectives per step wait 140 us *under a tracer*
 
-- E061 measured the allreduce's p90 on the waiting cards explode from 36.6 to 140.3 us once the
+- Under `rocprofv3`, E061's allreduce p90 on the waiting cards went 36.6 -> 140.3 us once the
   compute phases got shorter, and the extra wait is not uniform: it sits on collective indices 6,
-  22, 38, 54, 70 and 86 of each step - every 8th layer, first collective. Which six those are is
-  not explained by E059 or E061, and the comms plan is the natural home for it. If it is a launch
-  order or rank-skew artifact it is fixable, and it is worth 0.433 ms/step per card (3% of device
-  time) every time the compute phases shrink.
+  22, 38, 54, 70 and 86 of each step - every 8th layer, first collective. **Untraced, the same
+  regime does not reproduce**: the wall gain converts 83% of the kernel saving, which caps any
+  untraced tail growth at ~0.1 ms/step against the traced 0.433.
+- So this is a *measurement-regime* item, not a production priority: whoever runs a traced A/B and
+  sees the wall go the other way should look here first (see the protocol memory's "a tracer can
+  invert a relative result"). Worth one experiment only if the traced instrument is going to be used
+  for wall claims again; the comms plan is not affected, since the collective's own 23% of device
+  time and its ~19 us per exchange stand on their own.
 
 ### ~~E007 - drop `-ot per_layer_token_embd=CPU`~~ killed by the user, confirmed in code
 

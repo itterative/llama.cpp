@@ -3,7 +3,7 @@
 - date: -
 - machine: bench-4x-r9700-32g
 - tier: T2 (manual, short)
-- status: planned
+- status: open (untraced runs done, sign positive; the paired -r 10 is the last gate)
 - parent: E061
 - commit: as E061; the arms differ only by `#define MMVF_K_UNROLL 1|4`
 - build: one TU rebuild per arm, as in E061
@@ -49,4 +49,37 @@ is unaddressed, which is exactly the conclusion H25 is about.
 
 ## results
 
-To be filled when it runs.
+**The wall question is answered in the change's favour; the precision is not yet protocol-grade.**
+Three untraced runs (`u1/u2/u4-noprof.log` in the parent raw dir - no `rocprofv3`, but
+`GGML_PROF_REGIONS=1` and the roctx window still on):
+
+| arm | tg128 @ d16384 | host launch+drain ms/token | `meta:allreduce` host span ms/token |
+| --- | --- | --- | --- |
+| u1 | 39.65 +/- 2.31 | 16.9605 | 0.7630 |
+| u2 | **40.46 +/- 2.39** (+2.04%) | 16.6956 (-1.97%) | 0.7756 (+1.65%) |
+| u4 | **40.41 +/- 2.36** (+1.92%) | 16.5241 (-1.86%) | 0.7657 (+0.35%) |
+
+Against the traced runs of the same arms (-1.8% tg, allreduce device time +11.9% absorbing 76% of
+the kernel saving), this inverts the sign and the absorption is arithmetically gone: the wall gain
+is 0.475 ms/token against a traced kernel saving of 0.572 ms/step/card, i.e. 83% conversion, where
+a surviving 0.433 ms of absorption would have left +0.55%. So the tracer, not the change, was
+producing the loss.
+
+Not covered by these runs, and the reason this record stays open:
+
+- `-r 3`, sequential, arm order not recorded in the logs (the file mtimes are 6-7 s apart, so they
+  were copied or written at the end). Each mean carries ~1.3 SE, the difference ~1.9, on a ~2%
+  effect. E059's own bench noise at this depth is 6-8% per depth, so a 2% delta needs the paired
+  instrument this record asked for.
+- The untraced logs do not echo the environment, so whether these arms carried
+  `GGML_CUDA_AR_ONESHOT_PROBE=1` (as the traced ones did) is unknown. Set it explicitly, and unset
+  it for at least one pass.
+
+Remaining run: `for pass in 1 2; do for arm in 0 4; do ...; done; done` with `-r 10`, no tracer, and
+record the `.so` md5s. If the paired delta holds at >= +1%, the default flip to `MMVF_K_UNROLL=4`
+(gated to RDNA4) is justified.
+
+### Left open (from the parent record, still true)
+
+- The default is still 1. The pair of runs above says the unroll does not lose the wall; the paired
+  `-r 10` says by how much it wins.
