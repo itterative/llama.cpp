@@ -104,7 +104,7 @@ end-to-end arms, 3 PPL arms, the case generator, the sweep and the parser; the r
 files are untracked, as in E059, because `.gitignore` has `*.log` - the sweep and the PPL commands
 regenerate them in ~2 minutes).
 
-### 1. The op-level harness measures exactly these rows L2-warm, by 3.3-3.8x
+### 1. The op-level harness measures exactly these rows cache-resident, by 3.3-3.8x
 
 `test_generic_op` re-reads one working set: the router case ran 143,858 times against the
 same 5.24 MB tensor, which fits the 8 MB L2. The bench trace reads that tensor once per
@@ -121,11 +121,79 @@ step behind ~1.5 GB of other traffic. Same shapes, both instruments:
 | f32 2560 x 12 (ssm_alpha/beta) | 3.57 | 2.46 | 1.45 | 123 KB |
 | f32 2560 x 1 | 3.55 | 2.22 | 1.60 | 10 KB |
 
-So the L2-sized rows are measured 3.3-3.8x too fast, and the tiny-m rows 1.45-1.60x too
+So the cache-sized rows are measured 3.3-3.8x too fast, and the tiny-m rows 1.45-1.60x too
 slow (this box has a higher launch/tail floor). The two rows that matter - router plus
 indexer.q_proj, 1.62 of the group's 2.61 ms/step - are both in the first category. Every
-arm below is therefore L2-warm data, and E059's caveat about this harness is now measured
-rather than assumed.
+arm below is therefore cache-warm data, and E059's caveat about this harness is now
+measured rather than assumed.
+
+### 1b. The cache that matters is the 64 MB Infinity Cache, not the 8 MB L2
+
+Sweeping m at k = 2560 f32 (one row per block, so the grid grows with m) brackets the
+level: the effective rate keeps *rising* to 1396 GB/s, well past the 640 GB/s DRAM peak,
+and then falls off a cliff at 64 MB.
+
+| m | weight | us | effective GB/s |
+| --- | --- | --- | --- |
+| 1024 | 10.5 MB | 11.04 | 950 |
+| 2048 | 21.0 MB | 18.07 | 1161 |
+| 4096 | 41.9 MB | 31.59 | 1328 |
+| 5120 | 52.4 MB | 38.23 | 1371 |
+| 6144 | 62.9 MB | 45.07 | **1396** |
+| 7168 | 73.4 MB | 110.78 | 663 |
+| 8192 | 83.9 MB | 134.42 | 624 |
+
+So the trap is wider than "small cases": *every* per-tensor read in the model is under
+64 MB (the largest, the Q6_K lm head at 130 MB/card, is the one row whose op-level rate
+agreed with the bench - 577 GB/s there, DRAM-bound by construction). The earlier note about
+this box's "8 MB L2" is the L2; the level that decides whether an op-level number means
+anything is the MALL.
+
+### 1c. Can the harness be made cold? Three walls, and what they leave
+
+Tried, in order of increasing fidelity:
+
+1. **Grow m until the weight exceeds the cache.** Works for the cache bracket, but it
+   changes the shape: m = 512 with a cold weight cannot be built, because the weight is
+   `k * m * 4` and m is fixed by the model.
+2. **Batch dim on ne2**, so one node reads B distinct slices (the only lever the case file
+   has). This does read cold (B = 16 x 5.24 = 84 MB) but the grid becomes (m, B) blocks, so
+   the B slices run concurrently and land in the DRAM-bound regime: 8.34 us per slice at
+   629 GB/s, against the bench's 27.37 us for the same slice. Useful as a *floor*, not as a
+   reproduction.
+3. **Rotate the source pointer between iterations.** `test_case::reinit_perf_iter` is called
+   once per `ggml_backend_graph_compute`, while `eval_perf` adds the *same node* to the graph
+   `min(avail, 32 GB / op_size) + 1` times per call - 6103 repeats for the router - so a
+   rotation moves the address once per 6103 dispatches. Dead end by construction.
+
+The faithful instrument for a sub-64 MB tensor is therefore a model at streaming scale:
+the bench decode window (already built), or a model-level dev-box run, which needs a
+per-kernel timing path the dev box does not have (`rocprofv3` is absent; `GGML_PROF_REGIONS`
+spans are host time and must not be read as device time).
+
+### 1d. What the cold probes did settle: the router is bytes-in-flight bound
+
+The probes keep the bench's own geometry (one row per block, 512 blocks) and grow k, which
+adds independent iterations per thread:
+
+| k, m = 512 | weight | us | GB/s |
+| --- | --- | --- | --- |
+| 2560 | 5.2 MB | 7.19 | 729 (cache) |
+| 8192 | 16.8 MB | 15.26 | 1099 (cache) |
+| 16384 | 33.5 MB | 23.89 | 1405 (cache) |
+| 32768 | 67 MB | 51.42 | 1305 (cache edge) |
+| 65536 | 134 MB | 219.31 | **612 (DRAM)** |
+
+512 blocks *can* saturate DRAM (612 GB/s at k = 65536) - the block-count theory of the
+router's 27.37 us is dead. Note the screening consequence: the cache-resident m = 512 case
+(7.19 us) is latency-bound on the *same* limit - 5 loads per thread - so a change that gives
+each thread more independent work should move it here, before the bench is asked to confirm
+the cold number. What the router lacks is independent work per thread: 5 float2
+loads at k = 2560 against 128 iterations at k = 65536, with the same bytes and the same
+grid. That is why the cold block-size sweep is inert where it matters: in the DRAM-bound cases
+bs32/bs64/bs128/bs256 move it by 3% or less, with one 13% outlier at bs128 (k = 65536:
+219.3 / 219.3 / 233.3 / 248.3 / 219.3 us; the B=16 router batch stays inside 2%), while the
+same knob still wrecks the tiny rows (inject 6.37 -> 16.95 us at bs64).
 
 ### 2. The hypothesis is refuted where the instrument can see it
 
@@ -193,12 +261,18 @@ the strides collapse, and the case aborts in rocBLAS with `invalid configuration
 ### 6. What is left
 
 - The mmvf group is 2.61 ms/step (18% of device time): router 1.33, inject 0.57, indexer.q
-  0.29, everything else ~0.42. The router and indexer.q rows are DRAM-latency-bound cold
-  (5.24 MB in 27.37 us = 190 GB/s with a perfectly coalesced pattern); the other 200+ calls
-  sit on a ~3.5 us launch/tail floor while moving 10-655 KB.
-- Follow-up needs a *shape-keyed* override (the m = 512 rows only) and a cold instrument:
-  either a bench decode window with device time, or a harness variant that rotates the
-  weight buffer per iteration. T1 op-level numbers cannot settle it. Bound if it transfers:
-  0.2-0.4 ms/step, 1.5-3% of device time.
-- The launch floor argues for the opposite change: fewer launches. 96 `hc_*_inject` calls at
-  5.8 us and 72 `ssm_*` calls at 2.5 us per step are per-call overhead, not bandwidth.
+  0.29, everything else ~0.42. The block-size lever is dead in both regimes - per-row optima
+exist only cache-warm, and the cold sweep is inert. What survives is the mechanism:
+  the router row is DRAM-latency-bound at ~5 independent loads per thread (190 GB/s), and
+  the same bytes at the same 512-block grid reach 612 GB/s once each thread has enough
+  independent work. The cold batched proxy puts the prize at 8.34 us per slice against
+  27.37, i.e. **~0.9 ms/step (6% of device time) if 48 routers could be issued with that
+  much concurrency**, and the lever is more independent work per thread, not a different
+  block size: register-blocked rows per thread, float4 instead of float2 loads, or a K-split
+  across 2-4 blocks.
+- The other 200+ calls sit on a ~3.5 us launch/tail floor while moving 10-655 KB, so the
+  opposite change is also live: fewer launches (fuse the 96 `hc_*_inject` and 72 `ssm_*`
+  calls per step, H24).
+- Instrument lesson for the rest of the project: an op-level number for a tensor under
+  64 MB describes the MALL, not DRAM, and the harness cannot be forced out of it. Use the
+  bench decode window for those rows.
