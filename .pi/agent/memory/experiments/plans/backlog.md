@@ -11,7 +11,7 @@ Format: one item per `###` heading, `id - question`, with the fields as bolded l
 struck-through id means the thread is answered or dead; the answer stays inline, because these notes
 are why later experiments were scoped the way they were.
 
-**Live right now:** H20/H21/H22 (what E057's fix left open: the pool never engages for a session with
+**Live right now:** H23/H24 (E060's survivors - a shape-keyed mmvf block size for the two L2-sized rows, and the launch floor on the 170+ tiny mmvf calls), H20/H21/H22 (what E057's fix left open: the pool never engages for a session with
 an image, `qsa_pool_get` promises more than the fast path verifies, and whether the vision path pays
 H19's ratchet), H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
 with the pool off), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated),
@@ -697,6 +697,26 @@ question is closed by E056, H9's correctness under mrope by E057.
 - **Why it matters:** on 4 cards a re-reserve measured ~300 ms, so the same 20 events per 7.5k cells
   would be ~6 s per turn of vision chat. Decide with `GGML_PROF_REGIONS=1` plus wall time on one
   real 3-image conversation, not with more local reps.
+
+### H23 - a shape-keyed mmvf block size for the two L2-sized rows, measured cold
+
+- **Open question from E060.** A blanket override loses (bs64 -4.0%, bs96 -1.5% end-to-end on the
+  dummy), but the per-row table says the two rows that carry 1.62 of the group's 2.61 ms/step want
+  bs96: ffn_gate_inp (f32 2560 x 512, 5.24 MB, 1.33 ms/step) and indexer.q_proj (bf16 2560 x 512,
+  2.62 MB, 0.29). Bound if it transfers: 0.2-0.4 ms/step, 1.5-3% of device time.
+- **Why it needs new instrument work:** the op-level harness re-reads one working set, and those two
+  weights fit the 8 MB L2, so it measured them 3.3-3.8x faster than the bench's decode window did
+  (7.33 vs 27.37 us and 7.89 vs 23.69). Either read it from a bench decode window with device time,
+  or make the harness rotate the weight buffer per iteration.
+
+### H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step
+
+- 96 `hc_*_inject` (bf16 10240 x 4, 82 KB) at 5.8 us and 72 `ssm_alpha`/`ssm_beta` (f32 2560 x 12,
+  123 KB) at 2.5 us, plus 48 one-row f32 calls at 2.2 us: ~0.85 ms/step of the mmvf group's 2.61,
+  and E060's block-size arms cannot move them (bs32 equals the heuristic, everything else is worse).
+  The lever is fewer launches - fuse the per-layer tiny matvecs - not the block shape.
+- Judge it on dispatch count and device time per step, per E059's finding that 63% of kernels are
+  under 2 us and the host slack tracks dispatch *count*.
 
 ---
 

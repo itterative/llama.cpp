@@ -110,7 +110,11 @@ threads as first-guess `tg` bottlenecks. **All three are since closed.** L1/L2 b
 compulsory first touches of a 133 MB working set, no cache of any placement helps, and a WILLNEED
 prefetch over the 16 distinct 110 B rows a step reads gave +4.2% tg. L3 by E059: routing was always
 fine, mmvq simply could not fill its own blocks at narrow K, and sizing nwarps by K width gave
-+3.7..4.7% tg.
++3.7..4.7% tg. **E060 is negative for the same class of fix on the f32 side**: `mul_mat_vec_f`'s
+`niter` block-size heuristic is near-optimal in aggregate (smaller blocks are 1.7-2.7x worse at
+m <= 128, and a blanket override loses 1.5-4% end-to-end on the dummy) even though per-row optima are
+1.2-1.7x; its 2.61 ms/step per card is 1.62 in the two DRAM-latency-bound rows (f32 router 1.33,
+indexer.q_proj 0.29) plus ~0.85 on the launch floor of 170+ tiny calls per step - H23/H24.
 
 Run ledger: **E001** (B1 closed on the old stack: ops pass, dummy models generate, the graph
 runs on `ROCm0`, `test-fusion` is Metal-only), **E002 dead-end** (19 MB synthetic measures harness
