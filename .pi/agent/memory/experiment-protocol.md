@@ -114,16 +114,32 @@ the external tool.** The dev box has no roctx SDK and no rocprofv3, so `regions 
 correct output here, not a failure.
 
 Live regions: `graph:build`, `graph:alloc`, `graph:set_inputs`, `graph:compute` (llama-context),
+`graph:reuse` (the reuse test), `mctx:apply` (hybrid / QSA memory context apply),
 `meta:subgraph`, `meta:allreduce` (tensor/row split dispatch), `spec:draft_decode` (draft-mtp),
-`ckpt:save_tgt`, `ckpt:load_tgt` (the rollback door), `phase:decode` (`0f641cc1b`).
+`ckpt:save_tgt`, `ckpt:load_tgt` (the rollback door), `phase:decode`, `phase:prefill`, `phase:sync`
+(the drain inside `llama_context::synchronize`), `phase:encode`.
+
+`phase:encode` fires only for encoder archs (T5, LLADA, DREAM, RND1) and the `common_init` warmup. It
+does **not** cover the mtmd vision tower: `mtmd_encode_impl` (`tools/mtmd/mtmd.cpp:1774`) runs on
+`clip_ctx` and never enters `llama_encode`, so image turns show up as no region at all.
+
+### Phase buckets
+
+Every region additionally accumulates a per-phase split. The label is a sticky thread-local set when
+`llama_context::decode` classifies a batch, so work *between* calls - the sampler's sync, the logits
+read - is attributed to the phase that produced it. A region that saw more than one phase prints a
+second line with per-phase calls and ms, because `ms/call` across mixed batches means nothing: local
+dummy `graph:compute` is 38.8 ms/call at pp against 1.45 ms/call at tg. min and max stay across phases.
+Counters are not bucketed, so use `tok:decode` / `tok:prefill` (tokens added per phase) to normalize.
 
 ### Capturing decode only
 
-`GGML_PROF_DECODE=<max n_tokens counted as decode>` opens a capture window (`roctxProfilerResume` /
-`Pause`) on the first batch at or below that width and closes it on the next wider batch or at exit, so a
-whole-turn trace carries decode kernels and nothing from the prompt pass. It also brackets a
-`phase:decode` region, which reports per-step decode wall time at exit with no profiler attached at all -
-often enough on its own, and the thing to reach for before fighting rocprofv3.
+The phase regions are on with plain `GGML_PROF_REGIONS=1`: a batch of at most `GGML_PROF_DECODE` tokens
+is decode, a wider one is prefill, and the limit defaults to 1 (the same test the code uses for
+`graph_compute(..., ubatch.n_tokens > 1)`). `GGML_PROF_DECODE` *also* opens a capture window
+(`roctxProfilerResume` / `Pause`) on the first decode batch and closes it on the next wider batch or at
+exit, so a whole-turn trace carries decode kernels and nothing from the prompt pass. The window stays
+opt-in because resume/pause decides what `--selected-regions` records; the regions do not.
 
 - plain decode: `GGML_PROF_DECODE=1`
 - **speculative decode: `n_draft + 1`, not 1.** A verify pass wider than the limit closes the window and
