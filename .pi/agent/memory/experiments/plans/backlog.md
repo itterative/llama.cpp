@@ -712,12 +712,14 @@ question is closed by E056, H9's correctness under mrope by E057.
   gate for a default flip to `MMVF_K_UNROLL=4` (gated to RDNA4).
 
 
-### H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step
+### ~~H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step~~ mostly closed by E061: they were ILP-bound
 
-- 96 `hc_*_inject` (bf16 10240 x 4, 82 KB) at 5.8 us and 72 `ssm_alpha`/`ssm_beta` (f32 2560 x 12,
-  123 KB) at 2.5 us, plus 48 one-row f32 calls at 2.2 us: ~0.85 ms/step of the mmvf group's 2.61,
-  and E060's block-size arms cannot move them (bs32 equals the heuristic, everything else is worse).
-  The lever is fewer launches - fuse the per-layer tiny matvecs - not the block shape.
+- The same calls were not launch-bound: with `MMVF_K_UNROLL=4`, `hc_*_inject` (96/step) went
+  5.83 -> 2.41 us (2.42x), the `ssm` pair (72/step) 2.45 -> 1.74 (1.41x) and the one-row f32 calls
+  (48/step) 2.23 -> 1.53 (1.46x). E060's block-size arms could not move them because the lever was
+  never the launch path.
+- So "fuse the per-layer tiny matvecs" is demoted: that 0.85 ms/step of mmvf time is now ~0.4, and
+  what is left is the dispatch count itself, which E059 already parked.
 - Judge it on dispatch count and device time per step, per E059's finding that 63% of kernels are
   under 2 us and the host slack tracks dispatch *count*.
 

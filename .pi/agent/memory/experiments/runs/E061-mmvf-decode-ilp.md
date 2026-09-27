@@ -242,11 +242,28 @@ K accumulation as predicted. Dummy `q4exp-4l -d 4096 -n 128 -r 5`, two interleav
 U=1 263.48 / 262.50, U=4 265.58 / 265.36 = **+0.94% paired** - the dev box said yes, the
 4-card bench said no, which is exactly the transfer risk E060's instrument work was about.
 
-### 7. Left open
+### 7. The flip
 
-- **The paired confirmation (E062).** Untraced `-r 3` runs already flipped the sign to
-  +1.9-2.0%; one interleaved U=1 vs U=4 run at `-r >= 10` turns that into a protocol-grade number
-  and is the last gate before a default flip.
+`MMVF_K_UNROLL` now defaults to **4 on gfx12 only** (`__gfx1200__`/`__gfx1201__` in the device
+pass; every other target keeps 1, and `if constexpr` means the unrolled body is not even compiled
+there). Verified on the dev box: the compiler report gives the f32 decode instantiation 25 VGPRs on
+gfx1201 and 12 on gfx1100, forcing `MMVF_K_UNROLL=1` restores 12 on gfx1201, the golden PPL moves
+to the U=4 value (263113.4044 from 263113.6984) and the dummy sits at the U=4 arm's throughput
+(266.4 t/s mean over two passes, against 265.5 for the U=4 arm and 263.0 for U=1 in section 6).
+
+**Comparability:** a pre-flip bench number is not comparable unless `MMVF_K_UNROLL=1` is set -
+the same trap as E055's small_k flip and E056's pool flip. This is the branch's first default flip
+resting on a ~2% effect, so the paired run below is owed rather than a formality.
+
+Cost: gfx12 builds now instantiate the unrolled f32 and bf16 decode kernels (~32 extra). Same
+objection E059's record raises about the mmvq narrow kernels; a default flip is where it starts to
+matter.
+
+### 8. Left open
+
+- **The paired confirmation (E062).** Untraced `-r 3` runs flipped the sign to +1.9-2.0%; one
+  interleaved U=1 vs U=4 run at `-r >= 10` turns that into a protocol-grade number. If it comes
+  back at or below zero, revert the flip.
 - **A shape guard for `indexer.q_proj`** if the unroll is ever revisited: bf16 2560 x 512 with
   12 calls/step regresses at both U=2 and U=4, and nothing else in the group does.
 - Non-RDNA4 builds instantiate the unrolled kernels too. They are only reachable when
