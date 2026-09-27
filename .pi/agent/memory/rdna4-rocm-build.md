@@ -363,6 +363,26 @@ as experienced expectation, not verified behaviour.
 
 ## Traps
 
+- **Bench-box decode for this model has three pathological steps** `[v]` (E059, both arms, identical
+  indices): steps 1, 3 and 258 of the 385-step `-r 3` tg128 run take 989 / 526 / 675 ms against a 22.6 ms
+  median. That is **19% of the decode window in 3 of 385 steps, ~5.5 ms/token of inflation on every t/s
+  figure ever recorded on this box for this model**. It cancels in an A/B only because it hits both arms,
+  so it corrupts cross-experiment comparisons far more than paired ones. Step 1's is a single 598 ms
+  `meta:subgraph`; suspected first-touch faults on the 133 MB n-gram table (E058's compulsory misses),
+  not measured. Trim or median-filter before quoting t/s.
+- **rocprofv3 traces: three parsing traps** `[v]`. (1) `Kernel_Name` contains commas, so positional `$N`
+  in awk is wrong - index with `$(NF-k)` from the end. (2) mmvq's block is **2D**, `Workgroup_Size_X` is
+  `warp_size` (32 on gfx1201, confirming wave32) and nwarps is `Workgroup_Size_Y`; reading only `_X` makes
+  every kernel look 1-warp. (3) **Never compute wall exposure from a profiled run** - interception costs
+  ~0.7 us per dispatch and decode issues 3,616 per card per step, i.e. ~2.5 ms/step, which makes the run
+  host-bound and absorbs device-side savings (E059: +1.5% profiled against +4.2% real for the same
+  change). Use the trace for mechanism and `kernel_trace.csv` per-agent busy time for device totals; use
+  an unprofiled llama-bench for wall. The traces also hold far more than `kernel_stats.csv`: all four GPUs
+  in one file under `Agent 1..4` on a common clock (so cross-rank skew is measurable), plus
+  `Scratch_Size`, `LDS_Block_Size`, `VGPR_Count`, `SGPR_Count`, grid/block geometry, and a joinable
+  `Correlation_Id`; `marker_api_stats.csv` gives llama.cpp's own nested host ranges (`phase:decode`,
+  `graph:compute`, `meta:subgraph`, `meta:allreduce`, `input:lazy_*`).
+
 - **`docs/ops.md` and `docs/ops/*.csv` are stale and wrong for these ops** `[s]`: they mark
   `DSV4_HC_*` as unsupported on CUDA and Metal while the kernels exist, and `CUDA.csv` has no
   rows at all for `DSV4_HC*`/`GATED_DELTA_NET`/`LIGHTNING_INDEXER`/`TOPK`. Generated snapshot

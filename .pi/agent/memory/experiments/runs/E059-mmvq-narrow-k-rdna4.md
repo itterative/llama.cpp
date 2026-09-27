@@ -224,7 +224,8 @@ on E055's small_k.
 **Protocol note.** The effect is under 5% and the arms were sequential `-r 3`, not the alternating
 `-r >= 10` the protocol requires at that size. What substitutes for it is the mechanism check the
 protocol prefers over more reps: an independent device-time accounting that predicts the wall gain.
-It does, to within 24%.
+It does: 1.35 ms of device time removed per card per step against 1.13-1.26 ms of wall gained, so
+84-93% of it is exposed.
 
 ### The trace accounting
 
@@ -259,18 +260,28 @@ the optimized arm:
 | Q6_K fused, narrow=0 | 24 | 6.98 | 6.88 | untouched |
 | Q4_K, small_k=0, narrow=0 | 96 | 4.79 | 4.63 | untouched |
 
-Totals:
+Totals from `kernel_stats.csv`, summed over all four agents:
 
 | | baseline | optimized | ratio | saved |
 |---|---|---|---|---|
 | `mul_mat_vec_q` | 8794.8 ms | 6702.9 ms | **1.312x** | 2091.9 ms |
 | all listed device time | 24,663.3 ms | 22,286.4 ms | 1.107x | 2376.9 ms |
-| per card per step | 16.02 ms | 14.47 ms | | **1.55 ms** |
+
+The authoritative version is straight off `kernel_trace.csv` filtered to `Agent 1` and summed as
+`End_Timestamp - Start_Timestamp`: **15.99 -> 14.64 ms per card per step, saving 1.35 ms (-8.4%)**,
+against the 16.02 -> 14.47 / 1.55 ms the aggregate table implies. The ~1% gap is rows the stats
+aggregate counts that the per-agent filter does not; use the raw-trace figure.
 
 **Reconciliation with the wall.** tg improved by 1.13 / 1.26 / 1.18 / 1.13 ms per token at the four
-depths, against 1.55 ms per card per step of device time removed: **~76% of the saving is exposed**,
-so it was on the critical path and not hidden behind overlap. Two independent measurements agreeing
-is the stronger half of this record.
+depths against 1.35 ms per card per step of device time removed, so **84 / 93 / 87 / 84% of the saving
+reaches the wall**. Two independent measurements agreeing is the stronger half of this record.
+
+The same comparison *inside* the profiled run gives only 26%: `phase:decode` trimmed of its three stall
+steps is 23.96 -> 23.61 ms per step. That is dilution, not a contradiction. rocprofv3 intercepts every
+dispatch, and at 3,616 dispatches per card per step it adds ~2.51 ms per step (23.61 profiled against
+~21.1 unprofiled and stall-free), which is 3,616 x 0.7 us to within 1%. Launches are async, so once the
+host is the binding constraint a device-side saving is absorbed into host slack rather than shortening
+the step. Use the unprofiled wall for exposure and the profiled trace for mechanism.
 
 The Q6_K exclusion is validated on the real model: 64 calls per card per step across `attn_qkv`,
 `attn_q`, the shared-expert gate/up and `output.weight`, all untouched.
@@ -284,9 +295,76 @@ The Q6_K exclusion is validated on the real model: 64 calls per card per step ac
 | `mul_mat_vec_f` (f32/bf16) | 4014.9 | **18.0%** | 2.61 ms |
 | `quantize_q8_1` | 893.3 | 4.0% | 0.58 ms |
 
-Device busy fraction is 14.47 ms per card per step against a ~26.6 ms token wall at d4096 = **54%**,
-so ~46% of the wall is host-side or gaps - consistent with the `meta:subgraph` 5.4 ms/token measured
-in E058 and deliberately left alone.
+Device busy is 14.64 ms per card per step (raw trace, Agent 1). Against the reported 26.6 ms/token wall
+at d4096 that is 55%; against a stall-free wall of ~21.1 ms - the reported figure minus the ~5.5 ms/token
+the three pathological steps contribute - it is **69%**. So the host-side share is 31-45% depending on
+which wall is used, and it stays deliberately parked. Note `meta:subgraph`'s 21.2 ms/step is *not*
+additive cost: it is the span that overlaps device execution, which is why it is not comparable to
+E058's 5.4 ms/token.
+
+## Re-analysis of the raw traces (after the first commit)
+
+The first pass read only `kernel_stats.csv`. The profile directory holds four more file kinds, and
+`kernel_trace.csv` carries per-dispatch launch geometry and resource use: `Workgroup_Size_X/Y`,
+`Grid_Size_X/Y`, `VGPR_Count`, `SGPR_Count`, `Scratch_Size`, `LDS_Block_Size`. Two traps: the name field
+contains commas so positional `$N` indexing is wrong and `$(NF-k)` from the end is required, and the block
+is **2D** - `Workgroup_Size_X` alone reads as 32 for every kernel and hides nwarps, which is in `_Y`.
+All four GPUs are in the **one** file (`Agent 1..4`, 1,392,129 dispatches each, common monotonic clock),
+which makes cross-rank skew measurable.
+
+**The narrow rule fired exactly as designed**, now from launch geometry rather than template args:
+
+| template `narrow` | observed block | types seen |
+|---|---|---|
+| 1 | 32x1 = **32 threads** | q5_0, q8_0 |
+| 2 | 32x2 = **64 threads** | q5_0, q8_0, q4_K, q5_K |
+| 0 | 32x8 = **256 threads** | q8_0, q4_K, **q6_K** |
+
+`Workgroup_Size_X = 32` everywhere confirms wave32 on gfx1201, so the "10 of 256 threads" figure in the
+mechanism section is right. **q6_K appears only ever at narrow=0**, the exclusion verified empirically
+rather than inferred. `Scratch_Size = 0` on every mmvq row and `LDS_Block_Size <= 7168` of the 64 KB
+available, so no shipped config spills; VGPR use is 16-56.
+
+Dispatch count is **identical in both arms, 1,392,129 per card**, alongside the 799,260 matvec control:
+the change alters block shape and nothing else about the work submitted.
+
+### Three pathological steps, equal in both arms
+
+`phase:decode` is not unimodal. At identical step indices in both arms:
+
+| step | baseline | optimized |
+|---|---|---|
+| 1 | 989 ms | 1040 ms |
+| 3 | 526 ms | 527 ms |
+| 258 | 675 ms | 670 ms |
+
+385 steps = 3 x 128 + 1, so this is the `-r 3` tg128 run. Those three steps are 2.1 s of an 11.3 s
+window: **19% of decode wall in 3 of 385 steps**. They cancel in this A/B only because they hit both
+arms. Step 1's is a single 598 ms `meta:subgraph`; step 258's has no matching subgraph outlier. Median
+per step is 22.6 / 22.1 ms and p95 is 27.2 / 26.2, so the rest of the distribution is tight.
+
+Hypothesis, not measured: first-touch page faults on the 133 MB n-gram table, i.e. E058's compulsory
+misses arriving as one giant step. **Every llama-bench t/s recorded for this model on the bench box
+carries roughly 5.5 ms/token of this inflation**, which matters for cross-experiment comparisons more
+than for A/Bs.
+
+### The host slack is dispatch count, not one slow range
+
+Agent 1 kernel durations: p50 **1.4 us**, p90 8.4, p99 27.7, p99.9 224.5, max 15.66 ms. **63% of all
+kernels are under 2 us** - about 2,285 of the 3,616 dispatches per card per step - holding 18% of device
+time. So the 31-45% host slack is per-dispatch overhead from kernel *count*, not a mysterious range. The
+lever is fewer launches, not faster kernels.
+
+`marker_api_stats.csv` quantifies the host side directly (nested ranges, so shares do not sum):
+`phase:decode` 29.24 ms/step mean, `graph:compute` 27.74 ms = 94.9% of it, `meta:subgraph` 37,345 calls
+= **97 per step** at 21.2 ms/step, `meta:allreduce` 36,960 = 96 per step at **1.71 ms of host time
+against 3.36 ms of `ar_oneshot` device time**, so the collective is roughly half host-bound. E058's input
+path on the bench box: `graph:set_inputs` 858 us/token, `input:lazy_gather` 716 us, `lazy:prefetch`
+182 us, and `input:lazy_h2d` / `lazy_staging` / `lazy:sort` all under 3 us, which closes E058's open
+question about those three.
+
+`agent_info.csv` gives the R9700 limits for occupancy arguments: 64 CU, 2 SIMD/CU, 16 max waves/SIMD,
+64 KB LDS, wave32 and wave64 both available, `Workgroup_Max_Size` 1024.
 
 ## What the GGUF dump corrected
 
@@ -313,6 +391,12 @@ in E058 and deliberately left alone.
 - The bench arms were sequential, not alternating, at `-r 3` with per-depth spread of 6-8%. No single
   depth is significant alone. What carries it is that all four move the same way by 3.7-4.7% and the
   device-time accounting independently predicts the size.
+- The profiled and unprofiled runs disagree on the wall gain: +1.5% trimmed inside the trace against
+  +3.7..4.7% from llama-bench. The reason is understood but not directly measured - ~2.5 ms/step of
+  interception overhead at 3,616 dispatches makes the profiled run host-bound. **Do not compute exposure
+  from a profiled wall.**
+- Three ~0.5-1.0 s stall steps inflate every bench-box t/s figure for this model by ~5.5 ms/token. Equal
+  in both arms here, but any single-run bench-box number carries them.
 - Non-RDNA4 builds instantiate the narrow kernels they will never launch, because `c_narrow_promoted`
   has to hardcode `MMVQ_PARAMETERS_RDNA4` - there is no host-side constexpr for the device table, which
   is exactly why the existing `c_promoted` hardcodes GB10. Roughly 44 extra instantiations for the 11
@@ -326,16 +410,25 @@ Closed: E053's "the ~115 GB/s has to be explained inside mmvq" lead, and backlog
 survives is narrower than "a fifth of peak bandwidth" - the kernel was never bandwidth-limited, it could
 not fill its own blocks, and the kblk=5 case reaches 64 GB/s while fully L2-resident.
 
-Still open, re-ranked by the complete table above:
+Still open, re-ranked by the complete table above and by the trace re-analysis:
 
-1. `ar_oneshot` at 23.3% is now within 7 points of all quantized matvecs combined. The comms thread's
-   three loose ends are worth more than they were.
-2. `mul_mat_vec_f` at 18.0% / 302 calls per card per step. E053 estimated this group at 6.1% from a
+1. **The three pathological decode steps** - 989 / 526 / 675 ms at steps 1, 3 and 258, equal in both arms,
+   19% of the decode window and unexplained. Largest single item by wall share and nothing here touches
+   it. If it is first-touch on the 133 MB n-gram table it connects directly to E058's WILLNEED work, which
+   already buys +4.2% by prefaulting 16 rows per step.
+2. `ar_oneshot` at 23.3% is now within 7 points of all quantized matvecs combined, and is **roughly half
+   host-bound**: 1.71 ms of `meta:allreduce` host time against 3.36 ms of device time per card per step.
+   Cross-rank skew is now measurable too, since all four agents share one trace file on a common clock -
+   that is the direct test of E044's "the LL spin may be waiting out a peer that has not arrived".
+3. `mul_mat_vec_f` at 18.0% / 302 calls per card per step. E053 estimated this group at 6.1% from a
    truncated table; it is three times that and no change here touches it.
-3. `quantize_q8_1` at 4.0%, one launch per matvec, 799,260 of them. `mmvq.cu:1503-1509` does an
+4. **Host dispatch count**, not host dispatch cost: 3,616 dispatches per card per step, 63% of them under
+   2 us, and 31-45% of the wall is host-side or gaps. `meta:subgraph` is 97 spans per step *enclosing*
+   those dispatches, so its 21.2 ms/step is not additive cost and the item is not "5.4 ms of dispatch" as
+   first written. The lever is fewer launches. Parked by the user's call.
+5. `quantize_q8_1` at 4.0%, one launch per matvec, 799,260 of them. `mmvq.cu:1503-1509` does an
    unconditional fresh `ggml_cuda_pool_alloc` plus quantize per call with no memoization on `src1`.
    Smaller in relative terms now, but the mechanism is still there.
-4. `meta:subgraph`, 5.4 ms/token of host dispatch, deliberately parked.
-5. Q8_0 at kblk=80 wants 1 warp by 1.68x (118.00 -> 70.27 us on the dev box), the one wide-K cell that
+6. Q8_0 at kblk=80 wants 1 warp by 1.68x (118.00 -> 70.27 us on the dev box), the one wide-K cell that
    breaks the pattern, and Q8_0 is 90 calls per card per step in the real model. Outside this rule by
    design; worth its own look.
