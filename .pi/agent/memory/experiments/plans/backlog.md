@@ -122,8 +122,16 @@ All four are development work with an already-measured prize, and none needs the
   step per card. The other shapes could add to that; the count above deliberately only claims what the
   builder and the call counts support.
 - **Mechanism** `[v]`: `mmvq.cu:1503-1519` does an unconditional `ggml_cuda_pool_alloc` plus
-  `quantize_row_q8_1_cuda` on every call, and nothing anywhere in the backend memoizes `src1` (the MMQ
-  path in `mmq.cu` has the same shape, so prefill pays it too - 4-5 times per layer on a 1024-token src1).
+  `quantize_row_q8_1_cuda` on every call, and nothing anywhere in the backend memoizes `src1`.
+- **Decode is the phase that pays, by ~4x.** The per-call cost is launch-bound: 12.8 KB of traffic in
+  1.12 us is ~12 GB/s, and there are 519 of them serialised per token. Prefill has the same sharing in the
+  code path (`mmq.cu`'s `quantize_mmq_q8_1_cuda`, same per-call shape), but the src1 of one op there is a
+  whole ubatch - 1024 x 2560 f32 = 13.4 MB per quantize at k=2560 - so ~4 redundant copies per layer per
+  ubatch are ~4.3 ms against a ~461 ms ubatch (E063's pp8192), i.e. **~0.9% against decode's measured
+  4.0%**, and below what a pp A/B can resolve. **The E061/E059 traces cannot see it at all: they are
+  decode-only** (E053: "no prefill at all"; verified again here - zero `mul_mat_q` and zero `mul_mat_id`
+  rows, and every `quantize_q8_1` row has `Grid_Size_Y` 1 or 10). Treat prefill as a bonus that a
+  pp-side trace would have to confirm, not as a target.
 - **The redundancy** `[v]`: the graph builder hands the *same* `cur` tensor to several matvecs per layer -
   `wq`/`wk`/`wv` (`qwen4exp.cpp:994,1005,1008`) and `index_q_proj`/`index_k_proj` (`:804,726`). The trace
   agrees: the 2560-wide activation is quantized **189 times per step = 3.94 per layer of 48**, a
