@@ -1438,6 +1438,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
+    // H19/E066 probe: which ubatches change the graph topology. The n_kv-proportional *sizes* are
+    // invisible here on purpose - this only answers whether the node count follows n_outputs or n_kv
+    if (getenv("LLAMA_UBATCH_DEBUG")) {
+        LLAMA_LOG_INFO("%s: n_tokens = %u, n_seqs = %u, n_outputs = %u, nodes = %d\n",
+                       __func__, ubatch.n_tokens, ubatch.n_seqs, this->n_outputs,
+                       ggml_graph_n_nodes(res->get_gf()));
+    }
+
     return res;
 }
 
