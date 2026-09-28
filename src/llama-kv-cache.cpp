@@ -747,7 +747,15 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 }
 
 llama_memory_context_ptr llama_kv_cache::init_full() {
-    return std::make_unique<llama_kv_cache_context>(this);
+    auto ctx = std::make_unique<llama_kv_cache_context>(this);
+
+    // the reserve pass only sizes the graph buffers, so under this gate it must see the whole cache instead
+    // of the state at this moment. see E066/H19/E068
+    if (getenv("LLAMA_RESERVE_WORST_CASE")) {
+        ctx->n_kv_min = get_size();
+    }
+
+    return ctx;
 }
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
@@ -2751,7 +2759,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = std::max(kv->get_n_kv(sinfos[i_cur]), n_kv_min);
 
     return true;
 }
