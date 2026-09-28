@@ -38,9 +38,11 @@ All four are development work with an already-measured prize, and none needs the
    empty reductions but the node count no longer depends on the batch.
    Measured (dev box, cli, sparse corpus, `-b 2048 -ub 1024 -c 32768`): reallocs 34 -> **0**,
    `sched:realloc_size` 1689-1776 ms -> **0**, prefill wall 5539-5725 -> **4819-5075 ms**, peak VRAM
-   unchanged, PPL bit-identical `263100.7437`. The prize recorded below is therefore realised on the dev
-   box; the bench-box instance (E056 priced a re-reserve at ~300 ms on 4 cards) is unverified but expected
-   to move seconds per prompt.
+   unchanged, PPL bit-identical `263100.7437`. **Dev-box llama-bench gives the fix its price tag (E075):
+   +16.4% pp** (`pp8192` 13248.27 -> 15419.44 t/s at `-r 3`), because pre-fix *every* allocation re-reserved
+   (24/24, 1218.55 ms = ~73% of the measured prefill wall) and post-fix `graph:alloc` drops from 50.9 to
+   0.16 ms/call. The random note below about expecting "seconds per prompt" on the bench box was
+   dev-box-only and does not transfer - see the T2 paragraph.
    Historical note, kept because it is the audit trail: the prize was 0.57 ms/token in decode (E062: 35
    `graph:alloc` calls at 21.0 ms per 1280 decode tokens, pool on and off; E056: 13 and 120 re-reserves per
    run for llama-cli and llama-perplexity) plus a larger prefill instance (E065: 34 reallocs, 1689 ms, 31%
@@ -59,6 +61,13 @@ All four are development work with an already-measured prize, and none needs the
    Related and measured on T2 while checking this (E074): the MoE weighted-reduction fusion is worth **8.75% of
    pp** (2138.37 vs 1951.32 t/s at pp4096 @ d16384); its decode value is still unmeasured and is the side where
    a weighted reduction should matter most.
+   Why the bench box is silent is **left unattributed deliberately** - H19 is closed here (E075): the flag axis
+   is measured and **excluded** (`--lazy-mode on-direct`, `--load-mode none`, the log's `lm` column,
+   `-d 16384` and the PLE-CPU override all still reallocate 24/24 or 40/40 on the pre-fix build). The two
+   axes that remain - the model (4-layer test model against the real one) and the 4-GPU tensor split - are not
+   worth a bench session on their own; the probes are recorded in E075 (on `32ba4c666` with
+   `GGML_ALLOC_DEBUG_REALLOC=1 LLAMA_UBATCH_DEBUG=1 -v`, or `-sm layer` against `-sm tensor`) in case H22 or
+   the vision path turns the same thing up.
    Open observation from the user (E074): prefill GPU utilisation looks higher than remembered. Not attributable
    to the fix in those runs (no re-reservations to remove) and not visible as throughput against the
    2026-09-27 baseline, which is flat; the prefill-pooling work (E056: 1781 -> 2230 pp8192) is the plausible
