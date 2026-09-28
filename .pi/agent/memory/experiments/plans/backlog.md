@@ -386,7 +386,12 @@ All three are development work with an already-measured prize, and none needs th
   with the *next* window's rows and `gather()` skips its own WILLNEED loop on a match
   (`LLAMA_LAZY_PREFETCH_AHEAD=0` keeps the old behaviour). The window rebuild is exact (12/12 and 6/6 hits,
   no wasted pages) and the dev box shows pp flat - its rows are page-cache resident, so only syscall time
-  moved and that was already hidden. The box's cold case is unmeasured and is the point of the item.
+  moved and that was already hidden. **On the box it is worth +3.0%/+1.9%/+1.2% pp4096 at d4096/16384/40960
+  (and +1.8%/+1.0%/+0.6% pp8192), 0% at d131072, tg flat**: ~27 ms per covered window is exposed and the
+  rest was already overlapped, and since that exposed part is a fixed per-ubatch cost, depth hides it. On the
+  real model every issued window matched (28 hits / 28 misses over 56 gathers = the predicted 50% coverage) and
+  a covered window's gather is ~8 ms against ~79 for an uncovered one (`input:lazy_gather` 79.2 -> 43.54
+  ms/call), so ~71 ms leaves the host path per covered window.
 
 ### H16 - 4-card decode comms: in-tree one-shot allreduce, +2.5% at depth, tied at 4k **done, opt-in**
 

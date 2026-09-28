@@ -339,7 +339,11 @@ token's budget) and the ~0.5% the prefetch costs when a table does stay cached. 
 implemented (E077)**: the reader has a prefetch thread fed with the *next* window's rows and `gather()`
 skips its own WILLNEED loop on a match, so at prefill width the same syscalls run while the current batch
 computes. Rebuild is exact (12/12, 6/6 hits, no wasted pages); the dev box is flat because its rows are
-page-cache resident, and the box's cold 36.75 MB per ubatch is where it has to be measured.
+page-cache resident, and on the box it is worth **+3.0%/+1.9%/+1.2% pp4096 at d4096/16384/40960, 0% at
+d131072, tg flat**: the exposed part is a fixed per-ubatch cost, so depth hides it. Window rebuild is exact
+on the real model too (28/28 matched, no wasted pages), and a covered window's gather is **~8 ms against ~79
+for an uncovered one**, i.e. ~71 ms leaves the host path per covered window (39% of it exposed at d4096, 27%
+at d16384).
 `LLAMA_LAZY_PREFETCH_AHEAD=0` is the control. B4 (the fork diff) and N4
 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
