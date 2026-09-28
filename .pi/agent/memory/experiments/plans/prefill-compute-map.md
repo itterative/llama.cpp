@@ -165,6 +165,27 @@ n_expert Q5_0 tensors" signature must not be used as a check here. The memory fi
   across cards if the GEMMs are compute-bound; plus 480 launches per ubatch of pure elementwise.
 - **Next step:** a counter of HC GEMM time and work per card, then a split-table change for `hc_*`;
   check the accuracy gate (a partial sum in a mirrored op changes the order of operations).
+- **Findings, 2026-09-28, before any change** (`GGML_META_DEBUG=1` plus `-v`, 4l model, `-sm tensor`; the env var
+alone does not raise ggml's log level, `-v` does):
+  - The table entry is `handle_generic(src_ss, scalar_only=true)` for `DSV4_HC_COMB/PRE/POST`, and
+    `scalar_only` rejects axis-split results, so the only states it can return are MIRRORED/PARTIAL/NONE. But
+    flipping that flag would change nothing today: the measured states of the inputs are already mirrored
+    (`hc_norm-0 (reshaped)[RESHAPE, MIRRORED]`, `hc_gate-0 (reshaped)[RESHAPE, MIRRORED]`, `node_5[MUL, MIRRORED]`,
+    `hc_mixed-0[DSV4_HC_PRE, MIRRORED]`), and the state propagates from the sources.
+  - Why the residual stream is mirrored: some weights in this model are split along their *input* dim
+    (`blk.0.ssm_out.weight[NONE, 0, {2048x3}]`), so that matmul contracts across devices, its result is PARTIAL and
+    becomes MIRRORED at the allreduce, and everything downstream of it, HC included, inherits MIRRORED.
+  - So splitting HC means giving its output a state from the tensor's own geometry (axis 0 or 2; legitimate,
+    because the contraction is over `hc` and orthogonal to both) rather than from its sources. Then the consumers
+    are the problem: `hc_mixed` feeds about seven `MUL_MAT`s per layer and `handle_mul_mat` has no case for
+    (weight split along its output dim, activation split along its ne0), whose correct semantics are a partial sum,
+    i.e. one allreduce per matmul: about 336 per ubatch against the 96 that exist, while NCCL is already 16.3% of
+    device time. The prize is three quarters of HC's 7.7% share, about 5.8%, so the collectives likely eat it.
+  - The elementwise half of P1 is mostly already there: `cparams.fused_dsv4_hc_pre` and `fused_dsv4_hc_post`
+    (src/models/qwen4exp.cpp:321,366) are what produce `DSV4_HC_PRE/POST`. What still sits outside them is
+    `w = sigmoid(scale(inject, 1/hc))` (line 362), about two nodes per layer.
+- **Verdict:** treat the split half as a layout experiment with a time box, judged on a traced A/B (device time per
+  card plus NCCL, and the accuracy gate), not as a table edit. The wall is more likely to move in P3.
 - **Deciding metric:** pp t/s on the box, with device time per card from the trace.
 - **Risk:** `hc_*` is F32-only by gate (N5) and feeds the residual stream, so a split introduces one
   reduce per mixture and could lose more in collectives than it wins.
