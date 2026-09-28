@@ -54,6 +54,12 @@ build is `BUILD_SHARED_LIBS=ON` and why the loader-shadowing trap on this box ex
 Workaround instead of static: set `CMAKE_INSTALL_RPATH`/`CMAKE_BUILD_RPATH` to `$PWD/build/bin`
 (backlog B0).
 
+**Always run the build tree as `LD_LIBRARY_PATH=$PWD/build/bin build/bin/...`** `[v]`. Without it a flat
+`build/bin/llama-bench` resolves `libggml*`/`libllama*` from `~/.local/lib64`, which on 2026-09-28 was the
+`2026-09-15` install - old enough to predate the profiler, so the run silently reported no `[prof]`
+tables and exercised two-week-old code. Set the variable, or `cmake --install build` first; a build with
+no `[prof]` banner under `GGML_PROF_REGIONS=1` is the symptom to check for.
+
 ## Knobs: what is real and what is inert on RDNA4
 
 | knob | status on gfx1201 |

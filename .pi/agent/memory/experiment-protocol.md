@@ -149,14 +149,21 @@ second line with per-phase calls and ms, because `ms/call` across mixed batches 
 dummy `graph:compute` is 38.8 ms/call at pp against 1.45 ms/call at tg. min and max stay across phases.
 Counters are not bucketed, so use `tok:decode` / `tok:prefill` (tokens added per phase) to normalize.
 
-### Capturing decode only
+### Capturing one phase at a time
 
 The phase regions are on with plain `GGML_PROF_REGIONS=1`: a batch of at most `GGML_PROF_DECODE` tokens
 is decode, a wider one is prefill, and the limit defaults to 1 (the same test the code uses for
-`graph_compute(..., ubatch.n_tokens > 1)`). `GGML_PROF_DECODE` *also* opens a capture window
-(`roctxProfilerResume` / `Pause`) on the first decode batch and closes it on the next wider batch or at
-exit, so a whole-turn trace carries decode kernels and nothing from the prompt pass. The window stays
-opt-in because resume/pause decides what `--selected-regions` records; the regions do not.
+`graph_compute(..., ubatch.n_tokens > 1)`). That width test only labels the phase, it is not what a
+tracer records.
+
+The capture window is a separate opt-in, `GGML_PROF_WINDOW=pp|tg|both` (default: no window). It opens
+the `roctxProfilerResume` / `Pause` pair, outside of which `--selected-regions` records nothing, on the
+first batch of the selected phase and closes as soon as a batch is not in it. `pp` covers the prompt
+pass alone (one window per request when serving), `tg` the decode pass, and `both` everything after the
+first batch - a single window there, still sliceable by the `phase:prefill` / `phase:decode` regions.
+The legacy spelling of the tg window is setting `GGML_PROF_DECODE`, so the E059/E061 commands still run
+as written. A wide `GGML_PROF_DECODE` is *not* a pp window: it relabels every batch decode and loses
+that run's phase table.
 
 - plain decode: `GGML_PROF_DECODE=1`
 - **speculative decode: `n_draft + 1`, not 1.** A verify pass wider than the limit closes the window and

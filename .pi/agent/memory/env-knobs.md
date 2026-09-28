@@ -52,13 +52,15 @@ alternative value) explicitly.
 | `GGML_FATTN_RTILE_PB` | unset = heuristic | parallel blocks | override the rtile minimum parallel-blocks gate | E047 |
 | `LLAMA_LAZY_WORKERS` | `0` = heuristic | threads | reader threads per gather (default is one per 32 rows, which leaves a decode gather on one thread) | E058 |
 | `GGML_PROF_REGIONS` | off | set = on | region counters (`[prof]` tables); also switches the roctx sink on | E053, E059 |
-| `GGML_PROF_DECODE` | off | set = on | restrict the roctx window to decode, which is what `rocprofv3 --selected-regions` needs | E059, E061 |
+| `GGML_PROF_DECODE` | `1` | `<tokens>` | width at or below which a batch counts as decode: sets the phase label, and setting it also opens the tg window (legacy spelling of `GGML_PROF_WINDOW=tg`) | E059, E061 |
+| `GGML_PROF_WINDOW` | unset = no window | `pp`/`prefill`, `tg`/`decode`/`1`, `both`/`all`, `off`/`0` | which phase the roctx capture window covers, i.e. what a `rocprofv3 --selected-regions` run records; `pp` is new, `both` is one window spanning the run | - |
 | `GGML_CUDA_NCCL_RETRY` | retry ON | set = off | disable the NCCL failure retry | - |
 | `GGML_FATTN_DEBUG` | off | int | FA selection debug | - |
 | `GGML_CUDA_AR_ONESHOT_DEBUG` | off | set = on | dumps the one-shot pointers/inbox state | - |
 
 Note on the tracer: `GGML_PROF_REGIONS=1` alone is host-side only and cheap; adding `rocprofv3` inverts
-some cross-arm results (see `experiment-protocol`, "a tracer can invert a relative result").
+some cross-arm results (see `experiment-protocol`, "a tracer can invert a relative result"). A kernel
+trace of either phase needs `GGML_PROF_WINDOW`, and the phase label is unaffected by it.
 
 ## Internal allreduce tuning - leave alone unless debugging it
 
