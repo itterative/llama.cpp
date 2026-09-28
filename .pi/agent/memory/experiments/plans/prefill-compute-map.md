@@ -343,6 +343,10 @@ pure host work with no numerics in it.
 - **Left on the table:** the remaining prep is the per-graph recompute plus a `std::map` find in
   `stc.simple_tensors` (once per init and once per source state lookup), which is a cheap follow-up; P9c is
   what removes the recompute itself.
+- **Bound, added after the first version.** The map is capped at `split_state_cache_max` (2^16 entries) and
+  cleared when exceeded. Keys are addresses that are never dereferenced and the split state holds no
+  pointers, so a stale entry is at worst a wrong number, and clearing is always sound; the cap only gives a
+  long-lived process a ceiling. It does not fire at the observed sizes (27k inits per pass, ~9k entries).
 - **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
   PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
