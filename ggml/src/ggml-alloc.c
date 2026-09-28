@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-prof.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1108,7 +1109,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    ggml_prof_region_begin("sched:needs_realloc");
+    const bool needs_realloc = ggml_gallocr_needs_realloc(galloc, graph);
+    ggml_prof_region_end();
+
+    if (needs_realloc) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1125,20 +1130,26 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     // reset buffers
+    ggml_prof_region_begin("sched:vbuf_reset");
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers[i] != NULL) {
             ggml_vbuffer_reset(galloc->buffers[i]);
         }
     }
+    ggml_prof_region_end();
 
     // allocate the graph tensors from the previous assignments
     // leafs
+    ggml_prof_region_begin("sched:init_leafs");
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
         ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf);
     }
+    ggml_prof_region_end();
+
     // nodes
+    ggml_prof_region_begin("sched:init_nodes");
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
@@ -1151,6 +1162,7 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         }
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
     }
+    ggml_prof_region_end();
 
     return true;
 }

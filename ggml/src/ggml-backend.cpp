@@ -1622,25 +1622,38 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
-    for (int i = 0; i < sched->graph.n_nodes; i++) {
-        if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
-            sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
-            backend_ids_changed = true;
-            break;
-        }
-    }
-    if (!backend_ids_changed) {
-        for (int i = 0; i < sched->graph.n_leafs; i++) {
-            if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
-                sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
+
+    {
+        ggml_prof_region prof_ids("sched:ids_scan");
+
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
+                sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
                 backend_ids_changed = true;
                 break;
+            }
+        }
+        if (!backend_ids_changed) {
+            for (int i = 0; i < sched->graph.n_leafs; i++) {
+                if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
+                    sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
+                    backend_ids_changed = true;
+                    break;
+                }
             }
         }
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    bool gallocr_ok = false;
+
+    if (!backend_ids_changed) {
+        ggml_prof_region prof_gallocr("sched:gallocr");
+
+        gallocr_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+    }
+
+    if (backend_ids_changed || !gallocr_ok) {
         // counter only. note what backend_ids_changed does NOT mean: it compares buffer-type
         // assignments per node index (see above), so it is not a topology flag, and a node-count change
         // can flip it by itself. both names here just say which test tripped
@@ -2049,10 +2062,18 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    {
+        ggml_prof_region prof_split("sched:split");
 
-    if (!ggml_backend_sched_alloc_splits(sched)) {
-        return false;
+        ggml_backend_sched_split_graph(sched, graph);
+    }
+
+    {
+        ggml_prof_region prof_splits("sched:alloc_splits");
+
+        if (!ggml_backend_sched_alloc_splits(sched)) {
+            return false;
+        }
     }
 
     sched->is_alloc = true;
