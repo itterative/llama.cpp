@@ -75,7 +75,7 @@ grep -iE "lazy read enabled|per_layer_token_embd" <the run's log>
 
 If that tensor reports `lazy read enabled`, the A/B set is `-lzm off` (fully resident) vs
 `-lzm auto` (today) vs `--load-mode mmap+mlock`, with `free -h` / RSS before and after.
-Logged as L1 in `plans/backlog.md`.
+Logged as L1 in `plans/backlog-answered.md`.
 
 ## Characterisation block
 

@@ -280,7 +280,8 @@ was the pre-E056 reservation tax); and the post-flip REF baseline arrived as the
 recorded as **E063** with the anchor table and the 7% cross-session caveat above. The one thing it left
 open is **E064** (flag-only, 4 invocations): is that 7% the allreduce probe's iteration count or the
 test order? The next development thread is H20 (pool block keys in rank space, so vision sessions stop
-losing the pool's +32.6% tg); the ranking below still holds for the threads not in the bundle.
+losing the pool's +32.6% tg); the backlog now leads with that focus list (H20, then H19, then E016), and
+its ranking below still holds for everything else.
 
 Top code action was the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
