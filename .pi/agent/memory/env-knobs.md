@@ -60,9 +60,9 @@ alternative value) explicitly.
 
 Note on the tracer: `GGML_PROF_REGIONS=1` alone is host-side only and cheap; adding `rocprofv3` inverts
 some cross-arm results (see `experiment-protocol`, "a tracer can invert a relative result"). A kernel
-trace of either phase needs `GGML_PROF_WINDOW`, and the phase label is unaffected by it. `llama-bench`
-opens a window of its own around its generation test (`llama-bench.cpp:2177`), so a pp trace has to pass
-`-n 0` or the recording runs on into the tg test.
+trace of either phase needs `GGML_PROF_WINDOW`, the phase label is unaffected by it, and with no window
+set the tracer records nothing at all - `llama-bench`'s own implicit tg window was removed in
+`cc6be7d35`, so a pp and a tg window in one run no longer bleed into each other.
 
 ## Internal allreduce tuning - leave alone unless debugging it
 

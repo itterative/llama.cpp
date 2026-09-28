@@ -165,11 +165,12 @@ The legacy spelling of the tg window is setting `GGML_PROF_DECODE`, so the E059/
 as written. A wide `GGML_PROF_DECODE` is *not* a pp window: it relabels every batch decode and loses
 that run's phase table.
 
-`llama-bench` opens a window of its own around the generation loop (`ggml_prof_window prof_window`,
-`tools/llama-bench/llama-bench.cpp:2177`), so a trace taken with `-p N -n R` records the pp arm *and*
-the tg test no matter what `GGML_PROF_WINDOW` says. Measure one phase per run: `-n 0` for pp, `-p 0`
-for tg, and check the trace's own `phase:*` markers to confirm what actually made it into the file
-(a pp window shows `phase:prefill` and no `phase:decode`, and a `roctxProfilerResume` marker).
+`llama-bench` used to open a window of its own around the generation loop, which is why a pp trace
+needed `-n 0` and why a mixed run recorded both phases. That window is gone (`cc6be7d35`), so the knob
+is now the only thing that decides: in one mixed `-p N -n R` run, `pp` records the prompt pass and
+closes at the first decode batch while `tg` records the decode test, each with its own window. With
+nothing set, the tracer records nothing. Confirm from the trace's own `phase:*` markers - a pp window
+shows `phase:prefill` and no `phase:decode`, plus one `roctxProfilerResume`.
 
 - plain decode: `GGML_PROF_DECODE=1`
 - **speculative decode: `n_draft + 1`, not 1.** A verify pass wider than the limit closes the window and
