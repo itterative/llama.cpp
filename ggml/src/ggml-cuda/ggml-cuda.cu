@@ -4618,7 +4618,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_moe_weighted_reduction_match match;
-            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            const bool matched = ggml_cuda_match_moe_weighted_reduction(cgraph, i, match);
+
+            // probe for the fusion's verdict, see E072: the reserve graph matches and the prompt graph does not,
+            // and that difference is the extra alloc-dep node that retightens the allocation reservation
+            if (getenv("GGML_ALLOC_DEBUG_REALLOC") != nullptr && strstr(cgraph->nodes[i]->name, "moe_weighted") != nullptr) {
+                const ggml_tensor * t = cgraph->nodes[i];
+
+                GGML_LOG_INFO("moe-fusion: %-22s node %3d matched = %d", t->name, i, (int) matched);
+                for (int j = 0; j < 2; ++j) {
+                    const ggml_tensor * s = t->src[j];
+                    GGML_LOG_INFO(" | src%d %-18s ne=%4lld,%5lld,%lld,%lld contig=%d %s",
+                            j, s ? s->name : "(null)",
+                            s ? (long long) s->ne[0] : 0, s ? (long long) s->ne[1] : 0,
+                            s ? (long long) s->ne[2] : 0, s ? (long long) s->ne[3] : 0,
+                            s ? (int) ggml_is_contiguous(s) : 0,
+                            s ? ggml_type_name(s->type) : "-");
+                }
+                GGML_LOG_INFO(" | mul ne=%4lld,%5lld,%lld,%lld contig=%d\n",
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        (int) ggml_is_contiguous(t));
+            }
+
+            if (matched) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
                 if (match.expert_scale != nullptr) {
