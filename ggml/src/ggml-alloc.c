@@ -963,6 +963,28 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
 }
 
+// [GGML_ALLOC_DEBUG_REALLOC] name the tensors that do not fit the current reservation
+static bool ggml_gallocr_debug_realloc(void) {
+    return getenv("GGML_ALLOC_DEBUG_REALLOC") != NULL;
+}
+
+static void ggml_gallocr_debug_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, const char * owner, int src_id, struct tensor_alloc * talloc) {
+    if (!ggml_gallocr_debug_realloc()) {
+        return;
+    }
+
+    // only reached for tensors that failed the fit test, so this counts culprits, not graphs
+    static int trip = 0;
+
+    const size_t need = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], tensor);
+
+    GGML_LOG_INFO("%s: trip %d: %s of %s: %s type=%s ne=%lldx%lldx%lldx%lld need=%zu have=%zu buf=%d\n",
+            __func__, ++trip, src_id < 0 ? "dst" : "src", owner,
+            tensor->name, ggml_type_name(tensor->type),
+            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+            need, talloc->size_max, talloc->buffer_id);
+}
+
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
@@ -1008,6 +1030,10 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
+        if (ggml_gallocr_debug_realloc()) {
+            GGML_LOG_INFO("%s: trip: graph structure changed, nodes %d -> %d, leafs %d -> %d\n",
+                    __func__, galloc->n_nodes, graph->n_nodes, galloc->n_leafs, graph->n_leafs);
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
@@ -1015,6 +1041,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
+        if (ggml_gallocr_debug_realloc()) {
+            GGML_LOG_INFO("%s: trip: graph structure changed, nodes %d -> %d, leafs %d -> %d\n",
+                    __func__, galloc->n_nodes, graph->n_nodes, galloc->n_leafs, graph->n_leafs);
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
@@ -1026,6 +1056,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+            ggml_gallocr_debug_tensor(galloc, node, node->name, -1, &node_alloc->dst);
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -1038,6 +1069,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+                ggml_gallocr_debug_tensor(galloc, src, node->name, j, &node_alloc->src[j]);
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif

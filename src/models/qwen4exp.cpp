@@ -723,6 +723,15 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
         }
         ggml_set_input(qsa->bias);
 
+        ggml_set_name(qsa->blk_cells, "qsa_blk_cells");
+        ggml_set_name(qsa->bias,      "qsa_bias");
+        if (qsa->blk_pos)    { ggml_set_name(qsa->blk_pos,    "qsa_blk_pos"); }
+        if (qsa->tail_cells) { ggml_set_name(qsa->tail_cells, "qsa_tail_cells"); }
+        if (qsa->cell_blk)   { ggml_set_name(qsa->cell_blk,   "qsa_cell_blk"); }
+        if (qsa->new_rows)   { ggml_set_name(qsa->new_rows,   "qsa_new_rows"); }
+        if (qsa->new_cells)  { ggml_set_name(qsa->new_cells,  "qsa_new_cells"); }
+        if (qsa->new_pos)    { ggml_set_name(qsa->new_pos,    "qsa_new_pos"); }
+
         inp = qsa.get();
         res->add_input(std::move(qsa));
         qsa_inps.emplace((uint32_t) r, inp);
