@@ -2632,6 +2632,15 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    // optional: reserve for the widest batch the session can produce - the callers commonly reserve for a
+    // single token, so the n_tokens-proportional part (the mask's second dimension) is not covered otherwise.
+    // the n_kv dimension is covered by llama_kv_cache::init_full under the same gate. see E066/H19/E068
+    static const bool worst_case = getenv("LLAMA_RESERVE_WORST_CASE") != nullptr;
+
+    if (worst_case) {
+        n_tokens = std::max(n_tokens, (uint32_t) cparams.n_batch);
+    }
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2655,19 +2664,6 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
-
-    // optional: shift the reserve ubatch to the end of the context so the reservation covers the worst case
-    // (n_kv = n_ctx at the real batch width). the gallocr accepts any smaller graph later, so one such reserve
-    // removes the per-padding-step re-reserve and its device sync for the whole session. see E066/H19/E068
-    static const bool worst_case = getenv("LLAMA_RESERVE_WORST_CASE") != nullptr;
-
-    if (worst_case && ubatch.n_tokens <= cparams.n_ctx) {
-        const llama_pos off = (llama_pos) (cparams.n_ctx - ubatch.n_tokens);
-
-        for (uint32_t i = 0; i < ubatch.n_tokens * (uint32_t) model.hparams.n_pos_per_embd(); ++i) {
-            ubatch.pos[i] += off;
-        }
-    }
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
