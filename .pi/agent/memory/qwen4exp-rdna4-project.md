@@ -39,6 +39,27 @@ Everything under `.pi/agent/memory/experiments/` (log tree) + the topic memories
 at the end of this file. Read `experiments/PROTOCOL.md` before running or recording
 anything - it defines the tiers, the naming, and the rules.
 
+## Branch defaults (2026-09-27)
+
+The defaults now ARE the configuration everything has been measured with, so a bare `llama-bench` /
+`llama-server` run needs no env at all:
+
+- **default-on:** `GGML_CUDA_P2P`, `GGML_CUDA_ALLREDUCE=internal`, `GGML_CUDA_AR_DIRECT_BF16=nccl`,
+  `GGML_FATTN_RDNA_RTILE`, `Q4EXP_SPARSE_FA`, `Q4EXP_POOLED`, `GGML_CUDA_MMVQ_RDNA4_SMALL_K`,
+  `LLAMA_LAZY_PREFETCH` (`6344fd41b`, `f383ef73e`, `9111adf2c`, `3f1138bb3`, `855a65544`).
+- **opt-outs, for A/B arms only:** `GGML_CUDA_P2P=0`, `GGML_CUDA_ALLREDUCE=nccl`,
+  `GGML_CUDA_AR_DIRECT_BF16=off`, `GGML_FATTN_RDNA_RTILE=0`, `Q4EXP_SPARSE_FA=0`, `Q4EXP_POOLED=0`,
+  `GGML_CUDA_MMVQ_RDNA4_SMALL_K=0`, `LLAMA_LAZY_PREFETCH=0`. An "off" arm that *omits* the variable
+  is now the ON arm - say `=0` explicitly.
+- Two flips were measured on 4x gfx1201 only and change more than speed: `ALLREDUCE=internal`
+  replaces NCCL on Linux as the no-env path, and `AR_DIRECT_BF16=nccl` changes numerics (bf16 wire
+  on large f32 reductions). The dev-box PPL is unaffected - 263113.4044 both ways - because one GPU
+  never runs an allreduce.
+- The user's `llama-server.service` still sets `GGML_CUDA_P2P` / `Q4EXP_POOLED` /
+  `GGML_FATTN_RDNA_RTILE` / `Q4EXP_SPARSE_FA` (now redundant) and has `GGML_CUDA_ALLREDUCE=internal`
+  **commented out**, so after the flip the server uses the internal allreduce where it used NCCL. If
+  that was deliberate, the unit needs `Environment=GGML_CUDA_ALLREDUCE=nccl`.
+
 ## Traps that already produced bogus results
 
 1. **Loader shadowing.** `LD_LIBRARY_PATH` includes `/home/sd/lib` and

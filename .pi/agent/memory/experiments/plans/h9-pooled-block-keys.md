@@ -164,7 +164,7 @@ selection-overlap test below.
   kernel later runs 1 new block per 4 tokens instead of 32768.
 - Does not fix F8 (FA half-count ambiguity) - re-measure separately.
 - Env gate `Q4EXP_POOLED`: **flipped to on** in `9111adf2c` once parity and the A/B bench landed, as
-  planned. Same style as Q4EXP_SPARSE_FA / Q4EXP_CELL_SEL, which are still opt-in.
+  planned. Same style as Q4EXP_SPARSE_FA - which became default-on 2026-09-27 (`Q4EXP_SPARSE_FA=0` opts out) - and Q4EXP_CELL_SEL, which is still opt-in.
 
 ## Implementation order
 
