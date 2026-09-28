@@ -321,7 +321,11 @@ corrupts (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`, E069 - it is a placement-validi
 record), and skipping a reserve whose graph fits is inert because the reserve path is only entered on a failed
 fit test. What is left is reserve *policy*: measure a worst-case graph at the retighten, or keep the
 reservation across a structural change. The tool that found all of this is `GGML_ALLOC_DEBUG_REALLOC=1`;
-the QSA graph inputs now carry names so its output is readable. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+the QSA graph inputs now carry names so its output is readable. **E070 then falsified the harness form of that
+first lever and narrowed it**: `llama_graph_reserve` always builds the all-outputs convention (703 nodes -
+`ubatch_prepare_reserve` honours sampled outputs only for sequences with a sampler), while the prompt pass runs
+702, and the node count is tested before any size, so no reservation can survive that. The lever is therefore
+"reserve with the *batch's* output convention *and* a full-cache context", testable against E070's arms. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
 on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
 before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also

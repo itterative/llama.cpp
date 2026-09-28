@@ -57,8 +57,8 @@ Three facts, all measured:
 2. The run makes **34** reallocs, but only **32** tensor-level fit failures. With the new structural print the
    other two are:
    ```
-   0.02.552: graph structure changed, nodes 703 -> 702, leafs 141 -> 141    (the warmup decode graph)
-   0.08.197: graph structure changed, nodes 702 -> 703, leafs 141 -> 141    (back to prefill)
+   0.02.552: graph structure changed, nodes 703 -> 702, leafs 141 -> 141    (E070 corrects this: the first PROMPT ubatch, not the warmup)
+   0.08.197: graph structure changed, nodes 702 -> 703, leafs 141 -> 141    (back to the reserve/warmup convention)
    ```
 3. `ggml_gallocr_reserve_n_impl` **assigns** each slot's `size_max` from the graph it is reserving for:
    `node_alloc->dst.size_max = ggml_backend_buft_get_alloc_size(...)`. It does not keep the larger earlier value.
@@ -91,7 +91,10 @@ The QSA side cannot be fixed from the QSA side. This is not a tensor that is und
 1. Make the retighten measure a worst-case graph. The sched's fallback reserves with `sched->graph`, which is
    built from the *current* memory context; a graph built from a full-cache context (`init_full`, the same
    context `sched_reserve` uses) would keep the record at the worst case. Needs a way for llama.cpp to hand the
-   sched a measure graph, or for the fallback to be told the worst case.
+   sched a measure graph, or for the fallback to be told the worst case. **E070 then tested the harness form of
+   this and found the second requirement**: the reserve graph must also use the output convention of the batch
+   that will run (reserves are always 703 nodes, the prompt is 702, and the node count is tested before any
+   size), so this lever alone cannot work.
 2. Keep the reservation across a structural change instead of recomputing it for the new structure - i.e. a
    persistent per-slot capacity record that is *also* correct about the placement. The negative result above is
    the guard rail: any version that only keeps sizes will corrupt.
