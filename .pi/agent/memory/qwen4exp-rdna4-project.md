@@ -330,7 +330,15 @@ exactly one scheduler dependency node, `ffn_moe_down-3 (view)` - the reserve cop
 MoE down output as a cross-split input, the runtime graph does not - and `n_outputs` does not control it (1 and
 n_tokens both give 703). So H19 is blocked on a graph-identity question; until the reserve graph and the runtime
 graph are the same graph, the record is retightened on the first prompt ubatch, and no allocator-side shortcut
-is safe (a one-node insertion shifts every later slot index). Testable against E070's control arms. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+is safe (a one-node insertion shifts every later slot index). **E072 then solved it**: the extra node is the
+MoE weighted-reduction fusion's `add_alloc_dep` (`ggml_backend_cuda_graph_optimize`, `ggml-cuda.cu:4597`) that
+the sched turns into a keep-alive view node - reserve graphs carry it, prompt graphs do not, and the node count
+is tested before any size. `GGML_CUDA_DISABLE_FUSION=1` gives **0 reallocs, 0 trips, prefill wall 5145 ms
+against 5539-5725 ms** (PPL 263100.9174, a summation-order change). The dep is also self-defeating in prefill:
+`ggml_cuda_check_fusion_memory_ranges` skips the fusion when ranges overlap, which is exactly what the dep
+prevents, so what the fusion gives up in prefill is worth less than the ratchet costs. The fix is to make the
+dep reporting consistent per graph; until then the env var is the workaround, and a fusion-off arm needs its
+own golden PPL. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
 on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
 before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also
