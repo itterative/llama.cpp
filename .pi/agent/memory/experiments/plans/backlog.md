@@ -23,23 +23,37 @@ All four are development work with an already-measured prize, and none needs the
    and the graph hands the same `cur` tensor to 4-5 matvecs per layer, so ~237 of the 519 launches and
    ~2.0% of device time are redundant on the shapes whose sharing is already visible. Fix is a
    per-invocation cache keyed on the `src1` tensor pointer; output stays bit-identical, so the golden PPL
-   must not move at all.
-3. **H19 - the reservation ratchet.** Prize: measured in the untraced E062 logs, **35 `graph:alloc` calls
-   at 21.0 ms = 735 ms per 1280 decode tokens = 0.57 ms/token, 2.3% of the wall**, with the pool on *and*
-   off, plus E056's 13 and 120 re-reserves per run for llama-cli and llama-perplexity. It is host work
-   that no region names. Next step: find the trigger, not another measurement.
+   must not move at all. E065 confirms the mechanism on the dev box (4512 quantizes for 4512 matvecs, 1.3 us
+   each: 2.4% of device time but **13% of all dispatches**) and shows the 370 dispatches of a decode step run
+   back-to-back, so this has to be scored by `us/call x calls/step` arithmetic, not by an A/B under the 5%
+   noise floor.
+3. **H19 - the reservation ratchet.** Prize: **0.57 ms/token in decode** (E062: 35 `graph:alloc` calls at
+   21.0 ms per 1280 decode tokens, 2.3% of the wall, pool on *and* off; E056: 13 and 120 re-reserves per run
+   for llama-cli and llama-perplexity), **plus a larger prefill instance found by E065** - dev box, cli,
+   32.68k prompt: 34 reallocs, 1689 ms = **31% of the prefill wall**, of which 1645 ms is the
+   `hsa_signal_wait_scacquire` from the `ggml_backend_synchronize` the branch runs before
+   `ggml_gallocr_reserve_n` (the allocation itself is 35 ms). Recoverable is the overlap that sync forbids
+   (staging 326 ms + build + checkpoint, ~8% of that wall), not the drain. H11's "prefill at 20-30% GPU" is
+   this same thing - E065 measures **33% occupancy** - and H22's vision re-reserve is the same family.
+   `GGML_SCHED_DEBUG_REALLOC=1` aborts with `graph size = 702, nodes = 702, leafs = 141` and the region is
+   never `realloc_buft`, so the size trips come without node-count changes; but the prompt phase fires ~1.6
+   events per ubatch where decode fires 1 per 256 tokens, which H19's padding story does not explain. Next
+   step: E066's node-count probe, then re-read the trigger. Not another measurement.
 4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
    exactly "the wall time that lands outside every region". Next step: `perf record -g` on a tg-only run
-   at depth, read against the region table.
+   at depth, read against the region table. E065 has already decomposed the dev-box step - 0.72 ms enqueue,
+   3.17 ms drain (2.62 ms of kernels inside it), ~0.3 ms sampling, 0.55 ms gaps, 4.18 ms total - so what is
+   left is the real-model repeat, and E059's 42% is likely async-execution attribution rather than waste.
 
 ## Parked - bench-only, no development (run when convenient)
 
 - **E011** `-npl` sweep, **E012** `-sm row`, **E014** `-lzm off` (revived), **E029** row-cut the real
   table, **E030** real text vs llama-bench's random fill, **H22** the vision path's ~120 ms re-reserve
-  (blocks nothing), **H25** the 6-of-96 collective tail (a *traced-regime* artifact; worth one run only if
-  traced wall claims come back). Commands and state are in their sections below.
+  (blocks nothing; same family as H19 now), **H25** the 6-of-96 collective tail (a *traced-regime*
+  artifact; worth one run only if traced wall claims come back). Commands and state are in their sections
+  below.
 
 ## Parked - open threads that are not next
 
@@ -47,10 +61,11 @@ All four are development work with an already-measured prize, and none needs the
   robustness (a watchdog-proof spin cap, unexercised widths, two dead ladder branches) and the decision to
   default it on - the plan's loose ends.
 - **H17b** is the QSA chain replicated 4x, **H2** HC chain on HIP, **H10** mmq cutoff for MoE, **H11**
-  prefill at 20-30% GPU while decode is near 100%, **H5** PLE n-gram hashing, **H6** fp32 output, **H7**
-  VMM, **H8** RCCL off, **H9** the pool's non-dense leftover and its 354 MiB/card tax, **H4a** the
-  indexer/mask tax, **L4** the fp32 recurrent state, **E028** memoize the QSA host mapping (~3.4 ms/token
-  at 131k), **N1/N2/N3/N5** survey notes, **F1/F2/F3** loader items, **T1** the fusion API for CUDA/HIP.
+  prefill at 20-30% GPU while decode is near 100% (now folded into H19: E065 measures 33% prefill
+  occupancy and explains it), **H5** PLE n-gram hashing, **H6** fp32 output, **H7** VMM, **H8** RCCL off,
+  **H9** the pool's non-dense leftover and its 354 MiB/card tax, **H4a** the indexer/mask tax, **L4** the
+  fp32 recurrent state, **E028** memoize the QSA host mapping (~3.4 ms/token at 131k), **N1/N2/N3/N5**
+  survey notes, **F1/F2/F3** loader items, **T1** the fusion API for CUDA/HIP.
 - Prerequisites: **B0** (rpath), **B1** (bench-box ops hang), **B2** (bench box facts).
 
 ---
@@ -64,6 +79,14 @@ All four are development work with an already-measured prize, and none needs the
   the fix: `CMAKE_BUILD_RPATH=$PWD/build/bin`. Found in E001.
 - **Status:** open, and still relevant - this session lost several runs to it again. The current
   workaround is `LD_LIBRARY_PATH=$PWD/build/bin` plus an `ldd` check before every measurement.
+
+### B3 - re-baseline the bench box after its ROCm move
+
+- **Why:** every prize in the focus list is an E062-era ROCm 7.1 number, and moving the dev box to ROCm 10
+  shifted the golden PPL from 263113.4044 to 263100.7437 for an unchanged tree. E063's anchor is void for
+  new comparisons until it is re-measured.
+- **What:** re-run the REF baseline (`bench-finish-bundle.md`) plus E065's cli harness on the real model,
+  with `LD_LIBRARY_PATH=$PWD/build/bin:/opt/rocm/lib` (ROCm 10 is in no loader config).
 
 ### B1 - `test-backend-ops` on AMD GPUs
 
