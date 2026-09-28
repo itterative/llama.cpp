@@ -36,9 +36,11 @@ All four are development work with an already-measured prize, and none needs the
    (staging 326 ms + build + checkpoint, ~8% of that wall), not the drain. H11's "prefill at 20-30% GPU" is
    this same thing - E065 measures **33% occupancy** - and H22's vision re-reserve is the same family.
    `GGML_SCHED_DEBUG_REALLOC=1` aborts with `graph size = 702, nodes = 702, leafs = 141` and the region is
-   never `realloc_buft`, so the size trips come without node-count changes; but the prompt phase fires ~1.6
-   events per ubatch where decode fires 1 per 256 tokens, which H19's padding story does not explain. Next
-   step: E066's node-count probe, then re-read the trigger. Not another measurement.
+   never `realloc_buft`, so the size trips come without node-count changes. E066 settled the rate: one event
+   per 256-token padding crossing (34 events over 36 ubatches at `-ub 1024`, 131 over 259 at `-ub 128`) and
+   the inference graph's node count is constant at 667 whatever n_kv or n_outputs do. So the trips are
+   size-only and "keep the buffer sizes constant inside a reserved window" is the whole fix. Next step:
+   implementation, not another measurement.
 4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
