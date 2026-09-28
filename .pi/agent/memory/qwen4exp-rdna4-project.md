@@ -338,7 +338,14 @@ against 5539-5725 ms** (PPL 263100.9174, a summation-order change). The dep is a
 `ggml_cuda_check_fusion_memory_ranges` skips the fusion when ranges overlap, which is exactly what the dep
 prevents, so what the fusion gives up in prefill is worth less than the ratchet costs. The fix is to make the
 dep reporting consistent per graph; until then the env var is the workaround, and a fusion-off arm needs its
-own golden PPL. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+own golden PPL. **E073 fixed it**: the matcher rejects empty reductions (`n_tokens <= 0`, and prefill's last
+layer has `ne[2] = 0` because the batch carries no output tokens), so the dependency vanished with the fusion
+and the node count changed per batch. `ggml_cuda_match_moe_weighted_reduction` now takes `require_work`
+(false at the dependency call site, true at compute): **0 reallocs, prefill wall 4819-5075 ms against
+5539-5725, VRAM unchanged, PPL bit-identical 263100.7437** - faster than disabling the fusion and no memory
+cost. Invariant restored, worth remembering for any future fusion: a fusion must not change the graph's node
+count per batch, because the scheduler's per-slot bookkeeping is indexed by node position and the node count
+is tested before any size. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
 on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
 before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also
