@@ -333,6 +333,10 @@ All three are development work with an already-measured prize, and none needs th
 
 ### H11 - prefill runs the GPUs at 20-30% while decode sits near 100%
 
+- **Map:** [prefill-compute-map.md](prefill-compute-map.md) - what a prefill ubatch is made of, the
+  launch census, and the ranked threads (P1 HC replication, P2 prefill graph reuse, P3 MoE tiles, P4
+  prefill-width collectives, P5 fusion tail). Written 2026-09-28 with no new box run; it names the one
+  trace that would decide the host/device split.
 - Reported by the user on the bench box, present before *and* after the rebase, so it is not a merge
   artifact. This is inverted: prefill is the compute-bound phase (512-8192 tokens per ubatch through 48
   layers of MoE GEMMs) and should be the one saturating the cards, while decode is small-kernel and
