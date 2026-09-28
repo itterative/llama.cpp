@@ -488,8 +488,15 @@ outright - `request (32673 tokens) exceeds the available context size (8192 toke
 table after that error holds only the 2-call tokenizer warmup, which is easy to misread as "the prompt
 file was ignored". Both `-f <file>` and `-p "$(cat <file>)"` do deliver the corpus. On the 4-layer F32
 dummy (11.88 GiB, `-c 32768`, `-b 2048 -ub 1024`) the prefill wall is **host-bound**: 5481 ms for
-32.68k tokens with only ~2036 ms of device time, 1689 ms of it `sched:realloc_size` at 80 ms per prefill
-call (49 ms at `-c 16384`), i.e. the scheduler re-allocates per batch and the GPU waits. Decode is
+32.68k tokens with only ~2036 ms of device time (33% occupancy). The scheduler's realloc branch fires on
+every batch - 1689 ms at 80 ms per call, 49 ms at `-c 16384` - but that is **97% `hsa_signal_wait_scacquire`**,
+the forced `ggml_backend_synchronize` before `ggml_gallocr_reserve_n`, while the allocation itself is 35 ms.
+So the region is mostly the drain of the previous batch, and the real cost is the overlap it forbids
+(staging 326 ms + build + checkpoint, i.e. ~0.4-0.5 s of the wall). `GGML_SCHED_DEBUG_REALLOC=1` aborts with
+`graph size = 702, nodes = 702, leafs = 141`, so the trip is a per-batch *tensor byte-size* change, not a
+topology ratchet. Of the 326 ms staging, H2D transfers are only 82 ms (169 copies) - the rest is CPU-side
+gather. HSA tracing also shows 588 ms of code-object loading (40 kernel first-launches), which a server pays
+once but a single-prompt run pays inside the wall. Decode is
 4.18 ms/step with 3.17 ms of drain and 2.6 ms of kernels, 1 `quantize_q8_1` per matvec. Tracer
 perturbation: +8.8% on the pp wall, +75% on the decode host regions, and the cli's own line drops 6%
 (pp) and 22% (tg).

@@ -160,8 +160,39 @@ untraced (**-6%**), decode 185.9 t/s against 239.4 (**-22%**). Decode is the tra
 its traced gap total (2.7 ms/step, from a 5.33 ms spanned step) overstates the real one - untraced the
 kernels are the same 2.62 ms in a 4.18 ms step, i.e. ~1.6 ms of gap.
 
-Limit of this pass: the trace has no memory-domain rows (H2D/D2H are not captured with these flags), so
-the 326 ms of `graph:set_inputs` cannot be split into CPU-side gather and transfer.
+
+
+### hsa / memory trace (one prefill arm, all domains on)
+
+`--hsa-trace --memory-copy-trace --memory-allocation-trace` (plus the usual kernel/marker flags and the
+same window) on the pp arm. The flag set works on rocprofv3 1.3.5; the run takes 9.9 s and slows the arm to
+5384.9 t/s, so it is a composition instrument only.
+
+| fact | number |
+| --- | --- |
+| `hsa_signal_wait_scacquire` | 1035 calls, **1847 ms** (75% of HSA API time) |
+| `hsa_executable_freeze` + `load_agent_code_object` | 40 + 40 calls, 431.5 + 156.6 ms = **588 ms** |
+| H2D copies | 169 / **82.4 ms** (487 us each) |
+| D2H copies | 24 / 1.3 ms |
+| allocation trace | 13 allocs 1.8 ms, 24 frees 33.7 ms |
+
+1. **The staging is CPU-bound.** `graph:set_inputs` is 326 ms of host region time and the transfers inside
+   it are 82 ms of H2D, so ~244 ms is the host gathering input. The HSA copy *enqueue* for all 193 copies
+   is 0.6 ms.
+2. **The "realloc" is a forced device sync, not an allocation.** 1645 of the region's 1689 ms is
+   `hsa_signal_wait_scacquire` (427 waits overlap those regions). The source says why: the branch is
+   `if (backend_ids_changed || !ggml_gallocr_alloc_graph(...))` and it calls `ggml_backend_synchronize()`
+   for every backend before `ggml_gallocr_reserve_n`, because the buffers may move. The allocator itself
+   costs 35 ms.
+3. **Why it trips every batch.** `GGML_SCHED_DEBUG_REALLOC=1` aborts at `ggml-backend.cpp:1627`:
+   `unexpected graph reallocation (graph size = 702, nodes = 702, leafs = 141)`. The region is always
+   `realloc_size` and never `realloc_buft`, so the buffer-type assignment is stable and so is the node
+   count; the only remaining input to `ggml_gallocr_needs_realloc` (`ggml-alloc.c:1053`) is a **tensor
+   byte-size change** - some tensor's `nbytes` differs between batches while the topology does not. So
+   this is a *sizes* trip, not a growing topology. Follow-up: log which tensor changes.
+4. **588 ms of the run is code-object loading** (40 kernel first-launches). A long-lived server pays it
+   once per process; these single-prompt runs pay it inside the wall, so discount it when comparing to
+   server behaviour.
 
 ## reads against
 
@@ -171,12 +202,17 @@ the 326 ms of `graph:set_inputs` cannot be split into CPU-side gather and transf
 - This is a T1 number on a **4-layer all-F32 dummy** (11.88 GiB): the *kernel mix* is not the quantized
   real model's, so only the host-side structure transfers - the per-call realloc churn, the staging, the
   sync split, and the host share of a step. It says nothing about the real model's GPU composition.
-- H19's territory: realloc churn is per call and grows with the graph (49 -> 81 ms as the context triples
+- H19's territory, corrected by the HSA data above: the realloc branch fires per batch, but 97% of its
+  region is the forced drain of the previous batch's kernels - time that has to pass anyway. What the
+  branch actually costs is the *overlap* it forbids: the staging (326 ms), build (5 ms) and checkpoint
+  (109 ms) that could have run during that drain, i.e. up to ~0.4-0.5 s of the 5.5 s wall, **not** the
+  1.7 s an earlier reading of the region suggested. Its root cause is a per-batch tensor-size change, which
+  is what a fix has to attack.
   while the call count grows to 21). If a later arm removes it, the pp wall has ~1.7 s to give back at
   32.68k on this box, and the check is the same host-side table, no tracer needed.
 - H26's mechanism reproduces on the dev box (1 q8_1 quantize per matvec) at 4 layers' scale.
-- Not measured here: the pool mode line (needs `-v`), H2D/D2H volume (needs memory-domain tracing), and
-  no A/B was run, so no effect size is claimed.
+- Not measured here: the pool mode line (needs `-v`), copy *volumes* (the copy trace has no size column
+  with these flags) and no A/B was run, so no effect size is claimed.
 - Trace side: the decode step is not launch-starved - 370 dispatches/step run back-to-back for 2.62 ms of
   the 4.18 ms step - so the host cost is real work (enqueue + sampler), not a launch wall. The prefill is
   the opposite: bursts of 13 kernels averaging 0.18 ms with the GPU idle two thirds of the wall.
