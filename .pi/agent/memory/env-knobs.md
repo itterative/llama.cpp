@@ -36,6 +36,7 @@ A bare `llama-bench` / `llama-server` run needs no env. Defaults from `6344fd41b
 | `Q4EXP_POOLED` | on | `=0` | pool indexer block keys at write time instead of re-deriving them per step | `llama-memory-hybrid-idx.cpp` | E044-E057 |
 | `GGML_CUDA_MMVQ_RDNA4_SMALL_K` | on | `=0` | RDNA4 mmvq block shape (worth 5.5-6.6% tg on 4 cards) | `mmvq.cu` | E055 |
 | `LLAMA_LAZY_PREFETCH` | on | `=0` | gather all distinct rows before waiting on any (the n-gram fetch, 5.4% -> 2.3% of the wall) | `llama-lazy-reader.cpp` | E058 |
+| `LLAMA_LAZY_PREFETCH_AHEAD` | on | `=0` | issue the next prefill batch's WILLNEED calls from the reader's own thread while the current batch computes, and let `gather()` skip its own loop when the row list matches; `=0` keeps the loop inline only | `llama-lazy-reader.cpp`, `llama-context.cpp`, `models/qwen4exp.cpp` | E077 |
 
 For A/B arms: an "off" arm that *omits* the variable is now the ON arm. Say `=0` (or the documented
 alternative value) explicitly.
@@ -68,6 +69,11 @@ set the tracer records nothing at all - `llama-bench`'s own implicit tg window w
 The region tables list **only regions that were hit**: an absent row means zero calls, not a missing
 instrument. That is what makes an absence readable - the bench box's missing `sched:realloc*` rows are a
 true zero (E074), verified against the same pre-fix commit printing them on the dev box (E075).
+
+The reader's prefetch thread deliberately emits no regions and no counters: the prof tables are plain
+globals with no lock, so only the calling thread may touch them. `lazy:prefetch` therefore reports the
+*inline* WILLNEED loop only, and `io:prefetch_rows` (counted on the caller) is how the thread's work shows
+up (E077).
 
 ## Internal allreduce tuning - leave alone unless debugging it
 

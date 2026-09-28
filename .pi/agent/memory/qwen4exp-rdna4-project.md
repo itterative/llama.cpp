@@ -335,7 +335,12 @@ before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default
 closed the cache question: the misses are compulsory first touches of a 133 MB working set, and the
 27.7-34.1% that do repeat are already free via the page cache, so no row cache host or GPU can win.
 What is left there is the tail (`lazy_gather` max 29-31 ms in every arm, so one row read can exceed a
-token's budget) and the ~0.5% the prefetch costs when a table does stay cached. B4 (the fork diff) and N4
+token's budget) and the ~0.5% the prefetch costs when a table does stay cached. **Its prefill half is now
+implemented (E077)**: the reader has a prefetch thread fed with the *next* window's rows and `gather()`
+skips its own WILLNEED loop on a match, so at prefill width the same syscalls run while the current batch
+computes. Rebuild is exact (12/12, 6/6 hits, no wasted pages); the dev box is flat because its rows are
+page-cache resident, and the box's cold 36.75 MB per ubatch is where it has to be measured.
+`LLAMA_LAZY_PREFETCH_AHEAD=0` is the control. B4 (the fork diff) and N4
 were dropped in the backlog sweep; `test-backend-ops`
 still needs a 7.1.1 re-baseline before it can serve as a correctness gate.
 

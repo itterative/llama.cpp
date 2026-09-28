@@ -380,6 +380,13 @@ All three are development work with an already-measured prize, and none needs th
   is the plausible cause if the memory reaches further back. To measure instead of remember:
   `rocprofv3 --kernel-trace` + `GGML_PROF_WINDOW=pp`, kernel time per pass against the wall
   (`graph:compute` is the async entry, not device time).
+- **E077 (2026-09-28): the n-gram read burst now runs one batch early.** `-lzm on-direct` prefetch had been
+  tuned at decode width; at prefill width a cold ubatch reads 12k-16k distinct rows (36.75 MB from storage on
+  the box) inside `set_inputs`, after the previous batch's enqueue. The reader now has a prefetch thread fed
+  with the *next* window's rows and `gather()` skips its own WILLNEED loop on a match
+  (`LLAMA_LAZY_PREFETCH_AHEAD=0` keeps the old behaviour). The window rebuild is exact (12/12 and 6/6 hits,
+  no wasted pages) and the dev box shows pp flat - its rows are page-cache resident, so only syscall time
+  moved and that was already hidden. The box's cold case is unmeasured and is the point of the item.
 
 ### H16 - 4-card decode comms: in-tree one-shot allreduce, +2.5% at depth, tied at 4k **done, opt-in**
 
