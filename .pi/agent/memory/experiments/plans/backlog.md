@@ -16,7 +16,10 @@ an image, `qsa_pool_get` promises more than the fast path verifies, and whether 
 H19's ratchet), H19 (the reservation ratchet outside H9: llama-cli and llama-perplexity re-reserve
 with the pool off), H18 (the MTP tax, now framed as over-drafting), H17b (is the chain 4x replicated),
 E008b (the measurement that decides the whole PLE/prefetch line), and the H13 leftovers. H9's prefill
-question is closed by E056, H9's correctness under mrope by E057.
+question is closed by E056, H9's correctness under mrope by E057. The four bench-only runs that need no
+development (E062 paired, the post-flip baseline) are written
+as exact commands in [bench-finish-bundle.md](bench-finish-bundle.md); E062's record points
+there. H20 is the agreed next development thread after that bundle.
 
 ---
 
@@ -369,17 +372,21 @@ question is closed by E056, H9's correctness under mrope by E057.
   gives `block key pool = 0` with zero mode lines and the same PPL. The other seven gates were not re-run:
   E056 already diffed all nine pool-off vs pool-on on the same build, and a default flip cannot change
   what either side computes.
-- **The tradeoff the flip accepts:** E050 measured the pool as *negative* for tg below ~32k (-3.7% at
-  d4096, ~0 at d16384, +2.6% at d40960, +30.1% at d131072), so short-context decode pays a little for a
-  feature it does not use. Those numbers predate the reservation fix and the flip, and E013's `-d` sweep
-  is the run that would re-draw the crossover. The branch targets 262k, which is why this is acceptable.
+- **The tradeoff the flip accepted, now closed:** E050 measured the pool as *negative* for tg below ~32k
+  (-5.1% at d4096, -2.5% at d16384, +2.6% at d40960, matching E045's +30.1% at d131072) on the build
+  *before* E056's reservation fix, whose per-ubatch re-reservation was itself the short-context tax. The
+  user reports the post-fix behaviour as a slight improvement rather than a loss and serves the pool on
+  by default, so the crossover re-draw (bundle item 4, E013's `-d` sweep) is closed without a run. The
+  nearest recorded support is E044's dev-box depth table (d4096 within noise, d16384 +5.6%) and E056's
+  pooled-prefill +2.4% over pool-off; the post-fix *decode* sweep the user refers to is not in the
+  records, so if its raw output exists it should be pasted into E050 rather than re-run.
 - **Still open:** states that are not one dense sequence (multi-seq under `--kv-unified`, an interior
   `seq_rm`) build the historic graph and so churn against a pooled reservation; closing that means making
   the general path build the pooled topology too (~40 lines in `set_input_qsa`, which already computes
   the per-block cells and positions).
 - Also open, and now on every run's bill: the pool taxes **354 MiB/card at ctx 245760**, so f16 storage
-  (H15/P3) went from "on the table" to "the default's cost"; and the crossover depth where pooling stops
-  paying is unexplained.
+  (H15/P3) went from "on the table" to "the default's cost". The crossover depth where pooling stops
+  paying is closed (above) - pre-fix numbers, and the fix was the tax.
 - **Separate bug found on the way (E056):** `llama-cli` and `llama-perplexity` re-reserve 13 and 120
   times per run **with `Q4EXP_POOLED=0`**, same ratchet, different first trigger. Nothing to do with H9;
   promoted to **H19** with the named tensor and the evidence.
@@ -560,9 +567,12 @@ question is closed by E056, H9's correctness under mrope by E057.
      step, on a box E039/E042 already measured as gap-dominated.
   3. Under `-sm tensor` the meta dispatch cost is per sub-graph, so 6 extra replays carry the overhead of
      6 extra layers.
-- **Cheapest diagnostics first:** scale `--n-draft 1,2,4,8` (linear in count = fixed per-replay,
+- ~~**Cheapest diagnostics first:** scale `--n-draft 1,2,4,8` (linear in count = fixed per-replay,
   sub-linear = compute), then one rocprofv3 pair of MTP decode vs plain decode (E042 method) to split
-  device ms from wall ms, then grep their load log for how many caches the draft ctx actually builds.
+  device ms from wall ms~~ **dropped 2026-09-27 on the user's call:** mtp works, acceptance runs 0.2-0.9
+  by task, and `n_max = 3` is what is served - so the `n_draft = 6` tax is not on any real run's bill and
+  neither the draft sweep (E048, closed) nor the E042-method trace is worth a bench session. Keep the
+  load-log cache count as a free check whenever a draft log is in hand.
 - **The same feature explains part of the VRAM pressure:** `need_n_rs_seq()` returns `draft.n_max`, so at
   `n_max = 6` the target's recurrent cache is 7x108 = **756 MiB** (their log: `size = 787.99 MiB ... 6
   rs_seq`) instead of 108 MiB, because `llama_memory-recurrent.cpp:101` allocates

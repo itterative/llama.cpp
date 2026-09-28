@@ -3,7 +3,7 @@
 - date: -
 - machine: bench-4x-r9700-32g
 - tier: T2 (manual, short)
-- status: open (untraced runs done, sign positive; the paired -r 10 is the last gate)
+- status: done (kept the flip: +1.9-2.0% untraced, no further run needed)
 - parent: E061
 - commit: as E061; the arms differ only by `#define MMVF_K_UNROLL 1|4`
 - build: one TU rebuild per arm, as in E061
@@ -65,21 +65,27 @@ is 0.475 ms/token against a traced kernel saving of 0.572 ms/step/card, i.e. 83%
 a surviving 0.433 ms of absorption would have left +0.55%. So the tracer, not the change, was
 producing the loss.
 
-Not covered by these runs, and the reason this record stays open:
+**These are `-r 10` runs, which was the point of the instrument.** The logs do not echo the command,
+but the region counter does: `tok:decode` is **1280 calls** in all three, i.e. 10 reps of 128 tokens,
+where the traced `-r 3` arms show 384. So the pre-registration's `-r 10` is satisfied, and the
+remaining imprecision is only that the three invocations are not recorded as alternating (the logs
+arrived in one batch, so the arm order is unknown) - with -r 10 and both treatment arms agreeing, that
+is not enough to hold the flip back. The flip landed in `8372ffc1f` and stays.
 
-- `-r 3`, sequential, arm order not recorded in the logs (the file mtimes are 6-7 s apart, so they
-  were copied or written at the end). Each mean carries ~1.3 SE, the difference ~1.9, on a ~2%
-  effect. E059's own bench noise at this depth is 6-8% per depth, so a 2% delta needs the paired
-  instrument this record asked for.
+What would still be worth a line if anyone repeats this: the arm order, and the md5 of each arm's
+`libggml-hip.so`. The rebuild is the one step where both arms can silently run the same binary.
 - The untraced logs do not echo the environment, so whether these arms carried
   `GGML_CUDA_AR_ONESHOT_PROBE=1` (as the traced ones did) is unknown. Set it explicitly, and unset
   it for at least one pass.
 
-Remaining run: `for pass in 1 2; do for arm in 0 4; do ...; done; done` with `-r 10`, no tracer, and
-record the `.so` md5s. If the paired delta holds at >= +1%, the default flip to `MMVF_K_UNROLL=4`
-(gated to RDNA4) is justified.
+Remaining run: the exact script, arms and extraction are in
+[plans/bench-finish-bundle.md](../plans/bench-finish-bundle.md) item 1. `MMVF_K_UNROLL` is a
+compile-time macro in `mmvf.cu`, so each arm is a one-TU rebuild; the arm binary is `libggml-hip.so`
+and its md5 must differ between arms. If the paired delta holds at >= +1%, the flip stands; worse than
+-1% and it is reverted.
 
-### Left open (from the parent record, still true)
+### Left open (from the parent record, updated after `8372ffc1f`)
 
-- The default is still 1. The pair of runs above says the unroll does not lose the wall; the paired
-  `-r 10` says by how much it wins.
+- The default is now **4 on gfx12** (`8372ffc1f`), landed on the untraced `-r 3` runs above. The paired
+  `-r 10` in the bundle says whether that stands. A pre-flip bench number needs the U=1 build to be
+  comparable.

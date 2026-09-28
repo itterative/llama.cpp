@@ -7,6 +7,11 @@ measurement - the numbers below are as quoted in chat.
 - `--n-draft 6`, acceptance ~0.25: **22.77 t/s** (E046).
 - `--n-draft 3`: **37-57 t/s depending on what is being done**.
 
+**Closed 2026-09-27 without the planned sweep** (bundle item 3): the user reports mtp working with
+acceptance from 0.2 to 0.9 depending on the task, and `n_max = 3` is what they serve, so the question the
+sweep would settle ("is over-drafting still costing a third of decode") does not apply to any real run -
+it was a property of `n_draft = 6`. No raw output exists for the 37-57 t/s figure and none is needed now.
+
 The spread in the second number is why this can't be read as a ratio: the range is wide enough that it
 covers both "modest gain" and "roughly doubled", and the no-spec reference for the same session is
 unknown (E045-era reference: 34.86 t/s). What is solid: cutting draft count from 6 to 3 is worth tens of
@@ -36,7 +41,11 @@ measured gain beat the prediction.
 ## Follow-up
 
 1. Re-run n = 1, 2, 3, 6 in one session with `drafts`/`accepted` counts per arm, so the yield is
-   measured instead of assumed, plus the no-spec reference in the same session.
+   measured instead of assumed, plus the no-spec reference in the same session. The server JSON
+   instrument (`.timings.draft_n` / `.timings.draft_n_accepted`), the per-arm server launches and the
+   extraction are in [plans/bench-finish-bundle.md](../plans/bench-finish-bundle.md) item 3.
+   `llama-bench` cannot do this, and `--spec-draft-n-max` is a launch flag, so it is one server launch
+   per arm.
 2. Then the accounting question: with `n = 3` the remaining gap is small enough that H18's "is it the
    draft ctx's host cost" may stop mattering. The split is available from existing llama.cpp perf data
    (see the H18 note on `common_perf_print` and the draft ctx being invisible to it).
