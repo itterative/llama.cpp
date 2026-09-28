@@ -1463,6 +1463,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
 
+    // [GGML_ALLOC_DEBUG_REALLOC] which graph reports dependencies, and which of them become nodes. tagged with
+    // the measure graph's node count, because the node count is what decides whether a reservation survives
+    const bool dbg_deps = getenv("GGML_ALLOC_DEBUG_REALLOC") != nullptr;
+
+    if (dbg_deps) {
+        GGML_LOG_INFO("%s: alloc-deps: graph %d nodes: %zu deps\n", __func__, graph->n_nodes, alloc_deps.size());
+        for (const auto & it : alloc_deps) {
+            GGML_LOG_INFO("%s: alloc-deps: graph %d reported until %s\n", __func__, graph->n_nodes, it.first->name);
+        }
+    }
+
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
     int n_dep_nodes = 0;
     for (const auto & it : alloc_deps) {
@@ -1527,6 +1538,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // add a dependency node so that the kept tensors are not freed before this node is computed
             auto it = alloc_deps.find(graph->nodes[j]);
             if (it != alloc_deps.end()) {
+                if (dbg_deps) {
+                    GGML_LOG_INFO("%s: alloc-deps: graph %d emits a dep node for %s\n", __func__, graph->n_nodes, it->first->name);
+                }
+
                 const std::vector<ggml_tensor *> & keep = it->second;
                 for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
                     struct ggml_tensor * dep = ggml_view_tensor(sched->ctx, keep[k]);
