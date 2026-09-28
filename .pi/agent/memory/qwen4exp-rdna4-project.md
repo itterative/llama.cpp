@@ -315,7 +315,8 @@ weighted-reduction fusion (upstream #25952) reported its keep-alive allocation d
 work, and the scheduler's node count decides whether a reservation survives, so prefill retightened the
 reservation on every ubatch: 34 reallocs, 1689 ms of a 5699 ms wall, one forced device drain each. Fix:
 `require_work` on the matcher, false at the dep call site and true at compute, so the fusion still runs. Dev
-box: 0 reallocs, prefill wall 4819-5075 ms, VRAM unchanged, PPL bit-identical. Invariant for any future
+box: 0 reallocs, prefill wall 4819-5075 ms, VRAM unchanged, PPL bit-identical, and **+16.4% pp** in the
+dev-box llama-bench path where every allocation used to re-reserve (E075). Invariant for any future
 fusion: it must not change the graph's node count per batch. Tooling: `GGML_ALLOC_DEBUG_REALLOC=1` (needs `-v`).
 
 **T2 bounds it (E074)**: the bench box's dense prefill never re-reserved (0 `sched:realloc*` rows in both prof

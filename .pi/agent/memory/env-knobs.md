@@ -65,6 +65,10 @@ trace of either phase needs `GGML_PROF_WINDOW`, the phase label is unaffected by
 set the tracer records nothing at all - `llama-bench`'s own implicit tg window was removed in
 `cc6be7d35`, so a pp and a tg window in one run no longer bleed into each other.
 
+The region tables list **only regions that were hit**: an absent row means zero calls, not a missing
+instrument. That is what makes an absence readable - the bench box's missing `sched:realloc*` rows are a
+true zero (E074), verified against the same pre-fix commit printing them on the dev box (E075).
+
 ## Internal allreduce tuning - leave alone unless debugging it
 
 All in `allreduce-p2p.cu` / `allreduce-host.cu`, all with working defaults:
