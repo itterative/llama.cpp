@@ -1748,48 +1748,85 @@ static int llama_prof_decode_limit(void) {
     return val;
 }
 
-// the capture window is a separate ask from the phase regions: resume/pause decides what a rocprofv3
-// --selected-regions run records, so it stays opt-in. opens on the first decode batch, closes on the
-// next wider one or at exit
-static bool llama_prof_window(void) {
-    static const bool val = getenv("GGML_PROF_DECODE") != nullptr;
+// which phase the capture window covers: GGML_PROF_WINDOW=pp|tg|both. the legacy spelling is
+// GGML_PROF_DECODE set (tg) and unset (no window)
+enum llama_prof_window_phase {
+    LLAMA_PROF_WINDOW_PP   = 1 << 0,
+    LLAMA_PROF_WINDOW_TG   = 1 << 1,
+    LLAMA_PROF_WINDOW_BOTH = LLAMA_PROF_WINDOW_PP | LLAMA_PROF_WINDOW_TG,
+};
+
+static int llama_prof_window_mask(void) {
+    static const int val = []() -> int {
+        const char * env = getenv("GGML_PROF_WINDOW");
+        const int    tg  = getenv("GGML_PROF_DECODE") != nullptr ? LLAMA_PROF_WINDOW_TG : 0;
+
+        if (env == nullptr) {
+            return tg;
+        }
+
+        if (strcmp(env, "pp") == 0 || strcmp(env, "prefill") == 0) {
+            return LLAMA_PROF_WINDOW_PP;
+        }
+
+        if (strcmp(env, "tg") == 0 || strcmp(env, "decode") == 0 || strcmp(env, "1") == 0) {
+            return LLAMA_PROF_WINDOW_TG;
+        }
+
+        if (strcmp(env, "both") == 0 || strcmp(env, "all") == 0) {
+            return LLAMA_PROF_WINDOW_BOTH;
+        }
+
+        if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
+            return 0;
+        }
+
+        LLAMA_LOG_WARN("%s: unknown GGML_PROF_WINDOW '%s'; using %s\n", __func__, env, tg ? "tg" : "off");
+
+        return tg;
+    }();
 
     return val;
 }
 
-static bool llama_prof_decode_open = false;
+// the capture window is a separate ask from the phase regions: resume/pause decides what a rocprofv3
+// --selected-regions run records, so it stays opt-in. opens on the first batch of a selected phase,
+// closes as soon as a batch is not in it, or at exit
+static bool llama_prof_window_open = false;
 
-static void llama_prof_decode_close(void) {
-    if (llama_prof_decode_open) {
+static void llama_prof_window_close(void) {
+    if (llama_prof_window_open) {
         ggml_prof_window_end();
 
-        llama_prof_decode_open = false;
+        llama_prof_window_open = false;
     }
 }
 
-static bool llama_prof_decode_touch(int n_tokens) {
+static bool llama_prof_window_touch(int n_tokens) {
     const bool is_decode = n_tokens <= llama_prof_decode_limit();
+    const int  mask      = llama_prof_window_mask();
 
-    if (!llama_prof_window()) {
+    if (mask == 0) {
         return is_decode;
     }
 
-    if (!is_decode) {
-        llama_prof_decode_close();
+    // the phases differ in width, so 'both' keeps one window open across the whole run
+    if (is_decode ? !(mask & LLAMA_PROF_WINDOW_TG) : !(mask & LLAMA_PROF_WINDOW_PP)) {
+        llama_prof_window_close();
 
-        return false;
+        return is_decode;
     }
 
-    if (!llama_prof_decode_open) {
-        static const bool registered = []() { atexit(llama_prof_decode_close); return true; }();
+    if (!llama_prof_window_open) {
+        static const bool registered = []() { atexit(llama_prof_window_close); return true; }();
 
         (void) registered;
 
         ggml_prof_window_begin();
-        llama_prof_decode_open = true;
+        llama_prof_window_open = true;
     }
 
-    return true;
+    return is_decode;
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -1810,7 +1847,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // declared ahead of the returns below so the region is closed on every path
-    const bool                      prof_decode = llama_prof_decode_touch((int) batch_inp.tokens.size());
+    const bool                      prof_decode = llama_prof_window_touch((int) batch_inp.tokens.size());
     std::optional<ggml_prof_region> prof;
 
     if (ggml_prof_enabled()) {
@@ -1818,7 +1855,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         prof.emplace(prof_decode ? "phase:decode" : "phase:prefill");
 
-        ggml_prof_count(prof_decode ? "tok:decode" : "tok:prefill", (uint64_t) batch_inp.n_tokens);
+        ggml_prof_count(prof_decode ? "tok:decode" : "tok:prefill", (uint64_t) batch_inp.tokens.size());
     }
 
     const auto & vocab   = model.vocab;
