@@ -402,7 +402,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -468,6 +468,19 @@ struct ggml_backend_meta_buffer_context {
         }
         return stc_compute[stc_compute_index];
     }
+
+    // per-device slices of a tensor, or nullptr when it has none in the container it would be looked up in
+    std::vector<ggml_tensor *> * find_simple_tensors(const ggml_tensor * tensor) {
+        auto it = stc_static.simple_tensors.find(tensor);
+        if (it != stc_static.simple_tensors.end()) {
+            return &it->second;
+        }
+        auto it_compute = stc_compute[stc_compute_index].simple_tensors.find(tensor);
+        if (it_compute != stc_compute[stc_compute_index].simple_tensors.end()) {
+            return &it_compute->second;
+        }
+        return nullptr;
+    }
 };
 
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -494,12 +507,11 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
-    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
-    auto it = stc.simple_tensors.find(tensor);
-    if (it == stc.simple_tensors.end()) {
+    std::vector<ggml_tensor *> * simple_tensors = buf_ctx->find_simple_tensors(tensor);
+    if (simple_tensors == nullptr) {
         return nullptr;
     }
-    return it->second[index];
+    return (*simple_tensors)[index];
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
