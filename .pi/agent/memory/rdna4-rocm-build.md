@@ -60,6 +60,20 @@ Workaround instead of static: set `CMAKE_INSTALL_RPATH`/`CMAKE_BUILD_RPATH` to `
 tables and exercised two-week-old code. Set the variable, or `cmake --install build` first; a build with
 no `[prof]` banner under `GGML_PROF_REGIONS=1` is the symptom to check for.
 
+**ROCm 10.0.0 (2026-09-28)** `[v]`: prefix `/opt/rocm-10.0.0`, with `/opt/rocm` a symlink to it;
+`hipconfig -l` = `/opt/rocm-10.0.0/lib/llvm/bin`, so `$(hipconfig -l)/clang` is the HIP compiler.
+`hipconfig --version` still reports 7.15, only the prefix separates the SDKs. Fedora's ROCm is gone:
+`/usr/lib64/rocm/` is an empty leftover and `llvm/bin/clang` under it no longer exists, so a cmake cache
+from that era holds a dead path and **a plain reconfigure keeps it** - pass `-DCMAKE_HIP_COMPILER`
+explicitly or drop the cache. ROCm 10 also brings `rocprofv3` and `librocprofiler-sdk-roctx.so`, so on
+this box the roctx sink resolves and `--selected-regions` records.
+
+**Its libraries are not in the loader cache** `[v]`: `ldconfig -p` has 0 rocm entries and
+`/etc/ld.so.conf.d` holds only `llvm18-x86_64.conf`, while the build tree's RUNPATH covers just
+`build/bin`, so `libhipblas.so.3` fails to load. Put `/opt/rocm/lib` on the path -
+`LD_LIBRARY_PATH=$PWD/build/bin:/opt/rocm/lib`, or `/etc/ld.so.conf.d/rocm.conf` plus `ldconfig`. The
+systemd unit needs it too; the old install worked only because Fedora's ROCm libs sat in `/lib64`.
+
 ## Knobs: what is real and what is inert on RDNA4
 
 | knob | status on gfx1201 |
