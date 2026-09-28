@@ -354,6 +354,43 @@ pure host work with no numerics in it.
   cleared when exceeded. Keys are addresses that are never dereferenced and the split state holds no
   pointers, so a stale entry is at worst a wrong number, and clearing is always sound; the cap only gives a
   long-lived process a ceiling. It does not fire at the observed sizes (27k inits per pass, ~9k entries).
+
+### P9d: container lookups and the name copy (pre-registered 2026-09-28, before the change)
+
+Hypothesis: the leftover prep (box 1.11 us, dev box 1.22 us of a per-init 1.87 us) is not one thing. Two
+parts are lookups that do not need to walk a tree: `simple_tensors` in each container is a `std::map` keyed
+by pointer, hit once or twice per init and once per source state lookup, and `ggml_backend_meta_buffer_simple_tensor`
+fetches the container and then searches the same map again. A third part is `ggml_set_name` per sub-tensor
+(four times per init on the box), a `strncpy` that NUL-pads a name that is already a bounded array on both
+sides.
+
+Change: `simple_tensors` to `unordered_map` (pointer keys, `std::hash` is enough); one lookup that returns
+the per-device vector, used where both the container and the vector were fetched; array copy for the name.
+
+Deciding metric: `meta:init_prep_ns` and the per-init total on the dev box (`-sm tensor` harness,
+`GGML_PROF_REGIONS=1`), then the same counters on the box. Gate: PPL with `-sm tensor` bit-identical at
+266980.6971.
+
+Expected: dev box prep 1.22 -> <=1.05 us and total 1.87 -> <=1.75 us (box prep 1.11 -> <=0.95), so ~7%.
+That is under the box run-to-run noise, so P9d is judged on counters, not on pp. Falsifier: prep does not
+move, in which case the leftover really is the recompute and the container type is irrelevant.
+
+**Result, dev box, 27,172 inits, two passes:** total 1.885 -> **1.626 us (-13.7%)**, above what was asked
+for, but not where it was predicted. In phase terms prep 1.22 -> 1.21-1.26 us (**flat, the falsifier fires**),
+create 175 -> 130 (-45, the name copy), srcs 184 -> 66-68 (-118), tail 303 -> 212-227 (-85). So the
+container type was worth nothing inside the state lookup, where the sources are already cached, and
+`simple_tensors` only mattered where it is searched or written on its own: the second search in
+`ggml_backend_meta_buffer_simple_tensor` and the insert in the tail. gate: PPL with `-sm tensor`
+bit-identical at 266980.6971, pp4096 1702-1712 against 1707.80 before, i.e. flat as expected on one card.
+Box projection: the name copy and the source loop scale with the sub-buffer count, so ~2.32 -> ~2.0 us per
+init, ~15.8 -> ~13.5 ms/ubatch, which is ~0.2% of wall and not resolvable on the box.
+
+Ceiling, written down before measuring so the result cannot be read as more than it is: the per-init floor
+is ~1.5-1.9 us and the bulk of it is the four per-device sub-tensor structs (bump alloc, field copies,
+`ggml_backend_buffer_init_tensor`), which the meta design requires per graph. So P9 is close to exhausted as
+a wall lever, and the residual exists only because prefill rebuilds its graph every ubatch: the structural
+fixes are P2a (blocked) and P10. P9c would take the recompute out but is a content-keyed memo, i.e. new
+machinery for ~0.2% of wall.
 - **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
   PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
