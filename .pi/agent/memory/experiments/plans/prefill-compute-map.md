@@ -312,14 +312,21 @@ pure host work with no numerics in it.
   graph reuses arena structs, so the first mismatch of each ubatch drops everything and every later tensor
   recomputes.
 - **Two fix candidates, cheapest first.**
-  1. Evict the one stale entry instead of clearing the cache. The memcmp guard runs per lookup, so
-     per-entry eviction is no less correct; whether it pays depends on how often a tensor's stored bytes
-     repeat between ubatches, and the stored copy includes fields the walk itself writes (`data`,
-     `buffer`), so this wants a measurement, not an argument.
-  2. Memoise on a content key: `(op, type, ne, nb, view state, the sources' state hashes)` in an
-     unordered_map. Survives graph rebuilds by construction, makes pointer reuse and the memcmp
-     irrelevant. Bigger change, same prize.
-- **Next step:** try 1 first, a few lines; fall back to 2 if the win does not appear.
+  1. ~~Evict the one stale entry instead of clearing the cache.~~ **Ruled out as unsound 2026-09-28.** The
+     split state is a pure function of the *sources'* states (`handle_generic(src_ss)`, `handle_flash_attn_ext(src_ss)`,
+     `handle_gated_delta_net(src_ss)`, ...), so an entry whose own bytes still match can be stale because a
+     source's shape changed under a stable pointer. The whole-cache clear is what invalidates those
+     descendants; per-entry eviction would serve a wrong state and the PPL gate would have to catch it.
+  2. **Cut the lookup cost, keep the invalidation.** Roughly 6-8 of the 11 ms/ubatch is the lookups, not the
+     recompute: one `get_simple_tensor_container` plus 5.97 source lookups per init (from
+     `meta:init_src_remaps`), each a `std::map` find on a pointer-pair key over ~6800 entries plus a
+     400-byte `memcmp`. A per-graph generation counter plus an `unordered_map` keyed by pointer removes the
+     `memcmp` and the mid-graph clears and makes the lookups O(1), with states still recomputed once per
+     tensor per ubatch. Sound, smaller change, ~6-7 ms/ubatch.
+  3. **Content-keyed memo** `(op, type, ne, nb, view state, sources' state hashes)`: the only variant that
+     survives a rebuild, so the recompute goes too. ~10-11 ms/ubatch, more code in the delicate part of the
+     file.
+- **Next step:** 2 first; 3 if the leftover recompute still shows in `meta:init_prep_ns`.
 - **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
   PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
