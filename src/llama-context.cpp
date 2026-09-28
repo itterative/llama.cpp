@@ -2656,6 +2656,19 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
+    // optional: shift the reserve ubatch to the end of the context so the reservation covers the worst case
+    // (n_kv = n_ctx at the real batch width). the gallocr accepts any smaller graph later, so one such reserve
+    // removes the per-padding-step re-reserve and its device sync for the whole session. see E066/H19/E068
+    static const bool worst_case = getenv("LLAMA_RESERVE_WORST_CASE") != nullptr;
+
+    if (worst_case && ubatch.n_tokens <= cparams.n_ctx) {
+        const llama_pos off = (llama_pos) (cparams.n_ctx - ubatch.n_tokens);
+
+        for (uint32_t i = 0; i < ubatch.n_tokens * (uint32_t) model.hparams.n_pos_per_embd(); ++i) {
+            ubatch.pos[i] += off;
+        }
+    }
+
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     auto * res = gf_res_reserve.get();
