@@ -1,6 +1,6 @@
 # Backlog, answered - kept for the record, do not re-open
 
-Everything here is finished, killed or superseded: 30 threads. It was the bottom of
+Everything here is finished, killed or superseded: 32 threads. It was the bottom of
 `backlog.md` until 2026-09-27, when the open material was split out so the backlog could answer "what
 next" without the archaeology. Bodies are verbatim apart from the old `##` group headings.
 
@@ -9,6 +9,7 @@ item here is described as open somewhere else, that pointer is stale - fix the p
 
 - ~~B3 - dev-box ROCm version policy~~ resolved: upgraded
 - B5 - rebuild the dev tree against ROCm 7.1.1
+- ~~B2 - bench box facts still unknown~~ answered: ROCm 10.0.0, one Zen3 root complex, 64 GB RAM
 - ~~P1 - which ops fall off the GPU~~ measured
 - ~~P4 - which FA family does gfx1201 get~~ `mma_f16` for prompt processing, not for decode
 - ~~P5 - does the model fit~~ capacity is not the constraint on this box
@@ -21,6 +22,7 @@ item here is described as open somewhere else, that pointer is stale - fix the p
 - H15 - keep the indexer gather and pooling in f16 **superseded by H9, ceiling cut by E053**
 - ~~H17 - is the QSA selection global or per-device under `-sm tensor`?~~ no correctness bug
 - H18 - why does `draft-mtp` cost a third of decode throughput on the 4-card box?
+- ~~H19 - the reservation ratchet is not H9's alone~~ fixed by E069-E073, priced at +16.4% pp by E075
 - ~~H23 - give mul_mat_vec_f's narrow rows more independent work per thread~~ answered by E061: real, but the allreduce absorbs it
 - ~~H24 - the ~3.5 us launch/tail floor on 170+ tiny mmvf calls per step~~ mostly closed by E061: they were ILP-bound
 - ~~E007 - drop `-ot per_layer_token_embd=CPU`~~ killed by the user, confirmed in code
@@ -55,6 +57,22 @@ item here is described as open somewhere else, that pointer is stale - fix the p
   removed `compiler-rt18` and `libomp18`.
 - **Status:** presumably done - E019 re-baselined the ops gate on 7.1.1 on this box, which required it.
   Close formally on the next clean configure.
+
+---
+
+### ~~B2 - bench box facts still unknown~~ answered (user, 2026-09-28)
+
+- **ROCm version: 10.0.0** (user). That is the stack B3 wants the bench box re-baselined on, and the same
+  major release the dev box moved to on 2026-09-28.
+- **PCIe topology:** `../results/user/lspci.log` - four Navi 48 R9700 at BDF 0b/10/13/19 under one Zen3
+  root complex through two levels of PCIe switches; Navi 48 has no Infinity Fabric, so every inter-card
+  byte crosses the host bridge. `../../rdna4-rocm-build.md` already carried that reading.
+- **System RAM: 64 GB** (user). The 62.7 GiB the 2026-09-18 screenshot shows is the same machine after
+  firmware reserve, and it is what made `-lzm off` (E014) feasible again.
+- The gfx target was already known: **gfx1201 on both boxes** (user-confirmed), so a dev build is
+  ISA-valid there.
+- `../hw/bench-4x-r9700-32g.md` carries the three facts now; what it still lists as unconfirmed is the
+  driver version, CPU model and OS.
 
 ---
 
@@ -248,6 +266,92 @@ item here is described as open somewhere else, that pointer is stale - fix the p
     proves the nextn fusion weights exist, because `graph_mtp` asserts `layer.nextn.eh_proj`, `enorm`,
     `hnorm` and `hc_head_norm` non-null. What stays unknown is specifically the indexer.
 - **Scope:** decode, 4-card.
+
+### ~~H19 - the reservation ratchet is not H9's alone~~ fixed by E069-E073, priced by E075
+
+**Resolution (from the 2026-09-28 focus list).** SOLVED (E069-E073, 2026-09-28): fixed in `ggml-cuda.cu`, 4
+lines. Cause: the HIP MoE weighted-reduction fusion (upstream #25952) reported its keep-alive allocation
+dependencies only when the reduction had work, and prefill's last-layer reduction can be empty
+(`ne[2] = 0`: the batch carries no output tokens). The scheduler turns each dependency into a keep-alive
+view node and tests the node count before any size, so the graph's structure changed per batch, the
+reservation was retightened on the first prefill ubatch, and every later ubatch - whose MoE and mask
+tensors grow by one padding step - re-reserved and drained the device. `ggml_cuda_match_moe_weighted_reduction`
+now takes `require_work`, false at the dependency call site and true at compute, so the fusion still skips
+empty reductions but the node count no longer depends on the batch.
+Measured (dev box, cli, sparse corpus, `-b 2048 -ub 1024 -c 32768`): reallocs 34 -> **0**,
+`sched:realloc_size` 1689-1776 ms -> **0**, prefill wall 5539-5725 -> **4819-5075 ms**, peak VRAM
+unchanged, PPL bit-identical `263100.7437`. **Dev-box llama-bench gives the fix its price tag (E075):
++16.4% pp** (`pp8192` 13248.27 -> 15419.44 t/s at `-r 3`), because pre-fix *every* allocation re-reserved
+(24/24, 1218.55 ms = ~73% of the measured prefill wall) and post-fix `graph:alloc` drops from 50.9 to
+0.16 ms/call.
+Historical note, kept because it is the audit trail: the prize was 0.57 ms/token in decode (E062: 35
+`graph:alloc` calls at 21.0 ms per 1280 decode tokens, pool on and off; E056: 13 and 120 re-reserves per
+run for llama-cli and llama-perplexity) plus a larger prefill instance (E065: 34 reallocs, 1689 ms, 31%
+of the wall, 1645 ms of it the forced `hsa_signal_wait_scacquire`). E066 settled the rate - one event per
+256-token padding crossing, inference graph node count constant at 667 - and E067/E068 showed that a slack
+on `size_max` faults the GPU while a worst-case reservation is viable but was not the lever. E069 named the
+tensor (`qsa_bias`), E070 falsified the output-convention route, E071 found the single extra node,
+E072 traced it to the fusion, E073 fixed it. **Invariant for any future fusion: it must not change the
+graph's node count per batch.**
+**T2 puts bounds on it (E074)**: the bench box's *dense* prefill shows 0 `sched:realloc*` rows in both prof
+arms, so it never re-reserved and the fix is neutral for that workload - the T2 exposure is the
+non-dense/pinned/vision path (H22) and the request path, and a `llama-cli`/server run with regions is what
+would show it there.
+Related and measured on T2 while checking this (E074): the MoE weighted-reduction fusion is worth **8.75% of
+pp** (2138.37 vs 1951.32 t/s at pp4096 @ d16384).
+Why the bench box is silent is **left unattributed deliberately** - H19 is closed here (E075): the flag axis
+is measured and **excluded** (`--lazy-mode on-direct`, `--load-mode none`, the log's `lm` column,
+`-d 16384` and the PLE-CPU override all still reallocate 24/24 or 40/40 on the pre-fix build). The two
+axes that remain - the model (4-layer test model against the real one) and the 4-GPU tensor split - are not
+worth a bench session on their own; the probes are recorded in E075 (on `32ba4c666` with
+`GGML_ALLOC_DEBUG_REALLOC=1 LLAMA_UBATCH_DEBUG=1 -v`, or `-sm layer` against `-sm tensor`) in case H22 or
+the vision path turns the same thing up.
+What the closure moved out rather than archiving: the normal `graph:alloc` cost (~20.5 ms/call, ~5% of T2
+prefill) went to **E016**, and the E074 prefill-utilisation observation to **H11**; the fusion's unmeasured
+decode value stays noted in E074's own record.
+
+**Original thread body (E056), verbatim:**
+
+- **Found by E056**, which removed the pool's own contribution and then measured the residue. Counts on
+  `q4exp-4l`, `-sm none`, **identical with `Q4EXP_POOLED=0` and `=1`**: `llama-cli -c 4096 -n 2500 -st`
+  13 in both arms, the `-c 1024 -n 2000` shift stress 6 in both, `llama-perplexity -b 256 -c 2048` 120 in
+  both (its runtime node count alternates 696/697, 30 of the 120 on the count). `llama-bench` pp/tg: 0.
+  Note `llama-cli` in this build runs on the merged server machinery, so its log carries `srv`/`slot`/`que`
+  lines.
+- **Same three-act ratchet as H9's.** The reservation is `n_tokens 512, n_seqs 1, n_outputs 1` -> 697
+  nodes / 138 leafs, 231.39 MiB. Then, in order: a node-count change at t=2.263 s, `node
+  model.input_embed is not valid` (a size) at 2.343, a second node-count change at 2.365 - all inside the
+  first 110 ms of the prompt phase - and after that ten size events spaced exactly ~1.06 s apart.
+- **The 1.06 s is 256 generated tokens, and 256 is the cache's own padding:** `llama_kv_cache::get_n_kv`
+  (`llama-kv-cache.cpp:1260`) rounds n_kv up to `max(n_pad, 256u)`, "so that the graph remains constant
+  across batches and can be reused". So `can_reuse` holds for 256 decode steps (no alloc at all), then
+  n_kv jumps and every depth-proportional tensor jumps with it.
+- **The growing tensor is named.** `leaf_111` is the src of `node #517 (GET_ROWS)` whose other src is
+  `cache_idx_k_l3`, i.e. `ggml_get_rows(k_all, inp->blk_cells)` in `build_qsa_top_k`, so it is
+  **`blk_cells`**, I32 `[ratio*n_blocks, n_stream]`: 16 KB at the reserve's n_kv=4096 (4 B x 4 x 1024
+  blocks) and stepping 1K -> 2K -> 3K in the `GGML_SCHED_DEBUG=2` assignment listing. `attn_inp_kq_mask`
+  and the QSA block bias grow alongside it.
+- **The ten decode events are collateral, not the bug.** n_kv can never exceed n_ctx, so had the
+  worst-case budget survived the prompt phase there would be zero re-reserves in the whole session -
+  which is what llama-bench shows, and what E056 bought for the pool.
+- **Gap: the root cause is unnamed.** What are the two node-count changes? The reserve is built with
+  `n_outputs = 1` and `n_seqs = n_seq_max` and passes `sampling.samplers` into
+  `ubatch_prepare_reserve`/`resolve_fused_ops`, while the server's prompt ubatches carry 0 outputs except
+  the last one, so the output/fused-sampler path is the only part of the graph whose node set can depend
+  on that. `build_inp_out_ids` deliberately keeps its topology constant (its comment cites PR 14275), so
+  it is not the obvious candidate; perplexity's 696/697 is a single node, which fits that family.
+  **Cheapest probe:** three lines in `process_ubatch` printing `ggml_graph_n_nodes(gf)`/`n_leafs` next to
+  n_tokens/n_outputs, or re-add E056's split-graph dump. One 90 s run.
+- **The user's read is that this belongs to the utils, not to `llama-server`.** The evidence so far points
+  the other way (cli and perplexity churn, bench does not), but it does not settle it: `llama-cli -st` is
+  one slot with no prompt-cache reuse and no keep-alive, so a real server session is untested. One curl
+  request against a server started with `GGML_PROF_REGIONS=1` and a `sched:realloc` count decides it.
+- **Cost:** ~25 ms per event here, ~300 ms on 4 cards (run8's `realloc_size` ms/call). A 2500-token turn
+  throws away ~0.3 s locally and ~4 s on the bench box, and a 4000-token generation re-reserves ~16 times.
+  It is a per-turn tax rather than a per-prefill one, which is why it hides under everything else.
+- **Scope:** every tool, both split modes, and probably not qwen4exp-specific once the node-count
+  difference is named - any arch whose host inputs scale with n_kv ratchets the same way, it only takes
+  one early mismatch to start it.
 
 ### ~~H23 - give mul_mat_vec_f's narrow rows more independent work per thread~~ answered by E061: real, but the allreduce absorbs it
 

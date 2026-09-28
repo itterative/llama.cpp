@@ -89,8 +89,9 @@ Two follow-ups that this raises directly:
 `per_layer_token_embd.weight` is category `TOKEN_EMBD` (`src/llama-quant.cpp:104-107`), so
 it follows `--token-embedding-type` and can be pinned individually with `--tensor-type`
 (`src/llama-quant.cpp:686-700`). That is the lever that decides whether this model is
-runnable at all on the bench box, and it is why P5/B2 (per-card VRAM) is now blocking
-rather than merely useful.
+runnable at all on the bench box. The two questions it raised are settled: P5 closed
+capacity (it fits) and B2's 64 GB system RAM is now recorded in `hw/bench-4x-r9700-32g.md`
+along with the box's 128 GB of VRAM - so this is a placement/tuning lever, not a blocker.
 
 ## Where the dummy model will mislead, ranked
 
