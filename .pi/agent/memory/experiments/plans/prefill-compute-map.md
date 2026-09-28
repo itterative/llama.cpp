@@ -344,8 +344,13 @@ pure host work with no numerics in it.
   15.8 ms of the 489 ms ubatch, and **`pp4096 @ d16384` 2070.90 -> 2076.09 +- 2.40** (+0.25%). The host
   saving is ~0.9% of the ubatch and the wall sees 0.25%, so pass-through is roughly a third - the same ratio
   E077 found, and a reminder that host-side items have to be priced through it. `sched:init_nodes` reads
-  21.26 against 22.25 ms/call; the two `erase` calls per init sit outside the timed phases, so they are in
-  that region but not in the counters.
+  21.26 against 22.25 ms/call, i.e. -1.0 ms/ubatch = -0.20%, against a pp move of +0.25%: the region delta
+tracks the wall, and the per-init counters overstate the saving about 4x because they time phases the ubatch
+as a whole partly hides. **An earlier draft of this section read the +0.25% against the -0.86% host estimate
+and concluded pass-through was ~1/3; the P9d box run falsified that** (region -2.65 ms = -0.54%, pp +0.54%).
+For host-side prefill work in llama-bench's pp measurement the conversion is about 1:1, so `sched:init_nodes`
+is the metric to quote, not the ns counters. The two `erase` calls per init sit outside the timed phases, so
+they are in that region but not in the counters.
 - **Left on the table, box numbers:** prep is still the top phase at 1.11 us of 2.32 (48%), and it is the
   per-graph recompute plus a `std::map` find in `stc.simple_tensors` (once per init and once per source
   lookup). Switching that container to an `unordered_map` is the same trick again and cheap; P9c's content
@@ -385,14 +390,23 @@ container type was worth nothing inside the state lookup, where the sources are 
 create, i.e. ~20-25 ns per init, which is why it did not survive review. Gate: PPL with `-sm tensor`
 bit-identical at 266980.6971, pp4096 1702-1712 against 1707.80 before, i.e. flat as expected on one card.
 Box projection: the source loop scales with the sub-buffer count, so ~2.32 -> ~2.05 us per init, ~15.8 ->
-~14 ms/ubatch, which is ~0.2% of wall and not resolvable on the box.
+~14 ms/ubatch, which was called "~0.2% of wall and not resolvable on the box"; the box run below resolved
+it. **Result, box run 2026-09-28** (`results/user/llama-bench/80828db67/run-prof.log`): per init 2.32 ->
+**1.965 us** (prep flat at 1.10, create 541 -> 466, srcs 354 -> 168, tail 315 -> 231), `sched:init_nodes`
+21.26 -> **18.61 ms**, `pp4096 @ d16384` 2076.09 -> **2087.29 +- 1.63 (+0.54%)**. P9b + P9d together: per
+init 2.94 -> 1.965 us, 20.0 -> 13.4 ms of the ubatch, pp 2070.90 -> 2087.29 (+0.79%). That build still had
+the name copy in it (~20 ns per init); the commit that shipped drops it, so expect the shipped build within
+this run's spread.
 
-Ceiling, written down before measuring so the result cannot be read as more than it is: the per-init floor
-is ~1.5-1.9 us and the bulk of it is the four per-device sub-tensor structs (bump alloc, field copies,
-`ggml_backend_buffer_init_tensor`), which the meta design requires per graph. So P9 is close to exhausted as
-a wall lever, and the residual exists only because prefill rebuilds its graph every ubatch: the structural
-fixes are P2a (blocked) and P10. P9c would take the recompute out but is a content-keyed memo, i.e. new
-machinery for ~0.2% of wall.
+Ceiling, written down before measuring so the result cannot be read as more than it is, and revised after the
+pass-through correction: the per-init floor is ~1.3-1.5 us, and the bulk of it is the four per-device
+sub-tensor structs (bump alloc, field copies, `ggml_backend_buffer_init_tensor`) that the meta design
+requires per graph, ~0.6 us of the 1.965. The other removable piece is the recompute inside prep, ~0.6-0.9 us
+of it. At ~1:1 into pp that makes each of them ~0.8-1.2%, so P9 is *not* exhausted after all: P9c, built as
+validation against the stored inputs of the split state (the tensor's own op/type/ne/nb/view fields plus the
+sources' states, which the walk has already refreshed) keeps the pointer-keyed fast path and turns the
+unconditional recompute back into a hit without hashing tensor content. The residual exists only because
+prefill rebuilds its graph every ubatch; the structural fixes for that are P2a (blocked) and P10.
 - **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
   PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
