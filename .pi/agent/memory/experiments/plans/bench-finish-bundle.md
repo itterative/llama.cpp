@@ -1,15 +1,16 @@
-# Bench-finish bundle - one run left, three closed without one
+# Bench-finish bundle - closed out, all four items accounted for
 
-Written 2026-09-27 after E062, closed out the same day. Three of the four items turned out not to need a
-run: item 1 was already answered by the untraced `-r 10` logs (`u1/u2/u4-noprof.log` in
-`results/user/h23-runs-b673ab4ae`), item 3 by the user's deployment knowledge, item 4 by an unrecorded
-post-fix measurement plus the fact that the recorded loss was itself the pre-E056 reservation tax. What
-is left is item 2, the comparability anchor for every later A/B.
+Written 2026-09-27 after E062, closed out the same day. Nothing here needs a run any more: item 1 was
+already answered by the untraced `-r 10` logs (`u1/u2/u4-noprof.log` in `results/user/h23-runs-b673ab4ae`),
+item 2 arrived as the user's own test run (`results/user/bench-finish-2026-09-27/`, recorded as E063),
+item 3 was closed by deployment knowledge and item 4 by an unrecorded post-fix measurement plus the fact
+that the recorded loss was itself the pre-E056 reservation tax. The one question this bundle *created* is
+E064, which is flag-only and not part of it.
 
 | # | item | record | decides | status |
 |---|---|---|---|---|
 | 1 | E062 paired `MMVF_K_UNROLL` 4 vs 1 | E062 | keep or revert the branch's first ~2% default flip | **closed without a new run: the untraced `-r 10` arms ARE the confirmation (+1.9-2.0%), flip kept in `8372ffc1f`** |
-| 2 | post-flip REF baseline | E026 style, new raw dir | the comparability anchor for every later A/B | **open - the only run left.** Its d16384 anchor already exists as the `u4-noprof` arm (40.41 t/s, -r 10, no tracer); what is missing is d4096/40960/131072 |
+| 2 | post-flip REF baseline | E026 style, new raw dir | the comparability anchor for every later A/B | **done - E063**: the user's own `-r 10` run, tg 43.43 / 43.15 / 41.88 / 37.64 at d4096/16384/40960/131072, pp8192 2219.27 / 2120.65 / 1958.24 / 1521.66, raw in `results/user/bench-finish-2026-09-27/`. Caveat: `GGML_CUDA_AR_ONESHOT_PROBE=50` and tg-after-pp, which is 6.8% above the same day's E062 U=4 arm - see E063 and E064 |
 | 3 | E048 completion: `--spec-draft-n-max` 1/2/3/6 + no-spec | E048 | whether over-drafting is still costing a third of decode | **closed 2026-09-27 without a run:** mtp works, acceptance 0.2-0.9 by task, `n_max = 3` is what is served, so the `n_draft = 6` tax is on nobody's bill |
 | 4 | E013 revival: pool on/off vs depth | E013 | whether the now-default pool still loses below ~32k | **closed 2026-09-27 without a run:** the user reports the post-E050-fix behaviour as a slight improvement rather than a loss; the -5.1% at d4096 was the pre-E056 per-ubatch re-reservation |
 
