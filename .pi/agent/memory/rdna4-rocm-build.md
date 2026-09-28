@@ -482,3 +482,13 @@ as experienced expectation, not verified behaviour.
   `-D__GFX12__` probing, or grep the object for the gfx12 ISA.
 - Whether `-cmoe`/`-ncmoe` and `-ot` placement interacts with `ARGSORT`/`MUL_MAT_ID` support
   gates when expert weights live on CPU.
+
+**Measuring with llama-cli** (E065) `[v]`: `-c` must exceed the prompt or the request is rejected
+outright - `request (32673 tokens) exceeds the available context size (8192 tokens)` - and the `[prof]`
+table after that error holds only the 2-call tokenizer warmup, which is easy to misread as "the prompt
+file was ignored". Both `-f <file>` and `-p "$(cat <file>)"` do deliver the corpus. On the 4-layer F32
+dummy (11.88 GiB, `-c 32768`, `-b 2048 -ub 1024`) the prefill wall is **host-bound**: 5481 ms for
+32.68k tokens with only ~2036 ms of device time, 1689 ms of it `sched:realloc_size` at 80 ms per prefill
+call (49 ms at `-c 16384`), i.e. the scheduler re-allocates per batch and the GPU waits. Decode is
+4.18 ms/step with 3.17 ms of drain and 2.6 ms of kernels, 1 `quantize_q8_1` per matvec. Tracer
+perturbation: +8.8% on the pp wall, +75% on the decode host regions.

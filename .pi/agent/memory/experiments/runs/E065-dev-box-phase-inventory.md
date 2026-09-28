@@ -48,33 +48,82 @@ so none is required; the golden PPL on this same toolchain is `263100.7437`.
 
 [`results/E065-dev-box-phase-inventory/commands.sh`](../results/E065-dev-box-phase-inventory/commands.sh)
 
-## harness correction, written before the runs
+## harness correction, and a retraction
 
-The pre-registered harness passed the corpus with `-f <corpus> -st`, which does not deliver a prompt.
-`-f` sets `common_params::prompt_file` (`common/arg.cpp:1803`) and **nothing in `tools`, `common`, `src`
-or `examples` reads that field** - only `imatrix` and `cvector-generator` do. `--stdin` is not registered
-for the cli either (`error: invalid argument: --stdin`). `-st`'s own help says the predefined first turn
-comes from `--prompt`, and that route works: `-p "$(cat <corpus>)"` measures `tok:prefill 21 calls 32.68k
-total`, where the `-f` form measured 2 calls / 4 tokens.
+The pre-registered harness passed the whole sparse corpus (32.68k tokens) with `-c 8192`, which
+**aborts**: `Error: request (32673 tokens) exceeds the available context size (8192 tokens), try
+increasing it`. llama-cli errors instead of truncating, and after the error the `[prof]` table holds
+only the tokenizer warmup - 2 calls / 4 tokens.
 
-Consequence for earlier data: the user's `results/user/llama-cli-traces/*` runs use the same `-f`
-pattern, so any cli trace taken that way profiled decode at a near-empty prompt depth - those logs carry
-no `tok:prefill` line that would say otherwise.
+That 4-token reading is what an earlier version of this section blamed on `-f` ("`prompt_file` is never
+read"). **That was wrong and is retracted**: with `-c 65536` the identical `-f <corpus>` invocation
+measures `tok:prefill 21 calls 32.68k total`, so `-f` delivers the corpus exactly as the user said. The
+grep finding (`common_params::prompt_file` has no reader outside imatrix/cvector-generator) describes a
+different field and says nothing about the cli's own file handling. The claim that the user's older
+`results/user/llama-cli-traces/*` runs profiled decode at depth 0 is retracted with it - those runs used
+`-c 131072` and were fine.
 
-Corrected flags, used for everything below: `-c {8192|32768} -b 2048 -ub 1024 -fa 1 -ngl 99 -st --temp 0`
-plus `-p "$(cat <corpus>)"`; `-lm/-sm/-ot` are left off because the dummy's memory layout differs from the
-real model's. Prompt is the full 32.68k-token corpus at `-c 32768`, the same corpus truncated to the
-context at `-c 8192`. Untraced arms: 3 reps per depth per phase. Traced arms: 2 reps per phase at 32768.
-
-Trace CSVs are written to a scratch dir (default `/tmp/pi-coder-scratchpad-obx3lc/e065/traces`) and are
-**not committed**: they run to gigabytes on the bench box and `commands.sh` regenerates them. What is
-committed is the `[prof]` logs, plus the aggregates in this record. `results/.../E065-*/.gitignore` keeps
-`*.csv` out.
+What survives: `-c` must exceed the prompt, and the depth comparison needs a prefix that fits. The
+shallow arms below therefore run a 45k-byte prefix of the corpus (10.90k tokens) in `-c 16384`.
 
 ## results
 
-(pending)
+### prefill, untraced (llama-cli, `-b 2048 -ub 1024`, `-fa 1 -ngl 99`)
+
+Six measurements per depth (3 pp-only, 3 tg-with-pp; all medians are over those, rep 1 of the deep set
+being a cold page cache at +5%):
+
+| depth | wall ms | `graph:compute` | `sched:realloc_size` | `graph:set_inputs` | other |
+| --- | --- | --- | --- | --- | --- |
+| 32.68k (21 calls, 1.56k/call) | 5481 | 3408 (62%) | 1689 (31%) | 326 (6%) | 58 |
+| 10.90k (10 calls, 1.09k/call) | 3642 | 3079 (85%) | 490 (13%) | 40 (1%) | 33 |
+
+The realloc is **per prefill call and stable to +-0.5%**: 80.4-81.0 ms/call at 32.68k, 48.9-49.0 ms/call
+at 10.90k (one 62.4 ms outlier in the shallow set, whose wall was also high). It is `graph:alloc` almost
+exactly (`sched:realloc_size` is 1685 of 1689 ms), so the scheduler is re-allocating its graph buffers on
+every batch rather than reusing the previous one; `graph:build` is 5 ms and `graph:reuse` 0.2 ms, i.e.
+the reuse test itself is free. Per token this is 52 us at the deep depth and 45 us at the shallow one,
+while the *rest* of the wall per token is 2.4x higher at the shallow depth - the cli splits the two
+prompts into different call widths (1.56k vs 1.09k tokens/call), so per-token rates between the two dep
+depths are not comparable. Per call they are.
+
+### decode, untraced
+
+| depth | steps | cli | `phase:sync` (tg) | `phase:decode` | `graph:compute` (tg) | `set_inputs` (tg) | `graph:alloc` (tg) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 32.68k | 94 | 239.4 t/s = 4.18 ms/step | 3.17 ms/step | 0.72 ms/step | 0.55 ms/step | 0.15 ms/step | 0.00 ms/step |
+| 10.90k | 255 | - | - | 0.62 ms/step | - | - | - |
+
+A step is ~3.2 ms of GPU drain (`phase:sync` carries it; `phase:decode` only enqueues) plus ~0.6-0.7 ms
+of host work plus sampling, so the non-GPU share is roughly a quarter of a step - the prediction's
+"visible" bar was 5%. The dummy stops early at the deep depth (EOS after 94 of 256 requested) and runs
+all 255 at the shallow one.
+
+### traced arms (kernel composition, never a wall)
+
+| arm | device ms | rows | leading families |
+| --- | --- | --- | --- |
+| pp 32.68k | ~2036 | 14370 | other 1184 (58%), `mul_mat_q` 438 (22%), `flash_attn` 147, `quantize` 49, `mul_mat_vec_q` 8 |
+| tg | 246 (2.6 ms/step) | 29592 | `mul_mat_vec_q` 4512 calls/178 ms (72%), other 45, elementwise 13, `quantize` 5.8 |
+
+**The GPU is busy about 2.0 s of a 5.5-5.9 s prefill**: the pp wall is host-bound on this box. The tg
+side is matvec-bound and shows H26's mechanism directly - 4512 `quantize_q8_1` calls for 4512 matvecs,
+exactly one q8_1 quantize per matvec.
+
+Tracer perturbation, again: the pp wall rises 5481 -> 5940-5964 ms (+8.8%) and the tg `phase:decode`
+total 67.5 -> 118 ms (+75%). Both traced arms are used for composition only, per E061.
 
 ## reads against
 
-(pending)
+- The pre-registered prediction is **falsified on prefill** (predicted GPU-bound with a single-digit host
+  share; measured 31% per-call scheduler realloc and the GPU idle two thirds of the wall) and
+  **satisfied on decode** (visible non-GPU share, matvec-led GPU part).
+- This is a T1 number on a **4-layer all-F32 dummy** (11.88 GiB): the *kernel mix* is not the quantized
+  real model's, so only the host-side structure transfers - the per-call realloc churn, the staging, the
+  sync split, and the host share of a step. It says nothing about the real model's GPU composition.
+- H19's territory: realloc churn is per call and grows with the graph (49 -> 81 ms as the context triples
+  while the call count grows to 21). If a later arm removes it, the pp wall has ~1.7 s to give back at
+  32.68k on this box, and the check is the same host-side table, no tracer needed.
+- H26's mechanism reproduces on the dev box (1 q8_1 quantize per matvec) at 4 layers' scale.
+- Not measured here: the pool mode line (needs `-v`), and no A/B was run, so no effect size is claimed.
+
