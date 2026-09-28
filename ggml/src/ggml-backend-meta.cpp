@@ -13,11 +13,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -411,6 +413,12 @@ struct ggml_backend_meta_simple_tensor_container {
     ggml_backend_meta_simple_tensor_container() {}
 };
 
+struct ggml_backend_meta_split_state_cache_hash {
+    size_t operator()(const std::pair<const ggml_tensor *, bool> & key) const {
+        return std::hash<const void *>()(key.first) ^ (key.second ? (size_t) 0x9e3779b97f4a7c15ull : 0);
+    }
+};
+
 struct ggml_backend_meta_buffer_context {
     // FIXME
     // Most tensors can simply be stored statically in their own buffer.
@@ -428,8 +436,14 @@ struct ggml_backend_meta_buffer_context {
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
-    static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    //
+    // The entries are dropped for a tensor when the buffer is asked to initialize it
+    // (ggml_backend_meta_buffer_init_tensor). That covers every tensor that is newly allocated for a graph,
+    // including views and input leafs, and the walk visits tensors in execution order, so a tensor sees
+    // only sources that were already refreshed in the same walk. Static weights are never initialized again,
+    // so their states stay cached.
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, ggml_backend_meta_split_state,
+            ggml_backend_meta_split_state_cache_hash> split_state_cache;
 
     int debug;
 
@@ -1109,15 +1123,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     const std::pair key = std::make_pair(tensor, assume_sync);
+
     auto it = buf_ctx->split_state_cache.find(key);
-    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
-        it = buf_ctx->split_state_cache.end();
-    }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        it = buf_ctx->split_state_cache.emplace(key, calculate_split_state()).first;
+
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1145,15 +1156,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!ne_info.empty()) {
                     ne_info += ", ";
                 }
-                const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
+                const ggml_backend_meta_split_state & ss = it->second;
                 ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
             }
             GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
+                ggml_backend_meta_split_axis_name(it->second.axis), ne_info.c_str());
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    ggml_backend_meta_split_state ret = it->second;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -1377,6 +1388,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
+
+    // this address may have held another tensor in an earlier graph: drop both cached states and recompute
+    // them from the sources, which the walk has already refreshed (it runs in execution order)
+    buf_ctx->split_state_cache.erase(std::pair<const ggml_tensor *, bool>(tensor, true));
+    buf_ctx->split_state_cache.erase(std::pair<const ggml_tensor *, bool>(tensor, false));
 
     const uint64_t t_lookup0 = meta_init_now();
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
