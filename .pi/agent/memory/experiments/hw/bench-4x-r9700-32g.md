@@ -14,19 +14,21 @@ evidence. User-supplied facts marked (user); everything else still to confirm.
 | cards | 4x **AMD Radeon AI PRO R9700**, **32 GB** each (user) |
 | gfx target | **gfx1201** (user-confirmed), RDNA4 / Navi 48 XT class |
 | total VRAM | 128 GB |
-| **system RAM** | **62.7 GiB total** (screenshot 2026-09-18 19:21, `gtop` mem panel; 7.70 GiB used, 12%) - the "32g" in this profile's name is **not** RAM, and the earlier reasoning that a 30-36 GB PLE table cannot fit in RAM was wrong |
+| **system RAM** | **64 GB total** (user, 2026-09-28). The 62.7 GiB `gtop` reported on 2026-09-18 19:21 (7.70 GiB used, 12%) is the same machine after firmware reserve - the "32g" in this profile's name is **not** RAM, and the earlier reasoning that a 30-36 GB PLE table cannot fit in RAM was wrong |
+| ROCm stack | **10.0.0** (user, 2026-09-28) - same major release as the dev box, so the two boxes are no longer split on that axis |
+| PCIe topology | 4x Navi 48 at BDF 0b/10/13/19 under one Zen3 root complex through two levels of PCIe switches; **no Infinity Fabric**, so every inter-card byte crosses the host bridge (`results/user/lspci.log`; the reading is already in `../../rdna4-rocm-build.md`) |
 | role | T2: real `qwen4exp` end-to-end, multi-GPU |
 | power profile | **`compute`** (was `auto` until 2026-09-24; changed while chasing the hangs in E033, validation pending) |
 | reachability | separate machine, not reachable from this session; user runs commands by hand |
 
-Still unconfirmed: ROCm version, driver, PCIe topology / any Infinity Fabric links, CPU +
-system RAM, OS.
+Still unconfirmed: driver version, exact CPU model, OS.
 
 **gfx1201 on both boxes, so they share an ISA target.** The dev build has no
 `AMDGPU_TARGETS` override and compiled gfx1201-only, which means a dev-box build is
 ISA-valid on the bench box. It does *not* mean a dev-box binary is a valid measurement
 there: the `LD_LIBRARY_PATH` shadowing caveat applies independently, and ROCm version
-differences still make numbers non-comparable. Cross-shipping a binary is allowed; using
+differences still make numbers non-comparable across sessions - B2 answered the version
+question (both boxes on 10.0.0), not the rule. Cross-shipping a binary is allowed; using
 it as a baseline partner is not.
 
 ## Deployment as the user actually runs it (user-supplied)

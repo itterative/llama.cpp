@@ -300,17 +300,18 @@ was the pre-E056 reservation tax); and the post-flip REF baseline arrived as the
 recorded as **E063** with the anchor table and the 7% cross-session caveat above. The one thing it left
 open is **E064** (flag-only, 4 invocations): is that 7% the allreduce probe's iteration count or the
 test order? The next development thread is H20 (pool block keys in rank space, so vision sessions stop
-losing the pool's +32.6% tg); the backlog now leads with that focus list (H20, then H26, then H19, then E016), and
+losing the pool's +32.6% tg); the backlog now leads with that focus list (H20, then H26, then E016), and
 its ranking below still holds for everything else.
 
 Top code action was the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
 what is left on it is vision - H20 (pool nothing while an image is in the run), H21 (the pool promises on
-an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
-bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
-VRAM tax the default now makes everyone pay is still open too.
+an endpoint test the fast path does not honour) and H22 (does a vision turn pay the re-reserve ratchet H19
+fixed on dense prefill; needs a bench reading, because the dev box counts ~20 re-reserves per 7.5k cells
+while wall time moves 1%). The VRAM tax the default now makes everyone pay is still open too.
 
-**H19 - the non-pool reservation ratchet - is fixed** (E069 to E073, detail in those records). Cause: the MoE
+**H19 - the non-pool reservation ratchet - is fixed** (E069 to E073, detail in those records; archived in
+`experiments/plans/backlog-answered.md`). Cause: the MoE
 weighted-reduction fusion (upstream #25952) reported its keep-alive allocation deps only when the reduction had
 work, and the scheduler's node count decides whether a reservation survives, so prefill retightened the
 reservation on every ubatch: 34 reallocs, 1689 ms of a 5699 ms wall, one forced device drain each. Fix:
@@ -323,9 +324,9 @@ fusion: it must not change the graph's node count per batch. Tooling: `GGML_ALLO
 arms), so the fix is neutral there and the "seconds per prompt" estimate does not transfer; its exposure is the
 pinned/vision path (H22) and the request path. Two T2 facts from the same runs: the fusion is worth **8.75% of
 pp** (2138.37 vs 1951.32 t/s at pp4096 @ d16384), and the normal `graph:alloc` cost (~20.5 ms/call, ~5% of the
-prefill total, no re-reservations involved) is untouched - that is H19's other half. Open observation: prefill
-GPU utilisation looks higher than remembered; measure with `rocprofv3 --kernel-trace` + `GGML_PROF_WINDOW=pp`,
-kernel time per pass against the wall.
+prefill total, no re-reservations involved) is untouched - it now lives in **E016**. Open observation: prefill
+GPU utilisation looks higher than remembered, tracked under **H11**; measure with `rocprofv3 --kernel-trace`
++ `GGML_PROF_WINDOW=pp`, kernel time per pass against the wall.
 
 **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16

@@ -178,6 +178,7 @@ If d4096/d16384 still favour `Q4EXP_POOLED=0` by more than the 5% bar, the branc
 rule (depth gate in `qsa_pool_get`, or "set Q4EXP_POOLED=0 below 32k" in the launch notes) rather than
 a silent tax. If the gap is inside the bar, E050's row gets a correction and this thread closes.
 
-Also read `sched:realloc_size` counts in both arms: E056 claimed 0 re-reserves when pooled, and
-`graph:alloc` tg calls in the E062 logs (19 calls at ~20 ms in a 128-token run) show the H19 ratchet is
-still live with the pool on. If pool-off shows more, that is H19's scope, not the pool's.
+Also read `sched:realloc_size` counts in both arms: E056 claimed 0 re-reserves when pooled. The H19
+ratchet those E062 logs showed (19 `graph:alloc` calls at ~20 ms in a 128-token run) is fixed now
+(E069-E073), so post-fix the expectation is 0 in both arms; what remains is the normal ~20 ms/call
+`graph:alloc` cost, which now lives in E016.
