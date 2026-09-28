@@ -11,18 +11,24 @@ parked on purpose.
 
 ## Focus now - pick one and go
 
-All three are development work with an already-measured prize, and none needs the bench box to start.
+All four are development work with an already-measured prize, and none needs the bench box to start.
 
 1. **H20 - give vision sessions the pool** (H21 is its bug). Prize: the pool is worth **+32.6% tg at
    depth**, and a session with an image in it loses that entirely (E057). Next step: pool block keys in
    rank/cell space instead of position space, per `h9-pooled-block-keys.md`. This is the agreed next
    development thread. H9's leftover (the non-dense-sequence path still builds the historic topology) is
    the same shape of work.
-2. **H19 - the reservation ratchet.** Prize: measured in the untraced E062 logs, **35 `graph:alloc` calls
+2. **H26 - stop quantizing the same activation once per matvec.** Prize: `quantize_q8_1` is **0.583
+   ms/step/card, 4.0% of device time, in 519 launches per step per card** (one per `mul_mat_vec_q` call),
+   and the graph hands the same `cur` tensor to 4-5 matvecs per layer, so ~237 of the 519 launches and
+   ~2.0% of device time are redundant on the shapes whose sharing is already visible. Fix is a
+   per-invocation cache keyed on the `src1` tensor pointer; output stays bit-identical, so the golden PPL
+   must not move at all.
+3. **H19 - the reservation ratchet.** Prize: measured in the untraced E062 logs, **35 `graph:alloc` calls
    at 21.0 ms = 735 ms per 1280 decode tokens = 0.57 ms/token, 2.3% of the wall**, with the pool on *and*
    off, plus E056's 13 and 120 re-reserves per run for llama-cli and llama-perplexity. It is host work
    that no region names. Next step: find the trigger, not another measurement.
-3. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
+4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
    exactly "the wall time that lands outside every region". Next step: `perf record -g` on a tg-only run
@@ -104,6 +110,36 @@ All three are development work with an already-measured prize, and none needs th
 - **Fix shape:** carry a "verified through" cell index in the `qsa_run` record so the promise and
   the verify test the same thing incrementally, instead of making `qsa_pool_get` walk all cells (it
   also runs from `can_reuse`, i.e. once per ubatch).
+
+### H26 - one q8_1 quantization per matvec, no sharing: 4% of device time in 519 launches per step
+
+- **Prize:** `quantize_q8_1` is **0.583 ms/step/card = 4.0% of device time, in 519 launches per step per
+  card** at 1.12 us each, i.e. latency-bound (a 2560-wide f32 row is 10 KB, so ~15 GB/s effective). That
+  is exactly one launch per `mul_mat_vec_q` call - 519 and 519 in the current trace - and it is E059's
+  "Closed and left open" item 5, never given an id. Where the sharing is already visible (below), **~237
+  of the 519 launches and ~0.29 ms/step/card, ~2.0% of device time, look recoverable** - the 2560-wide
+  shape 189 -> 48, the 10,240-wide and 512-wide ones 96 -> 48 each - plus ~6.6% of the 3,616 dispatches per
+  step per card. The other shapes could add to that; the count above deliberately only claims what the
+  builder and the call counts support.
+- **Mechanism** `[v]`: `mmvq.cu:1503-1519` does an unconditional `ggml_cuda_pool_alloc` plus
+  `quantize_row_q8_1_cuda` on every call, and nothing anywhere in the backend memoizes `src1` (the MMQ
+  path in `mmq.cu` has the same shape, so prefill pays it too - 4-5 times per layer on a 1024-token src1).
+- **The redundancy** `[v]`: the graph builder hands the *same* `cur` tensor to several matvecs per layer -
+  `wq`/`wk`/`wv` (`qwen4exp.cpp:994,1005,1008`) and `index_q_proj`/`index_k_proj` (`:804,726`). The trace
+  agrees: the 2560-wide activation is quantized **189 times per step = 3.94 per layer of 48**, a
+  10,240-wide one 96 times (2/layer), a 512-wide one 96 times (2/layer), and the MoE gather 48 times
+  (1/layer, `Grid_Size_Y = 10` = `n_expert_used`).
+- **Fix to test:** a per-graph-compute cache keyed on the `src1` **tensor pointer** (never the data
+  pointer - the compute pool recycles addresses), plus shape and `src0->type`, cleared at the start of
+  each invocation. Under `-lzm on-direct` the graph is captured, so the sharing collapses to one recorded
+  quantize per replay for free. The output is bit-identical by construction, which gives a sharp gate:
+  the golden PPL must not move at all.
+- **What to check first:** the sharing is inferred from the builder plus the call counts, not proven per
+  pointer. A counter of distinct `src1` pointers per invocation settles it in a few lines of code.
+- **Risks:** a tensor rewritten between two consumers inside one invocation (in-place ops, views with
+  their own pointers) would serve a stale buffer - the pointer key plus the per-invocation clear is the
+  answer to that; and under capture the buffer must live for the whole invocation, which is how the other
+  captured temporaries already work (pool lifetime).
 
 ### H19 - the reservation ratchet is not H9's alone: llama-cli and llama-perplexity re-reserve with the pool off
 

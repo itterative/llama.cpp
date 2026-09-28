@@ -502,7 +502,8 @@ Still open, re-ranked by the complete table above and by the trace re-analysis:
    2 us, and ~45% of the wall is host-side or gaps. `meta:subgraph` is 97 spans per step *enclosing*
    those dispatches, so its 21.2 ms/step is not additive cost and the item is not "5.4 ms of dispatch" as
    first written. The lever is fewer launches. Parked by the user's call.
-5. `quantize_q8_1` at 4.0%, one launch per matvec, 799,260 of them. `mmvq.cu:1503-1509` does an
+5. `quantize_q8_1` at 4.0%, one launch per matvec, 799,260 of them. **Given an id later: H26 in
+   `plans/backlog.md`**, which sizes the redundancy in the graph builder and proposes the sharing cache. `mmvq.cu:1503-1509` does an
    unconditional fresh `ggml_cuda_pool_alloc` plus quantize per call with no memoization on `src1`.
    Smaller in relative terms now, but the mechanism is still there.
 6. Q8_0 at kblk=80 wants 1 warp by 1.68x (118.00 -> 70.27 us on the dev box), the one wide-K cell that
