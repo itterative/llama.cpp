@@ -309,7 +309,19 @@ what is left on it is vision - H20 (pool nothing while an image is in the run), 
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
 bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
 VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
-reservation ratchet. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+reservation ratchet, and **E069 closed its investigation with a negative answer for the obvious fix**: the
+tripping tensor is `qsa_bias` (`F32 [n_blocks, n_tps]`, +256 blocks = 1 MiB per 1024-token ubatch), but the
+reserve graph already builds it at the full-cache shape (8192 blocks, `need = 1381.18 MiB`), so nothing is
+under-sized. The ratchet is the *reservation being retightened*: `ggml_gallocr_reserve_n_impl` assigns each
+slot's `size_max` from the graph it reserves for, the warmup's 702-node graph trips the structure check right
+after the 703-node reserve, and the sched's fallback then records the warmup's tiny sizes - so every prefill
+ubatch is exactly one padding step past the record (34 reallocs, 1699 ms of a 5699 ms wall, one forced device
+drain each). Two candidate fixes are already excluded by measurement: making `size_max` a high-water mark
+corrupts (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`, E069 - it is a placement-validity token, not a capacity
+record), and skipping a reserve whose graph fits is inert because the reserve path is only entered on a failed
+fit test. What is left is reserve *policy*: measure a worst-case graph at the retighten, or keep the
+reservation across a structural change. The tool that found all of this is `GGML_ALLOC_DEBUG_REALLOC=1`;
+the QSA graph inputs now carry names so its output is readable. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
 on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
 before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also
