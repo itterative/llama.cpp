@@ -60,6 +60,13 @@ Not in the table because it is not measured: the device's own busy time per ubat
 (`results/user/amd-smi-prefill.log`) shows 34% GFX utilisation during prefill with 93/210 W per card,
 but that predates E077 and the user reports it higher now, so treat it as unset.
 
+`graph:alloc` is three things, measured on the dev box (48l dummy, current build, `sched:*` regions added
+for this): `sched:split` 0.978 ms of the 1.64 ms/call, `sched:gallocr` 0.652, of which
+`sched:needs_realloc` 0.355 and the whole tensor-init walk 0.30, with `sched:ids_scan` at 0.006. The box's
+`graph:alloc` is 20.47 ms/call at almost the same node count (6825 against 6873), and the two gallocr
+pieces are per-entity work at ~15 ns each, so they cannot be 13x dearer there: **the split pass is where
+the box's time sits**. One `GGML_PROF_REGIONS=1` run on the box confirms it.
+
 ## 3. Real-model device composition, best available (A5: sparse FA + rtile, d131072)
 
 `results/user/qsa-kernel-traces-postfix/stats-qsa-rtile-131k.log`, build `b827606c8`, a 131072-token
@@ -196,12 +203,13 @@ P2b's precondition is therefore missing for now.
      call, pattern [0,0,0,1]) the check is entered.
   2. Entered, it fails on 2 of 6 inputs, identically with the window on and off: the n_kv-sized cell-domain
      inputs (the KQ mask via `can_reuse_kq_mask`, and the QSA/attention input). `allow_reuse` itself returns 1.
-- **Why windowing those is not the answer either.** Padding the mask and the K/V views makes the attention
-  process masked cells: a W-token window adds about W/2 masked cells per ubatch, which against FA's ~17% of
-  device time at d16384 is roughly +10%, i.e. more than the 4.5% host saving. It is only cheap where the
-  sparse FA path is active (above ~4104 cells it gathers a fixed top-k set, so its work stops tracking n_kv).
-  So prefill reuse is not a QSA-block problem: it needs the cell window, and the cell window costs attention
-  work at exactly the depths where the host time matters least.
+- **Why windowing those is not the answer either.** Padding the mask and the K/V views makes the dense
+  attention process masked cells: a W-token window adds about W/2 masked cells per ubatch, so FA's work grows
+  with the window until the sparse path takes over (above ~4104 cells it gathers a fixed top-k set and stops
+  tracking n_kv). That is device work bought to save host time, and how the two trade depends on the host
+  pass-through, which nobody has measured. (An earlier draft of this section said +10% device time, which
+  conflated the device share with the wall; corrected 2026-09-28.) So prefill reuse needs the cell window, and
+  the cell window is only cheap at depth, where the host bill is smallest.
 - **Constraint learned for any future attempt.** A node that appears only at runtime breaks the measured
   graph: with the clamp gated on `n_blocks_g > n_blocks`, the runtime topology differed from the reserved one
   and every prefill ubatch re-reserved (`sched:realloc_buft` at ~518 ms/call). Any node added by a window must
@@ -288,6 +296,35 @@ P2b's precondition is therefore missing for now.
   3.1 ms per call, the single largest kernel there; in A5 (d131072) it is only 3.5%. Nothing local says
   which of those two the box resembles at shallow depth.
 - **Next step:** the section 1 trace, family table at d4096.
+
+### P9 - the sched split pass is the expensive half of `graph:alloc`
+
+- **Question:** what does `ggml_backend_sched_split_graph` spend 0.98 ms per ubatch on here, and ~20x that on
+  the box, and can the assignment be cached or computed more cheaply?
+- **Why it matters:** measured on the dev box, it is 60% of `graph:alloc`; the two gallocr pieces are ~15 ns
+  per entity and the box has the same 8197 of them, so the box's 20.47 ms/call is essentially this pass. That
+  makes it most of the 22 ms/ubatch P2a was after, and unlike reuse it needs no shape to stop moving.
+- **Next step:** one `GGML_PROF_REGIONS=1` box run on the instrumented build to confirm the split dominates,
+  then find where it spends it: per-node backend support queries, or the meta backend's per-node partial or
+  split decisions. A cache keyed on a graph signature is the candidate if the per-node work is shape-driven.
+- **Risk:** the split result depends on shapes *and* buffer types, so a cache has to key on both; a stale hit
+  would put a node on a backend that cannot run it.
+
+### P10 - overlap the build and alloc with the previous ubatch's device work
+
+- **Question:** can ubatch k+1's `graph:build` and `graph:alloc` run while ubatch k is still executing on the
+  device, so the host path stops being additive?
+- **Why it might work:** nothing in the build for k+1 needs device results, only the memory context's
+  bookkeeping (n_kv, the pool state), which is host-side and already known. The two `gf_res_prev` slots are
+  machinery for holding two graph results at once; today they alternate output classes rather than pipeline.
+- **Prize:** the 22 ms/ubatch (4.5%) without touching a single shape, so it does not inherit P2a's problem.
+  If host time is already hidden behind device work, this measures that too.
+- **Cost and risk:** a change in `llama_context::decode`'s loop and in the ordering guarantees around
+  `mctx->apply()` and `set_inputs`, the same class of hazard as E073's synchronize-before-set_inputs
+  invariant. Two graphs in flight also means two copies of the input staging; the sched has `n_copies` for
+  that, so the buffers exist.
+- **Deciding metric:** `phase:prefill` wall plus the region table at pp4096 d16384, with `graph:alloc` and
+  `graph:compute` no longer back to back.
 
 ## 7. Not to re-open
 
