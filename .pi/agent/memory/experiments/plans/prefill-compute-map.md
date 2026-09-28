@@ -327,6 +327,22 @@ pure host work with no numerics in it.
      survives a rebuild, so the recompute goes too. ~10-11 ms/ubatch, more code in the delicate part of the
      file.
 - **Next step:** 2 first; 3 if the leftover recompute still shows in `meta:init_prep_ns`.
+- **P9b implemented and validated on the dev box, 2026-09-28.** The cache is an `unordered_map` keyed by
+  (tensor pointer, `assume_sync`); the 400-byte tensor copy, the `memcmp` and the whole-cache clear are
+  gone, and the states for a tensor are instead dropped in
+  `ggml_backend_meta_buffer_init_tensor`. That entry point runs for every tensor newly allocated for a
+  graph - nodes, views through `ggml_backend_view_init`, and reshaped input leafs - and never for static
+  weights, whose states therefore stay cached. Correctness rests on the walk order: a tensor's sources are
+  initialized earlier in the same walk, so their states are recomputed before they are read.
+- **Gate:** PPL with `-sm tensor` on the sparse corpus at `-c 8192` is **bit-identical before and after**
+  (270867.5339 / 270355.0350 / 266980.6971). Note `-sm tensor` shifts the digits by itself, against
+  266980.7507 for the default split, so a meta-path gate has to compare like with like.
+- **Result, dev box, same command:** per init 2.72 -> 1.87 us (prep 1.94 -> 1.22 us, tail 431 -> 304 ns,
+  create and srcs unchanged), `sched:init_nodes` 20.49 -> 17.71 ms/call, so about a third of the meta init
+  comes off. On the box that should be ~5.7 ms/ubatch, ~1.2% of prefill; the wall number needs a box run.
+- **Left on the table:** the remaining prep is the per-graph recompute plus a `std::map` find in
+  `stc.simple_tensors` (once per init and once per source state lookup), which is a cheap follow-up; P9c is
+  what removes the recompute itself.
 - **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
   PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
