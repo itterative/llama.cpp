@@ -6,6 +6,9 @@ priority: 4
 keep_updated: true
 ---
 
+Branch env vars and their defaults are indexed in `env-knobs.md`; regenerate that list from the
+code with the `git diff --name-only ebbb18522...HEAD` line in it, because the index can drift.
+
 # RDNA4 / HIP build + backend behaviour
 
 Anchors at `ebbb18522`. Marked **[v]** = read/verified by me directly; **[s]** = from the
