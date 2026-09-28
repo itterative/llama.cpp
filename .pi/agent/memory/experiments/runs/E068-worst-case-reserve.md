@@ -88,3 +88,26 @@ Iteration 2's code is not in the tree (the width bump alone removes no reallocs 
 - Consequence for H19: "keep the worst-case budget" is the right lever but it has *two* dimensions, and the one
   that matters cannot be reached from the reserve ubatch today. Budget accordingly: this is a graph-params
   plumbing job, not a padding tweak.
+
+## iteration 3 (+ the mask's n_kv floor)
+
+The floor went on the reserve context itself: `llama_kv_cache::init_full` (which every reserve uses) now sets
+`n_kv_min = get_size()` under the gate, and `llama_kv_cache_context::apply` takes `max(kv->get_n_kv(...),
+n_kv_min)`, so the cached value that the mask reads is floored. Verified by observation rather than inference:
+with the gate on, the log showed `init_full: reserve floor = 32768` and 24 `get_n_kv: n_kv = 32768, n_kv_min =
+32768` calls against 260 without - the reserve graph really is built with `n_kv = n_ctx`.
+
+| arm | reallocs | `realloc_size` | prefill wall | peak VRAM | PPL |
+| --- | --- | --- | --- | --- | --- |
+| control | 34 | 1685.40 ms | 5756.94 ms | 7836 MiB | 263100.7437 |
+| width + n_kv floor | 34 | 1686.29 ms | 5510.59 ms | **8367 MiB** | 263100.7437 |
+
+So both mask dimensions are now reserved - `[n_ctx, n_batch]` - and the trips are untouched. **The tensor that
+grows past the reservation is therefore not the mask.** H19 already named it: `blk_cells`, the src of the
+`GET_ROWS` in `build_qsa_top_k`, whose shape follows the number of *pooled blocks* rather than `n_kv`, and every
+padding step adds blocks. The floor reaches `llama_kv_cache_context::get_n_kv`, which the mask uses; the pool's
+tensors are sized elsewhere and keep growing per ubatch.
+
+Next increment, precisely: a worst-case reservation for the QSA pool's block tensors (the block count at
+`n_ctx`), which is H9/H20 territory rather than the graph buffers - a new thread with its own experiment. The
+scaffold here (width + mask floor, gated, default-off, inert) is the verified half.
