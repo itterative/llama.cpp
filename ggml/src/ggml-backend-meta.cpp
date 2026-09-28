@@ -433,15 +433,16 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
-    // FIXME
-    // The size of the split state cache is unbounded and can theoretically grow infinitely large.
-    // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
+    // The split state cache is keyed on the tensor address and holds no tensor copies. A tensor's entries are
+    // dropped when the buffer is asked to initialize it (ggml_backend_meta_buffer_init_tensor), which covers
+    // every tensor newly allocated for a graph: nodes, views and input leafs. The walk runs in execution
+    // order, so a tensor only ever reads sources that were already refreshed in the same walk, and static
+    // weights are never initialized again, so their states stay cached.
     //
-    // The entries are dropped for a tensor when the buffer is asked to initialize it
-    // (ggml_backend_meta_buffer_init_tensor). That covers every tensor that is newly allocated for a graph,
-    // including views and input leafs, and the walk visits tensors in execution order, so a tensor sees
-    // only sources that were already refreshed in the same walk. Static weights are never initialized again,
-    // so their states stay cached.
+    // The graph recycles addresses, so the map settles at about one entry per live tensor; the cap only
+    // bounds a process that keeps minting new addresses. Clearing is always sound.
+    static constexpr size_t split_state_cache_max = (size_t) 1 << 16;
+
     std::unordered_map<std::pair<const ggml_tensor *, bool>, ggml_backend_meta_split_state,
             ggml_backend_meta_split_state_cache_hash> split_state_cache;
 
@@ -1383,10 +1384,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
 
-    // this address may have held another tensor in an earlier graph: drop both cached states and recompute
-    // them from the sources, which the walk has already refreshed (it runs in execution order)
+    // this address may have held another tensor in an earlier graph: drop its states and recompute them,
+    // from sources the walk has already refreshed
     buf_ctx->split_state_cache.erase(std::pair<const ggml_tensor *, bool>(tensor, true));
     buf_ctx->split_state_cache.erase(std::pair<const ggml_tensor *, bool>(tensor, false));
+
+    // cap reached: clearing is sound, it just costs a recompute for the next graph
+    if (buf_ctx->split_state_cache.size() > ggml_backend_meta_buffer_context::split_state_cache_max) {
+        buf_ctx->split_state_cache.clear();
+    }
 
     const uint64_t t_lookup0 = meta_init_now();
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
