@@ -264,11 +264,12 @@ unless that number set `Q4EXP_POOLED` explicitly - same trap as E055's `855a6554
 
 ## Next steps
 
-Agreed 2026-09-27: the next bench session is the four flag/rebuild-only runs in
-`experiments/plans/bench-finish-bundle.md` (E062 paired, post-flip baseline, E048 draft sweep, E013 pool
-crossover); the next development thread after that is H20 (pool block keys in rank space, so vision
-sessions stop losing the pool's +32.6% tg). The ranking below still holds for the threads not in the
-bundle.
+Agreed 2026-09-27: the bench bundle is down to **one** run (`experiments/plans/bench-finish-bundle.md`),
+the post-flip REF baseline. E062 was closed by three untraced `-r 10` arms (+1.9-2.0%, flip kept in
+`8372ffc1f`), and the E048 draft sweep and the E013/pool crossover were closed the same day without a run
+(mtp is served at `n_max = 3` with 0.2-0.9 acceptance; the pool's low-depth loss was the pre-E056
+reservation tax). The next development thread is H20 (pool block keys in rank space, so vision sessions
+stop losing the pool's +32.6% tg); the ranking below still holds for the threads not in the bundle.
 
 Top code action was the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
