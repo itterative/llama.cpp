@@ -40,7 +40,11 @@ All four are development work with an already-measured prize, and none needs the
    per 256-token padding crossing (34 events over 36 ubatches at `-ub 1024`, 131 over 259 at `-ub 128`) and
    the inference graph's node count is constant at 667 whatever n_kv or n_outputs do. So the trips are
    size-only and "keep the buffer sizes constant inside a reserved window" is the whole fix. Next step:
-   implementation, not another measurement.
+   implementation, not another measurement. E067 tried the cheap version of that (a percentage slack on the
+   reserved size) and it **faults the GPU** (`HSA_STATUS_ERROR_MEMORY_FAULT` in `k_set_rows`): `size_max` also
+   feeds placement while the backing allocation is sized on another path, so a slack has to be applied
+   wherever the allocation is sized, not only in the validity check. The gallocr accepts any tensor smaller
+   than the reservation, so the worst-case-reserve route is confirmed viable - it just has to use real sizes.
 4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
