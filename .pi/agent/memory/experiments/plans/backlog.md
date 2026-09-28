@@ -27,24 +27,29 @@ All four are development work with an already-measured prize, and none needs the
    each: 2.4% of device time but **13% of all dispatches**) and shows the 370 dispatches of a decode step run
    back-to-back, so this has to be scored by `us/call x calls/step` arithmetic, not by an A/B under the 5%
    noise floor.
-3. **H19 - the reservation ratchet.** Prize: **0.57 ms/token in decode** (E062: 35 `graph:alloc` calls at
-   21.0 ms per 1280 decode tokens, 2.3% of the wall, pool on *and* off; E056: 13 and 120 re-reserves per run
-   for llama-cli and llama-perplexity), **plus a larger prefill instance found by E065** - dev box, cli,
-   32.68k prompt: 34 reallocs, 1689 ms = **31% of the prefill wall**, of which 1645 ms is the
-   `hsa_signal_wait_scacquire` from the `ggml_backend_synchronize` the branch runs before
-   `ggml_gallocr_reserve_n` (the allocation itself is 35 ms). Recoverable is the overlap that sync forbids
-   (staging 326 ms + build + checkpoint, ~8% of that wall), not the drain. H11's "prefill at 20-30% GPU" is
-   this same thing - E065 measures **33% occupancy** - and H22's vision re-reserve is the same family.
-   `GGML_SCHED_DEBUG_REALLOC=1` aborts with `graph size = 702, nodes = 702, leafs = 141` and the region is
-   never `realloc_buft`, so the size trips come without node-count changes. E066 settled the rate: one event
-   per 256-token padding crossing (34 events over 36 ubatches at `-ub 1024`, 131 over 259 at `-ub 128`) and
-   the inference graph's node count is constant at 667 whatever n_kv or n_outputs do. So the trips are
-   size-only and "keep the buffer sizes constant inside a reserved window" is the whole fix. Next step:
-   implementation, not another measurement. E067 tried the cheap version of that (a percentage slack on the
-   reserved size) and it **faults the GPU** (`HSA_STATUS_ERROR_MEMORY_FAULT` in `k_set_rows`): `size_max` also
-   feeds placement while the backing allocation is sized on another path, so a slack has to be applied
-   wherever the allocation is sized, not only in the validity check. The gallocr accepts any tensor smaller
-   than the reservation, so the worst-case-reserve route is confirmed viable - it just has to use real sizes.
+3. **H19 - the reservation ratchet. SOLVED (E069-E073, 2026-09-28): fixed in `ggml-cuda.cu`, 4 lines.**
+   Cause: the HIP MoE weighted-reduction fusion (upstream #25952) reported its keep-alive allocation
+   dependencies only when the reduction had work, and prefill's last-layer reduction can be empty
+   (`ne[2] = 0`: the batch carries no output tokens). The scheduler turns each dependency into a keep-alive
+   view node and tests the node count before any size, so the graph's structure changed per batch, the
+   reservation was retightened on the first prefill ubatch, and every later ubatch - whose MoE and mask
+   tensors grow by one padding step - re-reserved and drained the device. `ggml_cuda_match_moe_weighted_reduction`
+   now takes `require_work`, false at the dependency call site and true at compute, so the fusion still skips
+   empty reductions but the node count no longer depends on the batch.
+   Measured (dev box, cli, sparse corpus, `-b 2048 -ub 1024 -c 32768`): reallocs 34 -> **0**,
+   `sched:realloc_size` 1689-1776 ms -> **0**, prefill wall 5539-5725 -> **4819-5075 ms**, peak VRAM
+   unchanged, PPL bit-identical `263100.7437`. The prize recorded below is therefore realised on the dev
+   box; the bench-box instance (E056 priced a re-reserve at ~300 ms on 4 cards) is unverified but expected
+   to move seconds per prompt.
+   Historical note, kept because it is the audit trail: the prize was 0.57 ms/token in decode (E062: 35
+   `graph:alloc` calls at 21.0 ms per 1280 decode tokens, pool on and off; E056: 13 and 120 re-reserves per
+   run for llama-cli and llama-perplexity) plus a larger prefill instance (E065: 34 reallocs, 1689 ms, 31%
+   of the wall, 1645 ms of it the forced `hsa_signal_wait_scacquire`). E066 settled the rate - one event per
+   256-token padding crossing, inference graph node count constant at 667 - and E067/E068 showed that a slack
+   on `size_max` faults the GPU while a worst-case reservation is viable but was not the lever. E069 named the
+   tensor (`qsa_bias`), E070 falsified the output-convention route, E071 found the single extra node,
+   E072 traced it to the fusion, E073 fixed it. **Invariant for any future fusion: it must not change the
+   graph's node count per batch.**
 4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
