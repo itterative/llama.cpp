@@ -24,6 +24,11 @@ cell back before committing. When a row needs a wholesale rewrite, replace the w
 patching a fragment of it. If a script is genuinely needed (multi-file analysis), have it *print* the
 proposed change instead of writing it.
 
+**Open and answered are separate files** (2026-09-27): `plans/backlog.md` holds only open threads and leads
+with a ranked focus list; `plans/backlog-answered.md` holds the finished ones, bodies verbatim, indexed one
+line each. Splitting beat trimming: nothing was rewritten, so no answer was lost, and the open file went
+from 953 to 557 lines.
+
 **Structure beats care here.** `experiments/plans/backlog.md` was converted to one `###` heading per
 item with the fields as bullets underneath, because a cell that needs paragraphs cannot be edited safely
 by exact-match text at all - the two failures above both came from appending a correction where a

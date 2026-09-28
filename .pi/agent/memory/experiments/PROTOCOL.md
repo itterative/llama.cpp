@@ -19,6 +19,7 @@ Local branch only - nothing here is intended for submission as-is.
     PROTOCOL.md                this file
     INDEX.md                   every run, one row; the only place to scan for history
     plans/backlog.md           candidate hypotheses, prioritised, with status
+    plans/backlog-answered.md  finished/killed threads, one line each - do not re-open
     runs/E<nnn>-<slug>.md      one record per experiment
     results/E<nnn>-<slug>.*    raw, machine-generated output (never hand-edited)
     hw/<machine>.md            machine profiles (hardware, versions, pinned config)

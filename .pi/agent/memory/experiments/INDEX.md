@@ -8,7 +8,8 @@ analysis lives in `runs/`; when a row starts carrying mechanism, caveats or a se
 out of contract and the fix is to move that text into the record, not to widen the row.
 
 Verdicts: `planned` (reserved, not run), `open` (ran, question still live), `done`, `dead-end`,
-`not attributed`. Ids with no row here are still open in [plans/backlog.md](plans/backlog.md).
+`not attributed`. Ids with no row here are in [plans/backlog.md](plans/backlog.md) if open, or
+[plans/backlog-answered.md](plans/backlog-answered.md) if finished.
 
 | id | date | tier | machine | hypothesis (one line) | headline | verdict | record |
 |---|---|---|---|---|---|---|---|
