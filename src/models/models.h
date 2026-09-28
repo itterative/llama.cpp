@@ -2393,6 +2393,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    void prefetch_next_rows(const llama_ubatch & ubatch, const llama_token * next, uint32_t n_next) const override;
+
     // inputs and builders shared by the trunk and the draft graph
     struct graph_base : public llm_build_delta_net_base {
         graph_base(const llama_model & model, const llm_graph_params & params);

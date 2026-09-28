@@ -2025,6 +2025,49 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        // issue the row prefetch for the window that follows this ubatch, so a lazily read table can
+        // start its reads while this ubatch computes. the allocator holds the whole batch, positions
+        // included, so the window is in hand; a guess that cannot be made is simply skipped
+        {
+            const llama_batch & b = balloc->get_batch();
+
+            if (ubatch.token != nullptr && ubatch.n_tokens > 0 &&
+                b.token != nullptr && b.pos != nullptr && b.seq_id != nullptr) {
+                const uint32_t last = ubatch.n_tokens - 1;
+                const llama_seq_id seq = ubatch.seq_id[last][0];
+                const llama_pos   pos  = ubatch.pos[last];
+
+                // where this ubatch's last token sits in the batch
+                uint32_t i_last = (uint32_t) b.n_tokens; // sentinel: not found
+
+                for (uint32_t i = 0; i < (uint32_t) b.n_tokens; ++i) {
+                    if (b.pos[i] == pos && b.token[i] == ubatch.token[last] && b.n_seq_id[i] == 1 &&
+                        b.seq_id[i][0] == seq) {
+                        i_last = i;
+                        break;
+                    }
+                }
+
+                if (i_last + 1 < (uint32_t) b.n_tokens) {
+                    const uint32_t n_max = std::min<uint32_t>((uint32_t) b.n_tokens - (i_last + 1), cparams.n_ubatch);
+
+                    uint32_t n_next = 0;
+
+                    // only a window that continues the same sequence has the predecessors the model rebuilds
+                    while (n_next < n_max &&
+                           b.n_seq_id[i_last + 1 + n_next] == 1 &&
+                           b.seq_id[i_last + 1 + n_next][0] == seq &&
+                           b.pos[i_last + 1 + n_next] == pos + 1 + (llama_pos) n_next) {
+                        n_next++;
+                    }
+
+                    if (n_next > 0) {
+                        model.prefetch_next_rows(ubatch, b.token + i_last + 1, n_next);
+                    }
+                }
+            }
+        }
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);

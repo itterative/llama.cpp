@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-lazy-reader.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -1257,10 +1258,26 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_layer_ffn(ggml_tensor * cu
     return cur;
 }
 
+// the row indices of one token's window: ctx[0] is the token itself, ctx[s] the s-th predecessor,
+// already cut to EOS; writes the ple_heads_per_ngram heads of one n-gram length
+static void ple_mix_row(const llama_hparams & hp, const int64_t * ctx, int64_t n, int32_t * out) {
+    uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+
+    for (int64_t j = 1; j < n; ++j) {
+        mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+    }
+
+    const int64_t base = (n - 2) * hp.ple_heads_per_ngram;
+
+    for (int64_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
+        const int64_t h_i = base + g;
+        out[g] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+    }
+}
+
 // PLE n-gram hash embedding: each token gathers ple_n_heads rows of a shared table.
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
-
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
@@ -1332,20 +1349,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
 
         for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
-            }
+            ple_mix_row(hp, ctx.data(), n, &idx[i * n_heads + (n - 2) * per_gram]);
         }
     }
 
     rows.set_rows(idx.data(), (int64_t) idx.size());
+}
+
+// --lazy-mode on-direct: prefill knows the tokens that follow, so ask for their rows while this batch is
+// still computing. the window is rebuilt from tokens alone, which is the same window the KV cells give
+// once the batch is applied, so a wrong guess only wastes pages - the gather re-derives the real rows
+void llama_model_qwen4exp::prefetch_next_rows(const llama_ubatch & ubatch, const llama_token * next, uint32_t n_next) const {
+    const auto * reader = per_layer_tok_embd != nullptr ? lazy_reader(per_layer_tok_embd) : nullptr;
+
+    if (reader == nullptr || ubatch.token == nullptr || n_next == 0) {
+        return;
+    }
+
+    const auto & hp = hparams;
+
+    const int64_t n_gram   = hp.ple_ngram_size;
+    const int64_t n_heads  = hp.ple_n_heads;
+    const int64_t per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos      = hp.ple_eos_token_id;
+    const int64_t n_prev   = n_gram - 1;
+
+    if (n_gram <= 1 || n_heads <= 0 || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // the tail of this ubatch, most recent first: what the window's first tokens have in front of them
+    std::vector<llama_token> carry(n_prev, LLAMA_TOKEN_NULL);
+
+    for (int64_t d = 1; d <= n_prev; ++d) {
+        carry[d - 1] = ubatch.n_tokens >= (uint32_t) d ? ubatch.token[ubatch.n_tokens - d] : LLAMA_TOKEN_NULL;
+    }
+
+    std::vector<int32_t> idx(n_heads * n_next);
+    std::vector<int64_t> ctx(n_gram);
+
+    for (int64_t i = 0; i < (int64_t) n_next; ++i) {
+        ctx[0] = next[i];
+
+        bool cut = false;
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const int64_t k = i - s; // negative means before the window, so read the carry
+            const llama_token t = cut ? LLAMA_TOKEN_NULL
+                                : k >= 0 ? next[k]
+                                : k >= -(int64_t) carry.size() ? carry[-k - 1]
+                                : LLAMA_TOKEN_NULL;
+
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+
+        for (int64_t n = 2; n <= n_gram; ++n) {
+            ple_mix_row(hp, ctx.data(), n, &idx[i * n_heads + (n - 2) * per_gram]);
+        }
+    }
+
+    reader->prefetch(idx.data(), (int64_t) idx.size());
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

@@ -4,6 +4,7 @@
 #include "ggml-prof.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -42,7 +43,19 @@ llama_lazy_reader::llama_lazy_reader(const std::string & path, size_t offs, enum
     }
 }
 
-llama_lazy_reader::~llama_lazy_reader() = default;
+llama_lazy_reader::~llama_lazy_reader() {
+    {
+        std::lock_guard<std::mutex> lock(prefetch_mtx);
+
+        prefetch_stop = true;
+    }
+
+    prefetch_cv.notify_one();
+
+    if (prefetch_thread.joinable()) {
+        prefetch_thread.join();
+    }
+}
 
 void llama_lazy_reader::read_range(const std::pair<int32_t, int32_t> * pairs, int64_t begin, int64_t end,
                                    size_t fi, float * dst) const {
@@ -151,6 +164,87 @@ static int llama_lazy_workers() {
     return val;
 }
 
+// env: LLAMA_LAZY_PREFETCH_AHEAD - issue the next batch's WILLNEED calls from a background thread while
+// the current batch computes. on by default; 0 keeps them inline in gather() only
+static int llama_lazy_prefetch_ahead() {
+    static const int val = []() {
+        const char * env = std::getenv("LLAMA_LAZY_PREFETCH_AHEAD");
+
+        return env == nullptr || atoi(env) != 0 ? 1 : 0;
+    }();
+
+    return val;
+}
+
+// one WILLNEED per row; rows must be sorted and unique. the kernel rounds each call up to a page, which
+// is the granularity the table layout leaves us - the rows of one token are 16 scattered 110 B spans
+void llama_lazy_reader::fadvise_rows(const int32_t * rows, int64_t n) const {
+#ifdef POSIX_FADV_WILLNEED
+    const int fd = files[0]->file_id();
+
+    for (int64_t i = 0; i < n; ++i) {
+        posix_fadvise(fd, offs + (size_t) rows[i] * rsize, rsize, POSIX_FADV_WILLNEED);
+    }
+#else
+    (void) rows;
+    (void) n;
+#endif
+}
+
+void llama_lazy_reader::prefetch(const int32_t * rows, int64_t n) const {
+    if (n <= 0 || llama_lazy_prefetch() == 0 || llama_lazy_prefetch_ahead() == 0) {
+        return;
+    }
+
+    std::vector<int32_t> job(rows, rows + n);
+    std::sort(job.begin(), job.end());
+    job.erase(std::unique(job.begin(), job.end()), job.end());
+
+    {
+        std::lock_guard<std::mutex> lock(prefetch_mtx);
+
+        if (!prefetch_thread.joinable()) {
+            prefetch_thread = std::thread([this]() { prefetch_loop(); });
+        }
+
+        // a job still waiting is stale by construction: it holds the window before this one
+        prefetch_job.swap(job);
+        prefetch_pending = true;
+    }
+
+    prefetch_cv.notify_one();
+
+    // counters are not thread-safe, so the background thread never touches them
+    ggml_prof_count("io:prefetch_rows", (uint64_t) n);
+}
+
+void llama_lazy_reader::prefetch_loop() const {
+    for (;;) {
+        std::vector<int32_t> job;
+
+        {
+            std::unique_lock<std::mutex> lock(prefetch_mtx);
+
+            prefetch_cv.wait(lock, [this]() { return prefetch_stop || prefetch_pending; });
+
+            if (prefetch_stop) {
+                return;
+            }
+
+            job.swap(prefetch_job);
+            prefetch_pending = false;
+        }
+
+        fadvise_rows(job.data(), (int64_t) job.size());
+
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mtx);
+
+            prefetch_done.swap(job);
+        }
+    }
+}
+
 // rows an earlier gather already read, so the reuse rate falls out of the counters. process-wide and
 // never evicted, which is fine because it is inert unless profiling and a run touches few rows
 static std::mutex                  lazy_seen_lock;
@@ -176,45 +270,51 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
         std::sort(pairs.begin(), pairs.end());
     }
 
-    // pairs is sorted, so the distinct rows and the ones an earlier gather saw are one linear pass
-    int64_t n_uniq = 0, n_reuse = 0;
+    // the distinct rows, sorted, which is also the list a prefetch one batch ahead would have issued
+    std::vector<int32_t> distinct;
+    distinct.reserve(n);
+
+    for (int64_t i = 0; i < n; ) {
+        int64_t j = i + 1;
+        while (j < n && pairs[j].first == pairs[i].first) {
+            ++j;
+        }
+
+        distinct.push_back(pairs[i].first);
+
+        i = j;
+    }
+
+    // pairs is sorted, so the rows an earlier gather saw are one linear pass over the same distinct list
+    int64_t n_uniq = (int64_t) distinct.size(), n_reuse = 0;
 
     if (prof) {
         std::lock_guard<std::mutex> lock(lazy_seen_lock);
 
-        for (int64_t i = 0; i < n; ) {
-            int64_t j = i + 1;
-            while (j < n && pairs[j].first == pairs[i].first) {
-                ++j;
-            }
-
-            n_uniq++;
-            if (!lazy_seen.insert(pairs[i].first).second) {
+        for (const int32_t row : distinct) {
+            if (!lazy_seen.insert(row).second) {
                 n_reuse++;
             }
-
-            i = j;
         }
     }
 
-#ifdef POSIX_FADV_WILLNEED
-    if (llama_lazy_prefetch() != 0) {
+    // a row list the prefetch already covered is resident or in flight, so the WILLNEED calls are not
+    // just redundant, they are the expensive part: 4.3 us cold against 0.75 us cached, per row
+    bool ahead = false;
+
+    if (llama_lazy_prefetch() != 0 && llama_lazy_prefetch_ahead() != 0) {
+        std::lock_guard<std::mutex> lock(prefetch_mtx);
+
+        ahead = prefetch_done == distinct;
+    }
+
+    if (llama_lazy_prefetch() != 0 && !ahead) {
+        // the region is opened here and not in fadvise_rows: the prefetch thread must not touch the
+        // prof tables, which are plain globals with no lock
         ggml_prof_region prof_prefetch("lazy:prefetch");
 
-        const int fd = files[0]->file_id();
-
-        for (int64_t i = 0; i < n; ) {
-            int64_t j = i + 1;
-            while (j < n && pairs[j].first == pairs[i].first) {
-                ++j;
-            }
-
-            posix_fadvise(fd, offs + (size_t) pairs[i].first * rsize, rsize, POSIX_FADV_WILLNEED);
-
-            i = j;
-        }
+        fadvise_rows(distinct.data(), (int64_t) distinct.size());
     }
-#endif
 
     int64_t n_want = n / 32;
     if (llama_lazy_workers() > 0) {
@@ -257,6 +357,12 @@ void llama_lazy_reader::gather(const int32_t * rows, int64_t n, float * dst) con
         ggml_prof_count(dec ? "io:rows_decode"  : "io:rows_prefill",  (uint64_t) n);
         ggml_prof_count(dec ? "io:uniq_decode"  : "io:uniq_prefill",  (uint64_t) n_uniq);
         ggml_prof_count(dec ? "io:reuse_decode" : "io:reuse_prefill", (uint64_t) n_reuse);
+
+        if (llama_lazy_prefetch() != 0 && llama_lazy_prefetch_ahead() != 0) {
+            // did the window issued one batch ahead match the rows this gather asked for
+            ggml_prof_count(dec ? "io:ahead_hit_decode"  : "io:ahead_hit_prefill",  (uint64_t) ahead);
+            ggml_prof_count(dec ? "io:ahead_miss_decode" : "io:ahead_miss_prefill", (uint64_t) !ahead);
+        }
 
         if (io) {
             uint64_t rchar1 = 0, storage1 = 0;
