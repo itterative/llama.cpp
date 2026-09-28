@@ -208,11 +208,13 @@ fixed cost, ~1/6 the magnitude, because per-node host work scales with layer cou
 
 Three rules that come from E017/E018 and must not be re-derived:
 - **Correctness gate**: `llama-perplexity -m models/q4exp-4l.gguf -f
-  experiments/tools/golden-corpus.md` -> `PPL = 263113.4044 +/- 3043.13706` on the current tree
-  (bit-stable across runs, and it moved 263113.6984 -> 263113.4044 when the mmvf decode unroll
-  became the default - summation order changes move this number, which is why the contract is
-  "every diff is explained" and not "no diff"). It covers the *prefill* path only, and its contract is "every diff is explained", not "no
-  diff" - the QSA compaction port must move it.
+  experiments/tools/golden-corpus.md` -> `PPL = 263113.4044 +/- 3043.13706` on ROCm 7.1, and
+  `263100.7437 +/- 3044.04345` on ROCm 10.0.0 (dev box, 2026-09-28). Never compare a PPL across
+  toolchains - this move shifted the estimate ~0.005% and every chunk - so re-baseline the gate after a
+  ROCm upgrade. On one tree and toolchain it is bit-stable across runs, and it moved
+  263113.6984 -> 263113.4044 when the mmvf decode unroll became the default: summation order changes
+  move this number, which is why the contract is "every diff is explained", not "no diff". It covers
+  the *prefill* path only - the QSA compaction port must move it.
 - **Noise floor ~1%**: the same file measured 180.3 / 181.8 / 181.9 t/s across invocations, and
   this GPU drives a display. Sub-2% local deltas are not findings.
 - **Decode does not care about table volume** (182.1 / 182.7 / 182.4 at 35 / 3.7 / 5.5 GB) but
