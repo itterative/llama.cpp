@@ -1,0 +1,17 @@
+# Derived output: regenerable from each record's commands.sh, and large on the bench box (traces reach 2 GB).
+# What DOES belong in git: the [prof] logs, case lists, small summaries - add those with `git add -f`,
+# since the repo root ignores *.log.
+vram-*.txt
+*.db
+*.duckdb
+*_kernel_trace.csv
+*_kernel_stats.csv
+*_marker_api_trace.csv
+*_marker_api_stats.csv
+*_agent_info.csv
+*_domain_stats.csv
+*_hsa_api_trace.csv
+*_hsa_api_stats.csv
+*_memory_copy_*.csv
+*_memory_allocation_*.csv
+traces/

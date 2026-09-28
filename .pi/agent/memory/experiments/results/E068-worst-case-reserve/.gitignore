@@ -1,0 +1,4 @@
+# rocprofv3 / sampler output is reproducible from commands.sh and never committed
+*.csv
+vram-*.txt
+*.db
