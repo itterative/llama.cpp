@@ -1,0 +1,301 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c49eb9f1d..8afee253b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1366,10 +1366,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+     bool can_reuse = !graph_reuse_disable && gf_res_prev_active == res;
+ 
++    if (getenv("Q4EXP_REUSE_DEBUG")) {
++        fprintf(stderr, "[reuse] outer: disable=%d active=%p res=%p can=%d\n",
++                (int) graph_reuse_disable, (void *) gf_res_prev_active, (void *) res, (int) can_reuse);
++    }
++
+     if (can_reuse) {
+         ggml_prof_region prof_reuse("graph:reuse");
+ 
+         can_reuse = res->can_reuse(gparams);
++
++        if (getenv("Q4EXP_REUSE_DEBUG")) {
++            fprintf(stderr, "[reuse] inner: %d\n", (int) can_reuse);
++        }
+     }
+ 
+     if (can_reuse) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9939dba29..c0b46f012 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1460,6 +1460,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+ }
+ 
+ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
++    const bool dbg = getenv("Q4EXP_REUSE_DEBUG") != nullptr;
++    const bool ok_params = this->params.allow_reuse(params);
++    if (dbg) {
++        fprintf(stderr, "[reuse] allow_reuse=%d inputs=%d nt=%u/%u seqt=%u/%u seqs=%u/%u nout=%u/%u\n",
++                (int) ok_params, (int) inputs.size(),
++                this->params.ubatch.n_tokens, params.ubatch.n_tokens,
++                this->params.ubatch.n_seq_tokens, params.ubatch.n_seq_tokens,
++                this->params.ubatch.n_seqs, params.ubatch.n_seqs,
++                this->params.n_outputs, params.n_outputs);
++    }
+     if (!this->params.allow_reuse(params)) {
+         if (debug > 1) {
+             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
+@@ -1474,11 +1484,14 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+ 
+     bool res = true;
+ 
+-    for (auto & input : inputs) {
+-        const bool cur = input->can_reuse(params);
++    for (size_t i = 0; i < inputs.size(); ++i) {
++        const bool cur = inputs[i]->can_reuse(params);
++        if (dbg) {
++            fprintf(stderr, "[reuse]   input %d -> %d\n", (int) i, (int) cur);
++        }
+ 
+         if (debug > 1) {
+-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
++            LLAMA_LOG_DEBUG("%s: input %d can_reuse = %d\n", "placeholder", (int) i, cur);
+         }
+ 
+         res = res && cur;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 72e0f5120..318c6d778 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2770,6 +2770,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++uint32_t llama_kv_cache_context::get_size() const {
++    return kv->get_size();
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5ac70d831..c1781543a 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -401,6 +401,7 @@ public:
+     //
+ 
+     uint32_t get_n_kv() const;
++    uint32_t get_size() const;
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 35d99feec..98acb2ce9 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -24,6 +24,32 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
+     }
+ }
+ 
++// QSA block widths. Nonzero Q4EXP_QSA_WINDOW rounds the block count up to a window so consecutive
++// prefill ubatches share a shape and the graph can be reused; the padded blocks are hidden by the bias,
++// so they only cost work. Prefill only, and only once the selection is saturated: below that the top-k
++// would have to pick a padded block, whose cell entry is 0 and would attend.
++static int64_t qsa_window_tokens() {
++    static const int64_t window_tokens = []() {
++        const char * env = getenv("Q4EXP_QSA_WINDOW");
++        return env ? (int64_t) atoll(env) : 0;
++    }();
++
++    return window_tokens;
++}
++
++static int64_t qsa_blocks_window(int64_t n_blocks, int64_t r, int64_t n_tokens, uint32_t kv_size, int64_t n_sel_max) {
++    const int64_t window_tokens = qsa_window_tokens();
++
++    if (window_tokens <= 0 || n_tokens <= 1 || n_blocks < n_sel_max) {
++        return n_blocks;
++    }
++
++    const int64_t step = std::max<int64_t>(1, window_tokens/r);
++    const int64_t cap  = (kv_size + r - 1)/r;   // pool rows, get_pool asserts on it
++
++    return std::min<int64_t>(GGML_PAD(n_blocks, step), cap);
++}
++
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -543,8 +569,8 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_norm_gated(
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias,
+-                        bool block_sel) :
+-        mctx(mctx), ratio(ratio), blk_bias(blk_bias), block_sel(block_sel) {}
++                        bool block_sel, int64_t n_sel_max) :
++        mctx(mctx), ratio(ratio), blk_bias(blk_bias), block_sel(block_sel), n_sel_max(n_sel_max) {}
+     virtual ~llm_graph_input_qsa() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+@@ -566,6 +592,11 @@ public:
+         const int64_t n_stream = mctx->get_n_stream();
+         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+ 
++        // the width the build asked for, see qsa_blocks_window
++        const int64_t n_blocks_g = pool.mode != llama_qsa_pool::NONE
++                ? qsa_blocks_window(n_blocks, ratio, params.ubatch.n_tokens, idx->get_size(), n_sel_max)
++                : n_blocks;
++
+         bool res = true;
+ 
+         res &= params.ubatch.n_tokens % n_stream == 0;
+@@ -580,9 +611,9 @@ public:
+         }
+ 
+         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+-        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
++        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks_g;
+         res &= !blk_pos || blk_pos->ne[0] == 4*n_blocks*n_stream;
+-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
++        res &= bias->ne[0]      == (blk_bias ? n_blocks_g : n_kv);
+         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+ 
+         // the pool variant is part of the graph topology: rows are read from the cache in one variant
+@@ -605,6 +636,7 @@ public:
+     // per stream: a cell index names a different token in each stream
+     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
+     ggml_tensor * blk_cells  = nullptr;   // I32 [ratio*n_blocks, n_stream]
++    int64_t       n_blocks   = 0;         // width the build used, see qsa_blocks_window
+     ggml_tensor * blk_pos    = nullptr;   // I32 [4*n_blocks*n_stream]
+     ggml_tensor * bias       = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+     ggml_tensor * cell_blk   = nullptr;   // I32 [n_kv, n_stream]           - per-cell bias mode only
+@@ -627,6 +659,9 @@ public:
+ 
+     // whole blocks are selected on the score array; otherwise the cells are scored and cut by top-k
+     const bool block_sel;
++
++    // most blocks the selection can pick, the window stays off below it
++    const int64_t n_sel_max;
+ };
+ 
+ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+@@ -645,13 +680,17 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+ 
+     GGML_ASSERT(r > 0);
+ 
+-    const int64_t n_blocks = (n_kv + r - 1)/r;
++    const int64_t n_blocks   = (n_kv + r - 1)/r;
++    int64_t       n_blocks_g = n_blocks;   // windowed width, see qsa_blocks_window
+ 
+     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
+     const int64_t n_stream = mctx_hyb->get_n_stream();
+     GGML_ASSERT(n_tokens % n_stream == 0);
+     const int64_t n_tps = n_tokens/n_stream;
+ 
++    // the most blocks the selection can pick, used to keep the window off before it saturates
++    const int64_t n_sel_max = std::max<int64_t>((int64_t) hparams.indexer_top_k / r, 1);
++
+     // only the "which block is visible" half of the bias varies per block
+     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
+     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+@@ -669,19 +708,28 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
+     llm_graph_input_qsa * inp = nullptr;
+ 
++    // the pool variant depends on the cell state, not on the layer, so it is decided once per ratio
++    const llama_qsa_pool pool_cur = block_sel ? mctx_hyb->qsa_pool_get((uint32_t) r, ubatch, n_stream, n_kv)
++                                              : llama_qsa_pool();
++
++    // the pool reads blocks, so the block widths can be widened inside a window: the padded blocks
++    // are not written, but the bias hides them, so all they cost is work
++    if (pool_cur.mode != llama_qsa_pool::NONE) {
++        n_blocks_g = qsa_blocks_window(n_blocks, r, n_tokens, mctx_idx->get_size(), n_sel_max);
++    }
++
+     const auto it = qsa_inps.find((uint32_t) r);
+-    if (it != qsa_inps.end() && it->second->block_sel == block_sel) {
++    if (it != qsa_inps.end() && it->second->block_sel == block_sel && it->second->n_blocks == n_blocks_g) {
+         inp = it->second;
+     } else {
+-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, block_sel);
++        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, block_sel, n_sel_max);
+ 
+-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
++        qsa->n_blocks = n_blocks_g;
++        qsa->pool     = pool_cur;
+ 
+-        // the pool variant depends on the cell state, not on the layer, so it is decided once per ratio
+-        qsa->pool = block_sel ? mctx_hyb->qsa_pool_get((uint32_t) r, ubatch, n_stream, n_kv)
+-                              : llama_qsa_pool();
++        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
++        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks_g, n_stream);
++        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks_g : n_kv, n_tps, n_stream);
+ 
+         // reading the pool replaces the whole-cache rope, so blk_pos has no consumer left in the pooled
+         // variant - and an input nobody uses never gets memory
+@@ -775,7 +823,7 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+         // one shape whether the pool holds nothing or everything: derive the rows this step owns, write
+         // them, and score the result of the write. ggml_set_rows returns a view of its destination, so
+         // the scores depend on the write through the graph instead of through node order
+-        ggml_tensor * pool = mctx_idx->get_pool(ctx0, il, n_blocks);
++        ggml_tensor * pool = mctx_idx->get_pool(ctx0, il, n_blocks_g);
+ 
+         ggml_tensor * dst = ggml_view_4d(ctx0, pool, idx_dim, pool->ne[1], 1, n_stream,
+                 pool->nb[1], pool->nb[2], pool->nb[2], 0);
+@@ -807,7 +855,7 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+         // rows the pool already held are untouched by the write, so the result of set_rows is the whole
+         // [0, n_blocks) range the scores need
+         pooled = ggml_reshape_3d(ctx0, ggml_set_rows(ctx0, dst, fresh, inp->new_rows),
+-                idx_dim, n_blocks, n_stream);
++                idx_dim, n_blocks_g, n_stream);
+         cb(pooled, "indexer_k", il);
+     }
+ 
+@@ -823,13 +871,13 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
++    score = ggml_reshape_4d(ctx0, score, n_blocks_g, n_idx_h, n_tps, n_stream);
+     score = ggml_relu(ctx0, score);
+ 
+     // the heads sit side by side on ne[1] and there are only a few of them
+     ggml_tensor * summed = nullptr;
+     for (int64_t h = 0; h < n_idx_h; ++h) {
+-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
++        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks_g, n_tps, n_stream,
+                 score->nb[2], score->nb[3], h*score->nb[1]);
+         summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+     }
+@@ -837,6 +885,13 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+     score = summed;
+     cb(score, "indexer_score", il);
+ 
++    // the windowed width scores pool rows that were never written: clamp it, or a garbage inf meets the
++    // -inf bias and turns into a nan inside the top-k. Gated on the env, not on the width, so the node is
++    // in the graph the reservation measures too - a node that appears only at runtime re-reserves
++    if (qsa_window_tokens() > 0) {
++        score = ggml_clamp(ctx0, score, -1e30f, 1e30f);
++    }
++
+     // one value per block, so it is cheaper to bias here than after the cells are expanded
+     if (blk_bias) {
+         score = ggml_add(ctx0, score, inp->bias);
+@@ -849,14 +904,13 @@ ggml_tensor * llama_model_qwen4exp::graph_base::build_qsa_top_k(
+         // expand each into its cells (Eq. 16 and 19). Nothing here walks the cell array.
+         // the tail always carries the query's own cell (Eq. 19's set can be empty at a block
+         // boundary), which is also what guarantees a query never gets a fully masked row
+-        const int64_t n_blk_sel = std::min<int64_t>(n_blocks,
+-                std::max<int64_t>((int64_t) hparams.indexer_top_k / r, 1));
++        const int64_t n_blk_sel = std::min<int64_t>(n_blocks_g, n_sel_max);
+ 
+         ggml_tensor * sel = ggml_top_k(ctx0, score, n_blk_sel);
+ 
+         // blk_cells is block-major, so seen this way it maps a block to the cells making it up
+         ggml_tensor * cells = ggml_get_rows(ctx0,
+-                ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream),
++                ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks_g, n_stream),
+                 ggml_reshape_2d(ctx0, sel, n_blk_sel*n_tps, n_stream));
+ 
+         cells = ggml_reshape_3d(ctx0, cells, n_blk_sel*r, n_tps, n_stream);
