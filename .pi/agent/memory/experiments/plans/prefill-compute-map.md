@@ -338,11 +338,18 @@ pure host work with no numerics in it.
   (270867.5339 / 270355.0350 / 266980.6971). Note `-sm tensor` shifts the digits by itself, against
   266980.7507 for the default split, so a meta-path gate has to compare like with like.
 - **Result, dev box, same command:** per init 2.72 -> 1.87 us (prep 1.94 -> 1.22 us, tail 431 -> 304 ns,
-  create and srcs unchanged), `sched:init_nodes` 20.49 -> 17.71 ms/call, so about a third of the meta init
-  comes off. On the box that should be ~5.7 ms/ubatch, ~1.2% of prefill; the wall number needs a box run.
-- **Left on the table:** the remaining prep is the per-graph recompute plus a `std::map` find in
-  `stc.simple_tensors` (once per init and once per source state lookup), which is a cheap follow-up; P9c is
-  what removes the recompute itself.
+  create and srcs unchanged), `sched:init_nodes` 20.49 -> 17.71 ms/call.
+- **Result, box run 2026-09-28** (`results/user/llama-bench/3d8452b0f/run-prof.log`, 6,793 inits per ubatch):
+  per init 2.94 -> 2.32 us (prep 1.65 -> 1.11, tail 435 -> 315 ns, create and srcs unmoved), i.e. 20.0 ->
+  15.8 ms of the 489 ms ubatch, and **`pp4096 @ d16384` 2070.90 -> 2076.09 +- 2.40** (+0.25%). The host
+  saving is ~0.9% of the ubatch and the wall sees 0.25%, so pass-through is roughly a third - the same ratio
+  E077 found, and a reminder that host-side items have to be priced through it. `sched:init_nodes` reads
+  21.26 against 22.25 ms/call; the two `erase` calls per init sit outside the timed phases, so they are in
+  that region but not in the counters.
+- **Left on the table, box numbers:** prep is still the top phase at 1.11 us of 2.32 (48%), and it is the
+  per-graph recompute plus a `std::map` find in `stc.simple_tensors` (once per init and once per source
+  lookup). Switching that container to an `unordered_map` is the same trick again and cheap; P9c's content
+  key is what removes the recompute. Tail 315 ns is the zero-slice scan plus the insert.
 - **Bound, added after the first version.** The map is capped at `split_state_cache_max` (2^16 entries) and
   cleared when exceeded. Keys are addresses that are never dereferenced and the split state holds no
   pointers, so a stale entry is at worst a wrong number, and clearing is always sound; the cap only gives a
