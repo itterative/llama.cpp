@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1178,12 +1179,59 @@ static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) 0x1000000000000000; // FIXME
 }
 
+// Phase timing for the per-tensor meta init. ggml_prof regions are us-resolution, which is too coarse
+// for phases of ~1 us, so time them with steady_clock and report the totals as ns counters. Off unless
+// profiling is enabled, so a normal run pays nothing.
+static uint64_t meta_init_ns[4] = { 0, 0, 0, 0 };   // prep (lookup + split), create, srcs, tail
+static uint64_t meta_init_subtensors = 0;
+static uint64_t meta_init_src_remaps = 0;
+
+static inline uint64_t meta_init_now(void) {
+    if (ggml_prof_enabled() == 0) {
+        return 0;
+    }
+
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void meta_init_report(void) {
+    if (ggml_prof_enabled() == 0) {
+        return;
+    }
+
+    static const char * names[4] = {
+        "meta:init_prep_ns", "meta:init_create_ns", "meta:init_srcs_ns", "meta:init_tail_ns",
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        if (meta_init_ns[i] != 0) {
+            ggml_prof_count(names[i], meta_init_ns[i]);
+            meta_init_ns[i] = 0;
+        }
+    }
+
+    if (meta_init_subtensors != 0) {
+        ggml_prof_count("meta:init_subtensors", meta_init_subtensors);
+        meta_init_subtensors = 0;
+    }
+
+    if (meta_init_src_remaps != 0) {
+        ggml_prof_count("meta:init_src_remaps", meta_init_src_remaps);
+        meta_init_src_remaps = 0;
+    }
+}
+
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
+    const uint64_t t_prep0 = meta_init_now();
+
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
+
+    meta_init_ns[0] += meta_init_now() - t_prep0;
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
 
@@ -1198,6 +1246,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
+        const uint64_t t_j0 = meta_init_now();
+
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
@@ -1267,17 +1317,26 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             t_ij->extra = tensor->extra;
         }
 
+        const uint64_t t_j1 = meta_init_now();
+
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
+                meta_init_src_remaps += 1;
             }
         }
 
+        meta_init_ns[1] += t_j1 - t_j0;
+        meta_init_ns[2] += meta_init_now() - t_j1;
+        meta_init_subtensors += 1;
+
         simple_tensors.push_back(t_ij);
     }
+
+    const uint64_t t_tail0 = meta_init_now();
 
     // If one of the sources has a zero-sized slice, disable the computation:
     for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1302,6 +1361,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
     stc.simple_tensors[tensor] = simple_tensors;
 
+    meta_init_ns[3] += meta_init_now() - t_tail0;
+    meta_init_report();
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1309,7 +1371,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+
+    const uint64_t t_lookup0 = meta_init_now();
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+    meta_init_ns[0] += meta_init_now() - t_lookup0;
+
+    return ggml_backend_meta_buffer_init_tensor_impl(stc, tensor);
 }
 
 static void ggml_backend_meta_buffer_memset_tensor(
