@@ -308,44 +308,25 @@ measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to
 what is left on it is vision - H20 (pool nothing while an image is in the run), H21 (the pool promises on
 an endpoint test the fast path does not honour) and H22 (does a vision turn pay H19's ratchet; needs a
 bench reading, because the dev box counts ~20 re-reserves per 7.5k cells while wall time moves 1%). The
-VRAM tax the default now makes everyone pay is still open too. H19 is the non-pool
-reservation ratchet, and **E069 closed its investigation with a negative answer for the obvious fix**: the
-tripping tensor is `qsa_bias` (`F32 [n_blocks, n_tps]`, +256 blocks = 1 MiB per 1024-token ubatch), but the
-reserve graph already builds it at the full-cache shape (8192 blocks, `need = 1381.18 MiB`), so nothing is
-under-sized. The ratchet is the *reservation being retightened*: `ggml_gallocr_reserve_n_impl` assigns each
-slot's `size_max` from the graph it reserves for, the warmup's 702-node graph trips the structure check right
-after the 703-node reserve, and the sched's fallback then records the warmup's tiny sizes - so every prefill
-ubatch is exactly one padding step past the record (34 reallocs, 1699 ms of a 5699 ms wall, one forced device
-drain each). Two candidate fixes are already excluded by measurement: making `size_max` a high-water mark
-corrupts (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`, E069 - it is a placement-validity token, not a capacity
-record), and skipping a reserve whose graph fits is inert because the reserve path is only entered on a failed
-fit test. What is left is reserve *policy*: measure a worst-case graph at the retighten, or keep the
-reservation across a structural change. The tool that found all of this is `GGML_ALLOC_DEBUG_REALLOC=1`;
-the QSA graph inputs now carry names so its output is readable. **E070 then falsified the harness form of that
-first lever and narrowed it**: `llama_graph_reserve` always builds the all-outputs convention (703 nodes -
-`ubatch_prepare_reserve` honours sampled outputs only for sequences with a sampler), while the prompt pass runs
-702, and the node count is tested before any size, so no reservation can survive that. **E071 then killed that
-lever too and localised the real difference**: the reserve graph (703) and the runtime graph (702) differ by
-exactly one scheduler dependency node, `ffn_moe_down-3 (view)` - the reserve copy graph treats the last layer's
-MoE down output as a cross-split input, the runtime graph does not - and `n_outputs` does not control it (1 and
-n_tokens both give 703). So H19 is blocked on a graph-identity question; until the reserve graph and the runtime
-graph are the same graph, the record is retightened on the first prompt ubatch, and no allocator-side shortcut
-is safe (a one-node insertion shifts every later slot index). **E072 then solved it**: the extra node is the
-MoE weighted-reduction fusion's `add_alloc_dep` (`ggml_backend_cuda_graph_optimize`, `ggml-cuda.cu:4597`) that
-the sched turns into a keep-alive view node - reserve graphs carry it, prompt graphs do not, and the node count
-is tested before any size. `GGML_CUDA_DISABLE_FUSION=1` gives **0 reallocs, 0 trips, prefill wall 5145 ms
-against 5539-5725 ms** (PPL 263100.9174, a summation-order change). The dep is also self-defeating in prefill:
-`ggml_cuda_check_fusion_memory_ranges` skips the fusion when ranges overlap, which is exactly what the dep
-prevents, so what the fusion gives up in prefill is worth less than the ratchet costs. The fix is to make the
-dep reporting consistent per graph; until then the env var is the workaround, and a fusion-off arm needs its
-own golden PPL. **E073 fixed it**: the matcher rejects empty reductions (`n_tokens <= 0`, and prefill's last
-layer has `ne[2] = 0` because the batch carries no output tokens), so the dependency vanished with the fusion
-and the node count changed per batch. `ggml_cuda_match_moe_weighted_reduction` now takes `require_work`
-(false at the dependency call site, true at compute): **0 reallocs, prefill wall 4819-5075 ms against
-5539-5725, VRAM unchanged, PPL bit-identical 263100.7437** - faster than disabling the fusion and no memory
-cost. Invariant restored, worth remembering for any future fusion: a fusion must not change the graph's node
-count per batch, because the scheduler's per-slot bookkeeping is indexed by node position and the node count
-is tested before any size. **E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
+VRAM tax the default now makes everyone pay is still open too.
+
+**H19 - the non-pool reservation ratchet - is fixed** (E069 to E073, detail in those records). Cause: the MoE
+weighted-reduction fusion (upstream #25952) reported its keep-alive allocation deps only when the reduction had
+work, and the scheduler's node count decides whether a reservation survives, so prefill retightened the
+reservation on every ubatch: 34 reallocs, 1689 ms of a 5699 ms wall, one forced device drain each. Fix:
+`require_work` on the matcher, false at the dep call site and true at compute, so the fusion still runs. Dev
+box: 0 reallocs, prefill wall 4819-5075 ms, VRAM unchanged, PPL bit-identical. Invariant for any future
+fusion: it must not change the graph's node count per batch. Tooling: `GGML_ALLOC_DEBUG_REALLOC=1` (needs `-v`).
+
+**T2 bounds it (E074)**: the bench box's dense prefill never re-reserved (0 `sched:realloc*` rows in both prof
+arms), so the fix is neutral there and the "seconds per prompt" estimate does not transfer; its exposure is the
+pinned/vision path (H22) and the request path. Two T2 facts from the same runs: the fusion is worth **8.75% of
+pp** (2138.37 vs 1951.32 t/s at pp4096 @ d16384), and the normal `graph:alloc` cost (~20.5 ms/call, ~5% of the
+prefill total, no re-reservations involved) is untouched - that is H19's other half. Open observation: prefill
+GPU utilisation looks higher than remembered; measure with `rocprofv3 --kernel-trace` + `GGML_PROF_WINDOW=pp`,
+kernel time per pass against the wall.
+
+**E058 is done and landed**: the n-gram fetch was **5.4% of the decode token wall**
 (1.4181 ms of 26.32 ms at 38.0 t/s), because a step reads 16 distinct 110 B rows and `gather()` put all 16
 on one worker, so the ~8 cold ones were serial queue-depth-1 waits. `POSIX_FADV_WILLNEED` over all of them
 before waiting takes it to 0.5819 ms and tg to **39.6 (+4.2%)**, now the default (`3f1138bb3`). It also

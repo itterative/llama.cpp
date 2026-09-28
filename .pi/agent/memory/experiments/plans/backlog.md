@@ -50,6 +50,20 @@ All four are development work with an already-measured prize, and none needs the
    tensor (`qsa_bias`), E070 falsified the output-convention route, E071 found the single extra node,
    E072 traced it to the fusion, E073 fixed it. **Invariant for any future fusion: it must not change the
    graph's node count per batch.**
+   **T2 puts bounds on it (E074)**: the bench box's *dense* prefill shows 0 `sched:realloc*` rows in both prof
+   arms, so it never re-reserved and the fix is neutral for that workload - the T2 exposure is the
+   non-dense/pinned/vision path (H22) and the request path, and a `llama-cli`/server run with regions is what
+   would show it there. Untouched by the fix and still open: the **normal `graph:alloc` cost**, ~20.5 ms/call,
+   56 calls = 1.15 s = ~5% of the T2 prefill total with no re-reserves involved (E074) - this is the same
+   ~21 ms/call behind E062's 0.57 ms/token decode line, so it is the other half of H19.
+   Related and measured on T2 while checking this (E074): the MoE weighted-reduction fusion is worth **8.75% of
+   pp** (2138.37 vs 1951.32 t/s at pp4096 @ d16384); its decode value is still unmeasured and is the side where
+   a weighted reduction should matter most.
+   Open observation from the user (E074): prefill GPU utilisation looks higher than remembered. Not attributable
+   to the fix in those runs (no re-reservations to remove) and not visible as throughput against the
+   2026-09-27 baseline, which is flat; the prefill-pooling work (E056: 1781 -> 2230 pp8192) is the plausible
+   cause if the memory reaches further back. To measure: `rocprofv3 --kernel-trace` + `GGML_PROF_WINDOW=pp`,
+   kernel time per pass against the wall (`graph:compute` is the async entry, not device time).
 4. **E016 - name the next piece of host wall.** Prize: E058 found one such piece (the n-gram fetch, 5.4%
    of the token wall) with the region counters plus `perf`, and fixed it to 2.3%; E059 left 42% of device
    work sitting between markers, and `decode-comms-plan.md` ends by saying the remaining decode problem is
