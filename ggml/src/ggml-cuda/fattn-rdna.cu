@@ -61,8 +61,14 @@ static bool ggml_cuda_fattn_rdna_can_use_rtile(const fattn_props & props) {
 // launch_fattn's use_sparse must be derived from the op hint: passing it true for a node with
 // n_kv_max == 0 trips GGML_ASSERT(n_kv_max > 0) in fattn-common.cuh.
 
+// on by default; GGML_FATTN_RDNA_RTILE=0 selects the non-tiled RDNA kernel
 static bool ggml_cuda_fattn_rdna_rtile_enabled() {
-    static const bool enabled = getenv("GGML_FATTN_RDNA_RTILE") && atoi(getenv("GGML_FATTN_RDNA_RTILE")) != 0;
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_FATTN_RDNA_RTILE");
+
+        return v == nullptr || (v[0] != '0' && v[0] != 'o' && v[0] != 'f');
+    }();
+
     return enabled;
 }
 

@@ -218,6 +218,17 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// on by default; GGML_CUDA_P2P=0 skips the peer-access setup
+static bool ggml_cuda_p2p_enabled() {
+    static const bool val = []() {
+        const char * v = getenv("GGML_CUDA_P2P");
+
+        return v == nullptr || (v[0] != '0' && v[0] != 'o' && v[0] != 'f');
+    }();
+
+    return val;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -383,7 +394,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
+    if (ggml_cuda_p2p_enabled()) {
         for (int id = 0; id < info.physical_device_count; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
             for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
@@ -597,15 +608,15 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
 
-            // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
-            bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
+            // VMM Bug fix for P2P access, on by default or if NCCL build
+            bool use_peer_access = ggml_cuda_p2p_enabled();
 #if defined(GGML_USE_NCCL)
             use_peer_access = true;
 #endif // defined(GGML_USE_NCCL)
 
             if (use_peer_access) {
                 // NCCL implicitly enables peer access (cudaDeviceEnablePeerAccess), and
-                // GGML_CUDA_P2P enables it explicitly. Unlike cudaMalloc buffers, VMM
+                // ggml_cuda_p2p_enabled() enables it explicitly. Unlike cudaMalloc buffers, VMM
                 // allocations do not become peer-accessible from that alone, so access
                 // must be granted explicitly here. With virtual devices, grant access
                 // on the backing *physical* devices (deduplicated, since several
@@ -1271,9 +1282,9 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
 #endif // GGML_USE_NCCL
 
 // Top-level init.  Picks one of the three init paths based on
-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
-// any fallback.  Unrecognised env values warn and fall through to the
-// platform default.
+// GGML_CUDA_ALLREDUCE (default internal; =nccl for the platform default)
+// and lets the chain handle any fallback.  Unrecognised env values warn and
+// fall through to the platform default.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
@@ -1290,12 +1301,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-#if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
-#else
+        // the in-tree allreduce; GGML_CUDA_ALLREDUCE=nccl restores the platform default
         ggml_backend_cuda_comm_init_internal(ret);
-#endif // defined(__linux__)
     } else {
         std::string env_str(env);
         if (env_str == "nccl") {
