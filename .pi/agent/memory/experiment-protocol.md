@@ -86,6 +86,10 @@ Seeing the line once is still not proof for the steps that matter: the mode is c
 the *cache state*, so a run with an mrope image in it never answers CACHED at all, and a text-only warmup
 can look pooled for a session that never pooled a real step (E057).
 
+**`llama-cli` runs at WARN by default**, so anything that prints through `LLAMA_LOG_INFO` needs `-v`. A probe
+that prints nothing while the build succeeded and the run exited clean is this, not a bug - E066 lost a cycle
+to it. Same family as the pool mode line above.
+
 **The standard golden gate is vacuous for anything gated on a single sequence.** `llama-perplexity`
 derives `n_seq = max(1, n_batch/n_ctx)`, so the golden command (`-c 512 -b 2048`) runs **4 sequences per
 batch** and `qsa_pool_get` answers NONE for all of them. E044/E049/E051/E052 all cite `263113.6984` as
