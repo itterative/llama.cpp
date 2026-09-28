@@ -48,6 +48,29 @@ so none is required; the golden PPL on this same toolchain is `263100.7437`.
 
 [`results/E065-dev-box-phase-inventory/commands.sh`](../results/E065-dev-box-phase-inventory/commands.sh)
 
+## harness correction, written before the runs
+
+The pre-registered harness passed the corpus with `-f <corpus> -st`, which does not deliver a prompt.
+`-f` sets `common_params::prompt_file` (`common/arg.cpp:1803`) and **nothing in `tools`, `common`, `src`
+or `examples` reads that field** - only `imatrix` and `cvector-generator` do. `--stdin` is not registered
+for the cli either (`error: invalid argument: --stdin`). `-st`'s own help says the predefined first turn
+comes from `--prompt`, and that route works: `-p "$(cat <corpus>)"` measures `tok:prefill 21 calls 32.68k
+total`, where the `-f` form measured 2 calls / 4 tokens.
+
+Consequence for earlier data: the user's `results/user/llama-cli-traces/*` runs use the same `-f`
+pattern, so any cli trace taken that way profiled decode at a near-empty prompt depth - those logs carry
+no `tok:prefill` line that would say otherwise.
+
+Corrected flags, used for everything below: `-c {8192|32768} -b 2048 -ub 1024 -fa 1 -ngl 99 -st --temp 0`
+plus `-p "$(cat <corpus>)"`; `-lm/-sm/-ot` are left off because the dummy's memory layout differs from the
+real model's. Prompt is the full 32.68k-token corpus at `-c 32768`, the same corpus truncated to the
+context at `-c 8192`. Untraced arms: 3 reps per depth per phase. Traced arms: 2 reps per phase at 32768.
+
+Trace CSVs are written to a scratch dir (default `/tmp/pi-coder-scratchpad-obx3lc/e065/traces`) and are
+**not committed**: they run to gigabytes on the bench box and `commands.sh` regenerates them. What is
+committed is the `[prof]` logs, plus the aggregates in this record. `results/.../E065-*/.gitignore` keeps
+`*.csv` out.
+
 ## results
 
 (pending)
