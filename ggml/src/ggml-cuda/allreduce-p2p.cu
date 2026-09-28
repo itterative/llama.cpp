@@ -58,10 +58,9 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
 // The meta-backend calls this between per-device graph_compute calls, never
 // inside a graph capture, so the event handshakes are not captured.
 //
-// GGML_CUDA_AR_DIRECT_BF16 (default "off", i.e. exact): reduce large F32 tensors
-// over a bf16 wire, like the NCCL path does. "nccl" reuses that path's element
-// count heuristic, a byte value uses that threshold instead (0 = off, the
-// default). The
+// GGML_CUDA_AR_DIRECT_BF16 (default "nccl", i.e. compress like the NCCL path does): reduce large
+// F32 tensors over a bf16 wire. "nccl" reuses that path's element count heuristic, a byte value
+// uses that threshold instead, and "off" (or 0) restores the exact f32 wire. The
 // payload is compressed before the round loop, every round moves half the bytes,
 // and it is decompressed once after the last round; the two bf16 buffers are
 // carved out of dev_tmp, so compression costs no extra allocation. F16/BF16
@@ -864,20 +863,20 @@ ggml_cuda_ar_pipeline_direct * ggml_cuda_ar_pipeline_direct_init(
         p->tmp_bytes = 1024 * 1024;
     }
 
-    // off (default) | nccl (reuse the NCCL path's element counts) | <bytes>
-    p->bf16_mode  = 0;
+    // nccl by default | off/0 = exact f32 wire | <bytes> = that threshold
+    p->bf16_mode  = 1;
     p->bf16_bytes = 0;
     if (const char * v = getenv("GGML_CUDA_AR_DIRECT_BF16")) {
-        if (strcmp(v, "nccl") == 0) {
-            p->bf16_mode = 1;
-        } else if (strcmp(v, "off") != 0 && strcmp(v, "0") != 0) {
+        if (strcmp(v, "off") == 0 || strcmp(v, "0") == 0) {
+            p->bf16_mode = 0;
+        } else if (strcmp(v, "nccl") != 0) {
             char * end = nullptr;
             const unsigned long long bytes = strtoull(v, &end, 10);
             if (end != v && *end == '\0') {
                 p->bf16_mode  = 2;
                 p->bf16_bytes = (size_t) bytes;
             } else {
-                GGML_LOG_WARN("%s: unknown GGML_CUDA_AR_DIRECT_BF16 '%s'; using off\n", __func__, v);
+                GGML_LOG_WARN("%s: unknown GGML_CUDA_AR_DIRECT_BF16 '%s'; using nccl\n", __func__, v);
             }
         }
     }
