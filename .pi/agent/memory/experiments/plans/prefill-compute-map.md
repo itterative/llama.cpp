@@ -60,12 +60,13 @@ Not in the table because it is not measured: the device's own busy time per ubat
 (`results/user/amd-smi-prefill.log`) shows 34% GFX utilisation during prefill with 93/210 W per card,
 but that predates E077 and the user reports it higher now, so treat it as unset.
 
-`graph:alloc` is three things, measured on the dev box (48l dummy, current build, `sched:*` regions added
-for this): `sched:split` 0.978 ms of the 1.64 ms/call, `sched:gallocr` 0.652, of which
-`sched:needs_realloc` 0.355 and the whole tensor-init walk 0.30, with `sched:ids_scan` at 0.006. The box's
-`graph:alloc` is 20.47 ms/call at almost the same node count (6825 against 6873), and the two gallocr
-pieces are per-entity work at ~15 ns each, so they cannot be 13x dearer there: **the split pass is where
-the box's time sits**. One `GGML_PROF_REGIONS=1` run on the box confirms it.
+`graph:alloc` is three things, and on the box it is the meta buffer's per-tensor init. Measured with the
+`sched:*` regions and the `meta:init_*_ns` counters (`results/user/llama-bench/bee859d04/run-prof.log`,
+56 ubatches of 1024 tokens): `graph:alloc` 24.10 ms/call, of which `sched:init_nodes` 22.25 and
+`sched:split` 0.88, over ~6800 meta inits per ubatch. Phases per init: prep 1.65 us (container lookup plus
+split state), tail 435 ns, create 507 ns (per sub-buffer create, copies, buffer init), srcs 349 ns. The dev
+box (1 sub-buffer) shows 1.94 / 431 / 170 / 185 ns, so only create and srcs scale with the device count.
+That is 20.0 ms/ubatch, 4.1% of a 489 ms ubatch, and P9 is where it is chased.
 
 ## 3. Real-model device composition, best available (A5: sparse FA + rtile, d131072)
 
@@ -297,18 +298,30 @@ P2b's precondition is therefore missing for now.
   which of those two the box resembles at shallow depth.
 - **Next step:** the section 1 trace, family table at d4096.
 
-### P9 - the sched split pass is the expensive half of `graph:alloc`
+### P9 - the meta buffer's per-tensor init is what `graph:alloc` is made of
 
-- **Question:** what does `ggml_backend_sched_split_graph` spend 0.98 ms per ubatch on here, and ~20x that on
-  the box, and can the assignment be cached or computed more cheaply?
-- **Why it matters:** measured on the dev box, it is 60% of `graph:alloc`; the two gallocr pieces are ~15 ns
-  per entity and the box has the same 8197 of them, so the box's 20.47 ms/call is essentially this pass. That
-  makes it most of the 22 ms/ubatch P2a was after, and unlike reuse it needs no shape to stop moving.
-- **Next step:** one `GGML_PROF_REGIONS=1` box run on the instrumented build to confirm the split dominates,
-  then find where it spends it: per-node backend support queries, or the meta backend's per-node partial or
-  split decisions. A cache keyed on a graph signature is the candidate if the per-node work is shape-driven.
-- **Risk:** the split result depends on shapes *and* buffer types, so a cache has to key on both; a stale hit
-  would put a node on a backend that cannot run it.
+- **Measured 2026-09-28 (`bee859d04`).** The split-pass hypothesis is falsified: `sched:split` is 0.88 ms of
+the box's 24.10 ms `graph:alloc`, and `sched:init_nodes` is 22.25. Phase split per meta init, from the
+`meta:init_*_ns` counters: **prep 1.65 us of 2.94 us** (container lookup plus split state), tail 435 ns,
+create 507 ns, srcs 349 ns, over ~6800 inits per ubatch. Dev box with 1 sub-buffer: 1.94 / 431 / 170 /
+185 ns, so only create and srcs scale with the device count. Total 20.0 ms/ubatch, **4.1% of prefill**,
+pure host work with no numerics in it.
+- **Why prep is 1.65 us.** `ggml_backend_meta_get_split_state` caches on the tensor *pointer* plus a
+  `memcmp` of the whole stored `ggml_tensor`, and on any mismatch it **clears the entire cache**
+  (`ggml-backend-meta.cpp`, around the `split_state_cache` in `calculate_split_state`). A rebuilt prefill
+  graph reuses arena structs, so the first mismatch of each ubatch drops everything and every later tensor
+  recomputes.
+- **Two fix candidates, cheapest first.**
+  1. Evict the one stale entry instead of clearing the cache. The memcmp guard runs per lookup, so
+     per-entry eviction is no less correct; whether it pays depends on how often a tensor's stored bytes
+     repeat between ubatches, and the stored copy includes fields the walk itself writes (`data`,
+     `buffer`), so this wants a measurement, not an argument.
+  2. Memoise on a content key: `(op, type, ne, nb, view state, the sources' state hashes)` in an
+     unordered_map. Survives graph rebuilds by construction, makes pointer reuse and the memcmp
+     irrelevant. Bigger change, same prize.
+- **Next step:** try 1 first, a few lines; fall back to 2 if the win does not appear.
+- **Validation:** pp t/s at d16384 plus the `meta:init_prep_ns` and `sched:init_nodes` rows, and the golden
+  PPL - the split state decides per-device slicing, so a wrong state would move the numbers.
 
 ### P10 - overlap the build and alloc with the previous ubatch's device work
 
