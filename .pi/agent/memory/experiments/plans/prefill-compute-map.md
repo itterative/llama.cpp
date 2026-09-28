@@ -398,8 +398,52 @@ init 2.94 -> 1.965 us, 20.0 -> 13.4 ms of the ubatch, pp 2070.90 -> 2087.29 (+0.
 the name copy in it (~20 ns per init); the commit that shipped drops it, so expect the shipped build within
 this run's spread.
 
-Ceiling, written down before measuring so the result cannot be read as more than it is, and revised after the
-pass-through correction: the per-init floor is ~1.3-1.5 us, and the bulk of it is the four per-device
+### P9c: validated split-state lookup (pre-registered 2026-09-28, before the change)
+
+Hypothesis: after P9b and P9d, prep is 1.10 us of the 1.965 us per init on the box and it is still a
+recompute on every lookup, because P9b drops a tensor's entry when the buffer initializes it. The split
+state is a pure function of the tensor's own op/type/ne/nb/op_params/view_src/buffer and of its sources'
+states, so an entry can carry those inputs and be validated instead of recomputed. Sources are covered by a
+per-entry version: a source's state can only change by way of its own entry no longer matching, which bumps
+its version, so dependency chains validate without walking or copying source states. That also removes the 1
+malloc/free pair per init that erase-emplace costs.
+
+Change: cache the entry (state + version + own fields + per-source kind mask + per-source version),
+validate on lookup, recompute in place when it fails, drop the erase in
+`ggml_backend_meta_buffer_init_tensor`, and cut the cap to 2^14 entries since an entry is ~1.4 KB now.
+Assumed, same as the old full-tensor memcmp: the static-buffer callback is a pure function of the tensor.
+
+Deciding metric: `meta:init_prep_ns` and `sched:init_nodes` on the dev box, then the box run's
+`sched:init_nodes` and `pp4096 @ d16384`. Gate: PPL with `-sm tensor` bit-identical at 266980.6971.
+
+Expected: prep 1.10 -> ~0.25 us and per init 1.965 -> ~1.15 us on the box (`sched:init_nodes` 18.6 ->
+~13 ms, pp +1%). Falsifier: prep does not collapse, meaning the lookups were not the cost.
+
+**Result: implemented, it works, and it is a net loss in prefill - reverted, kept as `stash@{0}`.**
+The implementation (entry validation off the tensor's own fields plus a per-entry version covering the sources, a GC
+that sweeps entries whose stamp is old instead of clearing the whole cache, and an iterative source refresh with an
+explicit stack) does what it says: PPL with `-sm tensor` stayed bit-identical at 266980.6971, and an unconditional
+cross-check that recomputed every state and aborted on any mismatch never fired. But on the dev box, same command, it
+costs more than it saves: prep 1.23 -> 1.74-2.91 us, tail 222 -> 928-1270 ns, `sched:init_nodes` 16.4-19.3 ->
+23.4-27.1 ms, pp4096 1699-1704 -> 1682-1692.
+
+Why: in prefill the graph is rebuilt every ubatch and the arena hands out **new addresses** for the new tensor
+objects. A new address is a cache miss in this design, never a validated hit, so the validation and the source refresh
+are pure overhead on top of the recompute P9b already does per tensor per graph. A content-keyed hit needs addresses
+that are stable across ubatches, which is P2a (blocked) or P10, not something a cache in here can deliver. P9d stands
+and P9's numbers do not change.
+
+Two findings from the attempt, both independent of it:
+- A tensor that the walk does not initialize keeps its old state. `ggml_gallocr_init_tensor` skips a tensor whose
+  `buffer != NULL`, and llama.cpp keeps persistent views as graph **leafs**, which are initialized before nodes, so a
+  leaf can depend on nodes of the whole graph. Upstream has the same staleness - the memcmp there compares the same
+  object, so it hits and returns the old state - and P9b inherits it rather than introducing it.
+- Any scheme that recomputes lazily rather than in walk order needs an iterative walk of the sources: recursion
+  overflows the stack at ~370 frames on the 48 layer model, and the crash bottom frames were
+  `llama_decode -> process_ubatch -> ggml_backend_sched_alloc_graph -> ggml_gallocr_alloc_graph ->
+  ggml_backend_meta_buffer_init_tensor`, i.e. a leaf's init, not an execution-path lookup.
+
+Ceiling, revised after the pass-through correction: the per-init floor is ~1.3-1.5 us, and the bulk of it is the four per-device
 sub-tensor structs (bump alloc, field copies, `ggml_backend_buffer_init_tensor`) that the meta design
 requires per graph, ~0.6 us of the 1.965. The other removable piece is the recompute inside prep, ~0.6-0.9 us
 of it. At ~1:1 into pp that makes each of them ~0.8-1.2%, so P9 is *not* exhausted after all: P9c, built as
