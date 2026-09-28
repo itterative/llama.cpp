@@ -491,4 +491,11 @@ dummy (11.88 GiB, `-c 32768`, `-b 2048 -ub 1024`) the prefill wall is **host-bou
 32.68k tokens with only ~2036 ms of device time, 1689 ms of it `sched:realloc_size` at 80 ms per prefill
 call (49 ms at `-c 16384`), i.e. the scheduler re-allocates per batch and the GPU waits. Decode is
 4.18 ms/step with 3.17 ms of drain and 2.6 ms of kernels, 1 `quantize_q8_1` per matvec. Tracer
-perturbation: +8.8% on the pp wall, +75% on the decode host regions.
+perturbation: +8.8% on the pp wall, +75% on the decode host regions, and the cli's own line drops 6%
+(pp) and 22% (tg).
+
+Trace side (same run, 2 reps, dispatch-identical): pp 14471 kernels / 2036 ms busy in a 6197 ms span =
+33% occupancy, in 94 tiny clusters (median 13 kernels, 0.18 ms busy) - the GEMMs are 44% of device time,
+the SSM gated delta net 12%, FA 7% over 29 calls. Decode 34780 kernels / 246 ms over 94 steps = 2.62
+ms/step busy, 370 dispatches/step running back-to-back, matvecs 77% of device time, and one
+`quantize_q8_1` per matvec (4512 calls, 1.3 us) which is 13% of all dispatches.

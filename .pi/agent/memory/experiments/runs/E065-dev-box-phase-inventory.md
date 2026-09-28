@@ -99,19 +99,69 @@ of host work plus sampling, so the non-GPU share is roughly a quarter of a step 
 "visible" bar was 5%. The dummy stops early at the deep depth (EOS after 94 of 256 requested) and runs
 all 255 at the shallow one.
 
-### traced arms (kernel composition, never a wall)
+### traced: kernel composition (never a wall)
 
-| arm | device ms | rows | leading families |
+Two reps, dispatch-identical (14471 kernels pp, 34780 tg; busy 2035.5 vs 2036.9 ms pp, 246.0 vs
+245.9 ms tg).
+
+**prefill, 32.68k tokens** - 2036 ms of device time, top kernels:
+
+| kernel | calls | ms | us/call |
 | --- | --- | --- | --- |
-| pp 32.68k | ~2036 | 14370 | other 1184 (58%), `mul_mat_q` 438 (22%), `flash_attn` 147, `quantize` 49, `mul_mat_vec_q` 8 |
-| tg | 246 (2.6 ms/step) | 29592 | `mul_mat_vec_q` 4512 calls/178 ms (72%), other 45, elementwise 13, `quantize` 5.8 |
+| `mul_mat_q` | 495 | 438.4 | 886 |
+| Tensile `Cijk_..._HSS_...` (GEMM) | 1056 | 282.4 | 267 |
+| `gated_delta_net_cuda<128,false,false>` (SSM) | 108 | 244.2 | 2261 |
+| Tensile `Cijk_..._S_B_...` (F32 GEMM) | 331 | 175.2 | 529 |
+| `flash_attn_ext_f16<256,256,1,16>` | 29 | 140.9 | 4859 |
+| `k_bin_bcast` | 1338 | 83.0 | 62 |
+| `cpy_scalar` | 180 | 68.6 | 381 |
+| `dsv4_hc_post_f32<false>` | 222 | 61.0 | 275 |
 
-**The GPU is busy about 2.0 s of a 5.5-5.9 s prefill**: the pp wall is host-bound on this box. The tg
-side is matvec-bound and shows H26's mechanism directly - 4512 `quantize_q8_1` calls for 4512 matvecs,
-exactly one q8_1 quantize per matvec.
+GEMMs together (`mul_mat_q` + both Tensile families) are 896 ms = 44% of device time; the SSM gated
+delta net 244 ms = 12%; flash attention 141 ms = 7% for only 29 calls, i.e. ~1.4 of the 4 layers take
+the attention path. The arch's own ops (`gated_delta_net` + `dsv4_hc_post` + `mm_ids_helper` 297 calls /
+59.7 ms) come to ~18%, elementwise/norm/copy the remaining ~20%.
 
-Tracer perturbation, again: the pp wall rises 5481 -> 5940-5964 ms (+8.8%) and the tg `phase:decode`
-total 67.5 -> 118 ms (+75%). Both traced arms are used for composition only, per E061.
+**decode** - 246 ms of device time for 94 steps = 2.62 ms/step, top kernels:
+
+| kernel | calls | ms | us/call |
+| --- | --- | --- | --- |
+| `mul_mat_vec_q` | 4512 | 177.7 | 39.4 |
+| `mul_mat_vec_f<__hip_bfloat16,...>` | 1128 | 6.5 | 5.8 |
+| `mul_mat_vec_f<float,...>` | 1316 (1410 in rep 2) | 5.9 | 4.4 |
+| `quantize_q8_1` | 4512 | 5.8 | 1.3 |
+| `k_bin_bcast` | 3384 | 5.4 | 1.6 |
+| `__amd_rocclr_copyBuffer` | 2162 | 4.3 | 2.0 |
+| `scale_f32` | 3196 | 3.3 | 1.0 |
+
+The matvec family is 190 ms = 77% of decode device time. `quantize_q8_1` appears **once per matvec**
+(4512/4512) - H26's mechanism, at 1.3 us a call: only 2.4% of device time here, but **13% of all 34780
+dispatches**, which is where its leverage sits.
+
+### traced: occupancy and launch structure
+
+| arm | kernels | busy ms | span ms | idle | busy share |
+| --- | --- | --- | --- | --- | --- |
+| pp 32.68k | 14471 | 2036 | 6197 / 6288 | 4162 / 4253 | 33% |
+| tg (94 steps) | 34780 | 246 | 500.0 / 500.8 | 254 / 255 | 49% |
+
+So the trace agrees with the region table: on prefill the GPU holds work for a third of the wall. With a
+1 ms gap threshold the pp timeline splits into 94-95 clusters that are *tiny* - median 13 kernels, 0.18 ms
+busy, 1.57 ms span, 1.33 ms gap - i.e. short kernel bursts separated by the host's per-batch stalls.
+
+The decode arms cluster into 2 (one >1 ms hole mid-phase) with a median of 17390 kernels / 123 ms busy /
+249 ms span, so **within a step the 370 dispatches/step are essentially back-to-back** (sub-ms gaps) and
+the large idle sits *between* steps, where the sampler runs. Per step: 0.72 ms host enqueue, then a
+3.17 ms drain in which 2.62 ms of kernels execute and ~0.55 ms is launch gap, plus ~0.3 ms of sampling -
+which sums to the measured 4.18 ms.
+
+Tracer perturbation, from the cli's own line: prefill 5565.7 / 5647.5 t/s traced against 5976.8 / 5982.7
+untraced (**-6%**), decode 185.9 t/s against 239.4 (**-22%**). Decode is the tracer-sensitive phase, so
+its traced gap total (2.7 ms/step, from a 5.33 ms spanned step) overstates the real one - untraced the
+kernels are the same 2.62 ms in a 4.18 ms step, i.e. ~1.6 ms of gap.
+
+Limit of this pass: the trace has no memory-domain rows (H2D/D2H are not captured with these flags), so
+the 326 ms of `graph:set_inputs` cannot be split into CPU-side gather and transfer.
 
 ## reads against
 
@@ -125,5 +175,9 @@ total 67.5 -> 118 ms (+75%). Both traced arms are used for composition only, per
   while the call count grows to 21). If a later arm removes it, the pp wall has ~1.7 s to give back at
   32.68k on this box, and the check is the same host-side table, no tracer needed.
 - H26's mechanism reproduces on the dev box (1 q8_1 quantize per matvec) at 4 layers' scale.
-- Not measured here: the pool mode line (needs `-v`), and no A/B was run, so no effect size is claimed.
+- Not measured here: the pool mode line (needs `-v`), H2D/D2H volume (needs memory-domain tracing), and
+  no A/B was run, so no effect size is claimed.
+- Trace side: the decode step is not launch-starved - 370 dispatches/step run back-to-back for 2.62 ms of
+  the 4.18 ms step - so the host cost is real work (enqueue + sampler), not a launch wall. The prefill is
+  the opposite: bursts of 13 kernels averaging 0.18 ms with the GPU idle two thirds of the wall.
 
