@@ -44,8 +44,9 @@ export REF="GGML_CUDA_P2P=1 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_DIRECT_BF1
 export BENCH="llama-bench -m $M -lm none -sm tensor -fa 1 -lzm on-direct -ot per_layer_token_embd=CPU -b 2048 -ub 1024 -o md"
 ```
 
-`Q4EXP_SPARSE_FA` and `GGML_FATTN_RDNA_RTILE` are still default-off; without them the run is not the
-configuration the user actually serves with.
+`Q4EXP_SPARSE_FA`, `GGML_FATTN_RDNA_RTILE` and the P2P/allreduce/bf16-wire trio are **now the
+defaults** (`6344fd41b`, `f383ef73e`), which is what the user actually serves with. The REF block still
+names all of them explicitly so it cannot drift with the code.
 
 ## 1. E062 paired confirmation (rebuild per arm)
 
