@@ -366,6 +366,7 @@ sides.
 
 Change: `simple_tensors` to `unordered_map` (pointer keys, `std::hash` is enough); one lookup that returns
 the per-device vector, used where both the container and the vector were fetched; array copy for the name.
+The name copy was dropped on review as too fine-grained for its gain, so it is not in what was measured.
 
 Deciding metric: `meta:init_prep_ns` and the per-init total on the dev box (`-sm tensor` harness,
 `GGML_PROF_REGIONS=1`), then the same counters on the box. Gate: PPL with `-sm tensor` bit-identical at
@@ -375,15 +376,16 @@ Expected: dev box prep 1.22 -> <=1.05 us and total 1.87 -> <=1.75 us (box prep 1
 That is under the box run-to-run noise, so P9d is judged on counters, not on pp. Falsifier: prep does not
 move, in which case the leftover really is the recompute and the container type is irrelevant.
 
-**Result, dev box, 27,172 inits, two passes:** total 1.885 -> **1.626 us (-13.7%)**, above what was asked
-for, but not where it was predicted. In phase terms prep 1.22 -> 1.21-1.26 us (**flat, the falsifier fires**),
-create 175 -> 130 (-45, the name copy), srcs 184 -> 66-68 (-118), tail 303 -> 212-227 (-85). So the
+**Result, dev box, 27,172 inits, two passes, name copy excluded:** total 1.885 -> **1.646 us (-12.7%)**,
+above what was asked for, but not where it was predicted. In phase terms prep 1.21 -> 1.21-1.22 us (**flat,
+the falsifier fires**), create 175 -> 149-154, srcs 184 -> 64-66 (-119), tail 303 -> 217-223 (-83). So the
 container type was worth nothing inside the state lookup, where the sources are already cached, and
 `simple_tensors` only mattered where it is searched or written on its own: the second search in
-`ggml_backend_meta_buffer_simple_tensor` and the insert in the tail. gate: PPL with `-sm tensor`
+`ggml_backend_meta_buffer_simple_tensor` and the insert in the tail. The name copy measured 130-133 for
+create, i.e. ~20-25 ns per init, which is why it did not survive review. Gate: PPL with `-sm tensor`
 bit-identical at 266980.6971, pp4096 1702-1712 against 1707.80 before, i.e. flat as expected on one card.
-Box projection: the name copy and the source loop scale with the sub-buffer count, so ~2.32 -> ~2.0 us per
-init, ~15.8 -> ~13.5 ms/ubatch, which is ~0.2% of wall and not resolvable on the box.
+Box projection: the source loop scales with the sub-buffer count, so ~2.32 -> ~2.05 us per init, ~15.8 ->
+~14 ms/ubatch, which is ~0.2% of wall and not resolvable on the box.
 
 Ceiling, written down before measuring so the result cannot be read as more than it is: the per-init floor
 is ~1.5-1.9 us and the bulk of it is the four per-device sub-tensor structs (bump alloc, field copies,
