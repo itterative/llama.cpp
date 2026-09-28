@@ -67,6 +67,15 @@ anything - it defines the tiers, the naming, and the rules.
    the repo root when tools are run from there. Two crashes were 14.6 GB before anyone looked
    (E020). Check `df` and `ls gpucore.*` after any `HSA_STATUS_ERROR_EXCEPTION`.
 
+7. **Bench tg has a ~7% cross-session floor, and prefill does not.** E050's session (2026-09-24) and
+   E063's (2026-09-27) agree on every pp row within 1.2%, while tg over the same span moved +25-35% - all
+   of that from decode-side default flips (small-k, pool, mmvf unroll), so the *level* is real. But E063's
+   U=4 arm reads **+6.8% over E062's same-day U=4 arm** at d16384 (43.15 vs 40.41, ~9 SE apart) with only
+   two differences between them: `GGML_CUDA_AR_ONESHOT_PROBE=50` against 1/unset, and tg measured after
+   the pp tests against `-p 0`. Until E064 and the test-order check land, read tg only within a session
+   and treat fixed-config cross-session comparisons as having a ~7% floor. The anchor to read against is
+   E063 (tg 43.43 / 43.15 / 41.88 / 37.64 at d4096/16384/40960/131072, pp8192
+   2219.27 / 2120.65 / 1958.24 / 1521.66, `-r 10`, no tracer).
 6. **A `llama-cli` A/B on the bench box cannot be text-matched.** `--temp 0` makes this model loop, and
    `-s <seed>` did not reproduce across runs with `-sm tensor` - probably 4-card reduction order moving
    the last logit bits, unconfirmed. So each arm generates different text and touches different rows, and
@@ -264,12 +273,14 @@ unless that number set `Q4EXP_POOLED` explicitly - same trap as E055's `855a6554
 
 ## Next steps
 
-Agreed 2026-09-27: the bench bundle is down to **one** run (`experiments/plans/bench-finish-bundle.md`),
-the post-flip REF baseline. E062 was closed by three untraced `-r 10` arms (+1.9-2.0%, flip kept in
-`8372ffc1f`), and the E048 draft sweep and the E013/pool crossover were closed the same day without a run
-(mtp is served at `n_max = 3` with 0.2-0.9 acceptance; the pool's low-depth loss was the pre-E056
-reservation tax). The next development thread is H20 (pool block keys in rank space, so vision sessions
-stop losing the pool's +32.6% tg); the ranking below still holds for the threads not in the bundle.
+**Agreed 2026-09-27:** the bench bundle is closed. E062 was answered by three untraced `-r 10` arms
+(+1.9-2.0%, flip kept in `8372ffc1f`); the E048 draft sweep and the E013/pool crossover were closed the
+same day without a run (mtp is served at `n_max = 3` with 0.2-0.9 acceptance; the pool's low-depth loss
+was the pre-E056 reservation tax); and the post-flip REF baseline arrived as the user's own test run -
+recorded as **E063** with the anchor table and the 7% cross-session caveat above. The one thing it left
+open is **E064** (flag-only, 4 invocations): is that 7% the allreduce probe's iteration count or the
+test order? The next development thread is H20 (pool block keys in rank space, so vision sessions stop
+losing the pool's +32.6% tg); the ranking below still holds for the threads not in the bundle.
 
 Top code action was the comms thread (`plans/decode-comms-plan.md`): the one-shot allreduce is in and
 measured at +2.5% tg at depth, with three loose ends left. H9 is measured end to end and on by default;
