@@ -2586,15 +2586,6 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
-    // optional: reserve for the widest batch the session can produce - the callers commonly reserve for a
-    // single token, so the n_tokens-proportional part (the mask's second dimension) is not covered otherwise.
-    // the n_kv dimension is covered by llama_kv_cache::init_full under the same gate. see E066/H19/E068
-    static const bool worst_case = getenv("LLAMA_RESERVE_WORST_CASE") != nullptr;
-
-    if (worst_case) {
-        n_tokens = std::max(n_tokens, (uint32_t) cparams.n_batch);
-    }
-
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);

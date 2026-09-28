@@ -402,11 +402,6 @@ public:
 
     uint32_t get_n_kv() const;
 
-    // floor for the reported n_kv. set while reserving graphs so that the reserved buffers cover the whole
-    // context instead of the state at reserve time, which is what stops the reserve from being outgrown.
-    // see E066/H19/E068
-    uint32_t n_kv_min = 0;
-
     ggml_type type_k() const;
     ggml_type type_v() const;
 
