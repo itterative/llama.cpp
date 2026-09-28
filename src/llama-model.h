@@ -786,6 +786,10 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // --lazy-mode on-direct: issue a row prefetch for the token window that follows this ubatch, so the
+    // reads run while this ubatch computes. advisory, and a no-op for models that read no table row by row
+    virtual void prefetch_next_rows(const llama_ubatch & /*ubatch*/, const llama_token * /*next*/, uint32_t /*n_next*/) const {}
+
 protected:
     llama_model_params params;
 
