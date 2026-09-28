@@ -31,3 +31,12 @@ for i in 1 2; do
         < /dev/null > $T/tg-traced-$i.log 2>&1
 done
 echo "done, traces in $S"
+
+# shallow arms, added after the first pass: -c 8192 ABORTED ("request (32673 tokens) exceeds the
+# available context size (8192 tokens)") because llama-cli errors instead of truncating. Fixed by
+# feeding a 45k-byte prefix of the corpus into -c 16384.
+PS="$(head -c 45000 $F)"
+for i in 1 2 3; do
+    GGML_PROF_REGIONS=1 timeout 900 $B -c 16384 -n 1   -p "$PS" < /dev/null > $T/pp-untraced-c16384-$i.log 2>&1
+    GGML_PROF_REGIONS=1 timeout 900 $B -c 16384 -n 256 -p "$PS" < /dev/null > $T/tg-untraced-c16384-$i.log 2>&1
+done
