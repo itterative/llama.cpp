@@ -3125,7 +3125,8 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match) {
+        ggml_cuda_moe_weighted_reduction_match & match,
+        bool require_work = true) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -3186,7 +3187,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    // an empty reduction is not fused, but the dependencies it reports must not depend on that: a graph's
+    // node count decides whether its allocation reservation survives, so reporting a different count for a
+    // batch that carries no output tokens re-reserves the whole scheduler. see E073
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
+            (require_work && n_tokens <= 0)) {
         return false;
     }
 
@@ -4590,7 +4595,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
 
             ggml_cuda_moe_weighted_reduction_match match;
-            const bool matched = ggml_cuda_match_moe_weighted_reduction(cgraph, i, match);
+            // require_work = false: report the dependencies of an empty reduction as well, so that the
+            // scheduler sees the same graph regardless of the batch. see E073
+            const bool matched = ggml_cuda_match_moe_weighted_reduction(cgraph, i, match, /*require_work =*/ false);
 
             // probe for the fusion's verdict, see E072: the reserve graph matches and the prompt graph does not,
             // and that difference is the extra alloc-dep node that retightens the allocation reservation
