@@ -13,19 +13,26 @@ tensor cannot use the planned type and is demoted - for a Q4_K target the fallba
 (`-> falling back to %s`), and a downloaded GGUF carries no trace of why a tensor has its type.
 
 The case that matters for a 10-of-512 MoE: expert `ffn_down` has `ncols = moe_intermediate_size`. Any
-value that is not a multiple of 256 pushes **every** expert down tensor up a class. With 640 (this model:
-48 layers x 512 experts = 24,576 tensors) `640 % 256 = 128`, so all of them land on Q5_0 - a third of the
-expert parameters carrying 33% more bytes than the recipe intended, and through a 32-element block, which
-costs more scale metadata and more dequant work per element than a 256-block type.
+value that is not a multiple of 256 pushes the tensor up a class. With 640 (this model: 48 layers x 512
+experts = 24,576 tensors) `640 % 256 = 128`, so a Q4_K target cannot be used and falls back to **Q5_0**
+at 6.0 bpw, through a 32-element block, which costs more scale metadata and more dequant work per element
+than a 256-block type.
 
-`gate`/`up` are unaffected because their `ncols` is `n_embd` (2560, divisible by 256). Same trap applies to
-any model with a narrow intermediate or a head-dim-ish width: check `ncols % 256` before concluding that an
-M-recipe produced uniform Q4_K experts.
+**Corrected 2026-09-28:** the claim that *every* down tensor therefore lands on Q5_0 is **wrong for the
+bartowski Q4_K_M conversion of this model**. `results/user/gguf-dump.log` has
+`blk.*.ffn_down_exps.weight` at **24 x Q8_0 and 24 x Q5_0** (gate/up are all 48 x Q4_K), i.e. a per-layer
+imatrix mix, so the fallback hit only the layers whose recipe asked for a 256-block k-quant. Do not use
+"Q5_0 count near n_layer * n_expert" as the signature on a downloaded file; read the types.
+
+`gate`/`up` are unaffected because their `ncols` is `n_embd` (2560, divisible by 256). The same trap
+applies to any model with a narrow intermediate or a head-dim-ish width: check `ncols % 256` before
+concluding that an M-recipe produced uniform Q4_K experts.
 
 ## Detecting it in a file you did not quantize
 
 - The loader prints a per-type census at INFO level: `src/llama-model-loader.cpp:825`,
-  `- type  q5_0:  N tensors`. A count near `n_layer * n_expert` is the signature.
+  `- type  q5_0:  N tensors`. A count near `n_layer * n_expert` is the signature *only* if the file was
+  quantized with one uniform recipe; a downloaded file can mix Q8_0 and Q5_0 per layer (see above).
 - `llama-gguf <f>.gguf r` prints tensor names and byte sizes (not types). Dividing size by `ne[0]*ne[1]*...`
   gives bpw directly, so `blk.7.ffn_down.3.weight` at 6.0 bpw vs `blk.7.ffn_gate.3.weight` at 4.5 confirms
   it without any extra tool.

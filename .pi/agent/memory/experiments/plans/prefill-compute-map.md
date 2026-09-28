@@ -35,8 +35,9 @@ Read three things, in this order:
 Decision rule: if the box's bursts are ~95% busy and longer than `graph:compute` per ubatch (139 ms),
 the device is the wall and P3-P5 lead. If they are short and gappy, the host path is the wall and P1,
 P2, P6 and P7 lead. `phase:sync` (97.7 ms/ub) is the drain tail and is neither: it is the device time
-that is *not* overlapped. Sanity anchor on the shape question: prefill reuses nothing today
-(`graphs reused = 0` on both machines), while decode reuse works and is worth ~22 ms/step (E010).
+that is *not* overlapped. Anchor on the shape question, measured on the dev box with the 48l dummy and
+`-v`: `graphs reused = 0` for `-p 4096 -n 0` and `graphs reused = 126` for `-p 512 -n 128 -d 4096`, i.e.
+prefill rebuilds every ubatch while decode reuses all but two steps.
 
 ## 2. Budget of a prefill ubatch today (box, real model, 1024 tokens)
 
@@ -160,25 +161,76 @@ n_expert Q5_0 tensors" signature must not be used as a check here. The memory fi
 - **Risk:** `hc_*` is F32-only by gate (N5) and feeds the residual stream, so a split introduces one
   reduce per mixture and could lose more in collectives than it wins.
 
-### P2 - prefill graph reuse, then capture
+### P2 - freeze the QSA window so prefill can reuse its graph (and then replay it)
 
-- **Question:** can the prefill graph be made reusable across ubatches, and if so does HIP capture engage?
-- **What is known:** reuse is not broken in general - E010 (build `c9a59ef73`, decode) measured it working
-  and worth ~22 ms per step, with `LLAMA_GRAPH_REUSE_DISABLE=1` costing 38% of tg. For qwen4exp's pooled
-  path the check in `qwen4exp.cpp:557-600` compares `blk_cells` (`ratio*n_blocks`), `blk_pos`
-  (`4*n_blocks*n_stream`) and `bias` widths against `n_blocks = (n_kv + ratio - 1)/ratio`, plus
-  `pool_cur.n_new` and `mode` against the previous run. Decode survives that because n_kv moves in padded
-  steps; a prefill ubatch that grows the block count (one block per 4 tokens) does not, so every ubatch
-  rebuilds. The box confirms: `graph:alloc` 56/56 calls and no `graph:reuse` row, `graphs reused = 0`.
-- **Prize:** `graph:alloc` + `graph:build` is 21.5 ms/call (2.2% of the call) and, if reuse holds and HIP
-  capture engages (E008 saw capture active in a `-lzm` config), the ~3,200 host launches per ubatch stop
-  being host work entirely.
-- **Next step:** one log line naming which comparison fails on each prefill ubatch, then decide whether the
-  n_blocks-dependent tensors can be padded to the run's reserved width (E056 already reserves the pooled
-  worst case) and whether `n_new` can be made constant for a whole prompt.
-- **Deciding metric:** `graphs reused` nonzero during a pp-only run, then `graph:compute` per ubatch.
-- **Risk:** capture is per split and this box has four GPU splits plus one CPU split and RCCL collectives;
-  the arrangement may not be capturable at all even with reuse.
+P2a was attempted on 2026-09-28 and retracted: windowing the QSA block domain is safe but does not produce a
+reuse hit, because the remaining blockers are cell-domain inputs. The detail and the numbers are below;
+P2b's precondition is therefore missing for now.
+
+#### P2a - the reuse half: attempted 2026-09-28, retracted, the 22 ms/ub is not reachable this way
+
+- **Prerequisite, measured.** The prize exists: `results/user/e79-02dd5cea2/run-prof.log` (56 ubatches of
+  1024 tokens) has `graph:alloc` 56 x 20.95 = 1173 ms and `graph:build` 56 x 1.04 = 58 ms, i.e. **22 ms per
+  ubatch**, which at pp4096 d16384 (2096 t/s, 489 ms/ubatch) is **4.5% of prefill**. A reuse hit skips both:
+  `llama_context` does not call `graph:alloc`/`graph:build`, and `ggml_backend_sched_graph_compute_async`
+  finds `sched->is_alloc` still set, so it runs `compute_splits` with the previous split list and buffer
+  assignment (`ggml-backend.cpp:2025-2065`). The region table's `ms/call` column is per ubatch, not per
+  2048-token call.
+- **Attempt.** An env-gated `Q4EXP_QSA_WINDOW` (tokens, default off) widened the pooled block width:
+  `blk_cells`, `bias` and the pooled score/top-k chain were sized from a rounded-up block count (the bias
+  already writes `-INFINITY` past the live range, `llama-memory-hybrid-idx.cpp:939-946`), the score got a
+  clamp so a garbage pool row cannot meet that -inf as a nan, `can_reuse` used the same width, and the window
+  was allowed only for prefill (`n_tokens > 1`) and only once the selection is saturated (otherwise top-k would
+  pick a padded block whose cell entry is 0). Patch kept at
+  [results/P2a-qsa-window-attempt/qsa-window.patch](../results/P2a-qsa-window-attempt/qsa-window.patch),
+  which applies to the tree at `02dd5cea2`, is 301 lines over 5 files, and also carries the two
+  `Q4EXP_REUSE_DEBUG` prints that found the blockers below; all source files reverted afterwards.
+- **It was safe but useless.** Correctness held: on the dev box with the 4l model and the sparse corpus at
+  `-c 8192`, per-chunk and final PPL are bit-identical with the window on and off
+  (270867.4519 / 270355.0602 / 266980.7507). No re-reservation either, once the clamp node was gated on the
+  env instead of on the width. But `graphs reused` stayed 0 in every arm.
+- **Two blockers, found with an instrumented `can_reuse`.**
+  1. With llama-bench's chunking (`-b 2048 -p 4096`) the reuse check is never entered at all: the two
+     `gf_res_prev` slots alternate, because the output flag alternates ([0,1,0,1] - logits are requested on the
+     last token of each chunk). `gf_res_prev_active == res` is then false by construction. With `-b 8192` (one
+     call, pattern [0,0,0,1]) the check is entered.
+  2. Entered, it fails on 2 of 6 inputs, identically with the window on and off: the n_kv-sized cell-domain
+     inputs (the KQ mask via `can_reuse_kq_mask`, and the QSA/attention input). `allow_reuse` itself returns 1.
+- **Why windowing those is not the answer either.** Padding the mask and the K/V views makes the attention
+  process masked cells: a W-token window adds about W/2 masked cells per ubatch, which against FA's ~17% of
+  device time at d16384 is roughly +10%, i.e. more than the 4.5% host saving. It is only cheap where the
+  sparse FA path is active (above ~4104 cells it gathers a fixed top-k set, so its work stops tracking n_kv).
+  So prefill reuse is not a QSA-block problem: it needs the cell window, and the cell window costs attention
+  work at exactly the depths where the host time matters least.
+- **Constraint learned for any future attempt.** A node that appears only at runtime breaks the measured
+  graph: with the clamp gated on `n_blocks_g > n_blocks`, the runtime topology differed from the reserved one
+  and every prefill ubatch re-reserved (`sched:realloc_buft` at ~518 ms/call). Any node added by a window must
+  be present in the graph the reservation measures (gate on the env, not on the width).
+- **What is left of P2:** P2b below, whose precondition (a reuse hit) is now known to be missing, and the
+  cheap question underneath it - why the split plus gallocr pass costs 22 ms/ubatch at all, and whether the
+  node count can come down (P1, P5) so that the price falls without reuse.
+- **Cost, and why the window size is the whole question.** The score, the bias fill and TOP_K all scale with
+  the padded block count. The bias is already 16.8 MB per QSA layer per ubatch at d16384, x12 layers, so a
+  window doubles that before any extra scoring. Padded pool rows were never written, so a `ggml_clamp` on the
+  scores before the bias add (`fminf(fmaxf(x,min),max)`, NaN-safe) is needed or a garbage +inf meets -inf and
+  turns into NaN inside top-k.
+
+#### P2b - the capture half (conditional)
+
+- **Mechanism.** `ggml_backend_cuda_graph_compute` only captures once two consecutive calls have identical
+  node properties - the whole `ggml_tensor` of every node plus each source's data pointer, `ne` and `nb`
+  (`ggml-cuda.cu:2673-2714`) - and a re-split assigns fresh split uids (`ggml-backend.cpp:1604`), so the
+  uid fast path needs reuse as well. Prefill satisfies neither today: properties differ every ubatch, the
+  warmup never completes, and the host issues all ~3,200 launches itself.
+- **Prize if it lands:** the launch API cost inside `graph:compute`, which needs the box trace to price; the
+  device work is unchanged either way.
+- **Caveat measured on the dev box (48l dummy, interleaved, `-r 5`, tg128 @ d4096):** capture on
+  42.01 +- 0.13 and 41.93 +- 0.10 against capture off 42.52 +- 0.05 and 42.40 +- 0.04, i.e. **capture is
+  1.2% slower there**, the opposite sign to E008's box measurement ("graphs off costs ~7%", older stack).
+  Same-config pp4096 was inert (`GGML_CUDA_DISABLE_GRAPHS=1` -0.66%, inside its own band). So capture's value
+  is stack- and shape-dependent and must be re-measured on the box before P2b is treated as a prize. One
+  `GGML_CUDA_DISABLE_GRAPHS=1` tg arm would settle it, and if the dev-box sign reproduces it is a free 1-2%
+  at decode with no code change.
 
 ### P3 - MoE tile and GEMM choice (H10, now priced)
 
