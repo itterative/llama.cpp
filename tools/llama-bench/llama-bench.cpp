@@ -2173,9 +2173,6 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 }
 
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
-    // under rocprofv3 --selected-regions this profiles only the decode loop
-    ggml_prof_window prof_window;
-
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
