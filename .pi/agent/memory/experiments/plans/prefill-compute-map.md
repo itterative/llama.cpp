@@ -187,8 +187,16 @@ alone does not raise ggml's log level, `-v` does):
   - The elementwise half of P1 is mostly already there: `cparams.fused_dsv4_hc_pre` and `fused_dsv4_hc_post`
     (src/models/qwen4exp.cpp:321,366) are what produce `DSV4_HC_PRE/POST`. What still sits outside them is
     `w = sigmoid(scale(inject, 1/hc))` (line 362), about two nodes per layer.
-- **Verdict:** treat the split half as a layout experiment with a time box, judged on a traced A/B (device time per
-  card plus NCCL, and the accuracy gate), not as a table edit. The wall is more likely to move in P3.
+- **Verdict:** close the split half. Activating a split on `hc_mixed` forces a partial sum in every consumer, and the
+  activation is split on its ne0, which is the contraction dim, so each of the ~7 matmuls per layer needs its own
+  reduce: ~336 per ubatch on top of the 96 today. The residual-stream reduces move ~25 MB each ([6144, 1024] F32 at
+  ub 1024), so the added volume is ~6.7 GB/ub against ~2.4 GB today; at the rate NCCL runs today (16.3% of 303 ms,
+  ~49 ms/ub) that added volume alone costs ~130 ms to recover ~17 ms (5.8% of device time). An order of magnitude
+  loss, so no experiment is needed. The token-split escape (split axis 2, no reduce) is not available: the tensor
+  split mode has one ubatch and no sequence-parallel path.
+- **What is left:** only the tail fusion, ~480 launches/ub, numerics unchanged because it is elementwise, and it
+  needs qwen4exp.cpp plus dsv4-hc.cu and the CPU path. About 0.2-0.3% of pp for a moderate diff, so it is a bundle
+  item, not a thread. P3 is the better next session.
 - **Deciding metric:** pp t/s on the box, with device time per card from the trace.
 - **Risk:** `hc_*` is F32-only by gate (N5) and feeds the residual stream, so a split introduces one
   reduce per mixture and could lose more in collectives than it wins.
