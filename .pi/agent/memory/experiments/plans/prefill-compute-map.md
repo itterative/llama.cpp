@@ -121,10 +121,13 @@ mmq 16.5%, HC 7.1%, FA 6.0%. Launch leaders are dummy artifacts (`convert_unary`
 
 ### 5.1 HC is the largest launch consumer and runs replicated four times
 
-`hc_*` and `ple_*` are unmatched in the split table, so they are MIRRORED: no split, no allreduce, full
-work on every card (`src/llama-model.cpp:541,568,579-583,605-606`; PARTIAL is only created when both
-operands are split on the contraction dim). HC is ~27 GFLOP/layer/card against the MoE's ~17 GFLOP
-k-split. Its tail is unfused: `SCALE,SIGMOID,SCALE` is 288 launches and `SCALE,SILU` 192 per ubatch.
+`hc_*` and `ple_*` go through `handle_generic(..., scalar_only = true)`, and they come out MIRRORED: no split, no
+allreduce, full work on every card. This was measured for HC, and the mirrored state comes from their sources,
+not from the table (see P1 in section 6; the earlier "unmatched in the split table" was wrong). PARTIAL is only
+created when both operands are split on the contraction dim. HC is ~27 GFLOP/layer/card against the MoE's ~17 GFLOP
+k-split. Its tail is outside the fused kernels, and it is 10 launches per layer with two mixers per layer:
+`SCALE,SILU` x2 is the gate prep (`src/models/qwen4exp.cpp:316`, 192 per ubatch), `SCALE,SIGMOID,SCALE` x2 is the
+scatter weight in `build_hc_combine` (`:362-364`, 288 per ubatch).
 
 ### 5.2 The allreduce count is a hard gate
 
