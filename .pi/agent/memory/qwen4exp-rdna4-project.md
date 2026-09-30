@@ -57,6 +57,30 @@ is read and which record measured it - is **`env-knobs.md`**.
   **commented out**, so after the flip the server uses the internal allreduce where it used NCCL. If
   that was deliberate, the unit needs `Environment=GGML_CUDA_ALLREDUCE=nccl`.
 
+## Rebase onto master (2026-09-30)
+
+The branch was rebased onto upstream master `272aad8b9` (origin/master; 258 new commits since the old base
+`ebbb18522`). New tip `2e7fc0752`, all 259 commit subjects unchanged. The pre-rebase tip `858a5a8d6` is kept
+as `backup/qwen4exp-rdna4-pre-rebase`. The fork branch needs a `--force-with-lease` push. Local `master` was
+not moved: the main checkout `/home/sd/Repos/llama.cpp` has all tracked files deleted in its worktree, so do
+not `git pull` there without fixing that first.
+
+Nine commits conflicted. The semantic ones: `abd3473a8` (AMD sparse FA) was re-applied onto upstream's
+rewritten grouped mask kernel (`3cf03257f`, `dc9879cf6`) and AMD is now gated to the only sparse instance
+with AMD device code, `(ncols1=1, ncols2=16)`, `DKQ <= 256`; `e3df587e0` (QSA block selection) merged with
+upstream's new `causal_attn` parameter, `block_sel` stays causal-only and `cparams.causal_attn` is back in
+`blk_bias` as in the branch's final state; `d8bce4e25` (pooled block keys) coexists with upstream's
+`mem_idx_stale_set` / kpool layout tracking, both calls stay; the profiler commits needed
+`batch_inp.n_tokens` -> `batch_inp.tokens.size()` because `llama_batch_ext` no longer has `n_tokens`.
+
+Verification: full HIP build clean, `ROCm0` loads. Golden PPL `263100.5295` against the recorded
+`263100.7437`; the shift is upstream's CPU kernel work (tiled k-quant mul_mat `d834d44e6`, CPU tiled FA
+`6f767fe96`, f16 dot accumulation `284153e06`), and every QSA arm (`Q4EXP_CELL_SEL`, `Q4EXP_POOLED`) is
+bit-identical to the others at the gate, so no QSA semantic moved. Dev-box dummy A/B against the
+pre-rebase tree, interleaved in one session: **tg +2.2% at d4096, +2.3% at d40960, +1.8% at d131072, pp
+flat**; sparse-on vs sparse-off is still +5% tg and +16-18% pp at d40960, so the ported AMD sparse path
+works. A pre-rebase worktree used for that A/B lives only in the session scratchpad.
+
 ## Traps that already produced bogus results
 
 1. **Loader shadowing.** `LD_LIBRARY_PATH` includes `/home/sd/lib` and

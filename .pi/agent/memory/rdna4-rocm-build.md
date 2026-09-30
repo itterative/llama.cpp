@@ -7,11 +7,12 @@ keep_updated: true
 ---
 
 Branch env vars and their defaults are indexed in `env-knobs.md`; regenerate that list from the
-code with the `git diff --name-only ebbb18522...HEAD` line in it, because the index can drift.
+code with the `git diff --name-only 272aad8b9...HEAD` line in it, because the index can drift.
 
 # RDNA4 / HIP build + backend behaviour
 
-Anchors at `ebbb18522`. Marked **[v]** = read/verified by me directly; **[s]** = from the
+Anchors at `ebbb18522` (pre-rebase; the branch moved to `272aad8b9` on 2026-09-30, see
+`qwen4exp-rdna4-project.md`). Marked **[v]** = read/verified by me directly; **[s]** = from the
 `scout-1` survey, plausible but not independently re-read; **[x]** = corrected after
 checking. Line numbers drift; trust the symbol names.
 

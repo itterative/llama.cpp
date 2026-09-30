@@ -8,11 +8,12 @@ keep_updated: true
 
 # Env knobs this branch adds
 
-Anchor: every change on `experiments/qwen4exp-rdna4` is after upstream `ebbb18522`. To regenerate the
+Anchor: every change on `experiments/qwen4exp-rdna4` is after upstream `272aad8b9` (the branch was
+rebased onto it on 2026-09-30; `ebbb18522` is the pre-rebase base, see `qwen4exp-rdna4-project.md`). To regenerate the
 list from the code (it is the authority, this file is the map):
 
 ```sh
-git diff --name-only ebbb18522...HEAD | grep -E '\.(cu|cuh|cpp|h)$' > /tmp/t.md
+git diff --name-only 272aad8b9...HEAD | grep -E '\.(cu|cuh|cpp|h)$' > /tmp/t.md
 grep -rhoE '(getenv|std::getenv|ggml_cuda_ar_env_u64)\("[A-Z0-9_]+"' $(cat /tmp/t.md) | grep -oE '"[A-Z0-9_]+"' | sort -u
 ```
 
